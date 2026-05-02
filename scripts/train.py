@@ -8,35 +8,30 @@ import os
 import random
 import sys
 import time
-from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 from typing import Any
+import numpy as np
+import pandas as pd
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset_config import ACTIVE_DATASET_ROOT_KEY
-from src.data.dataset_config import TEST_VFX_0416_DATASET_PRESET
-from src.data.dataset_config import TRAIN_VFX_0416_DATASET_PRESET
 from src.data.dataset_config import get_dataset_preset
-from src.data.dataset_config import iter_dataset_configs
 from src.data.dataset_config import list_dataset_presets
 from src.data.dataset_config import resolve_active_dataset_root
+from src.data.dataset_config import iter_dataset_configs
+from src.data.dataset_loader import VFITrainDataset
 from src.engine.evaluation import TaskEvaluator
 from src.engine.evaluation import VFI_METRICS
 from src.models.registry import get_model_class
 from src.models.registry import get_model_config
-
-if TYPE_CHECKING:
-    import pandas as pd
-    import torch
-    import torch.optim as optim
-    from torch.utils.data import DataLoader
-
-    from src.data.dataset_loader import VFITrainDataset
 
 
 @dataclass(frozen=True)
@@ -44,14 +39,10 @@ class TrainingState:
     start_epoch: int
     global_step: int
     best_psnr: float
-    resume_path: str | None
     mode: str
 
 
 def set_seed(seed: int) -> None:
-    import numpy as np
-    import torch
-
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -69,104 +60,18 @@ def set_lr(optimizer: Any, lr: float) -> None:
         param_group["lr"] = lr
 
 
-def build_merged_dataframe(
-    root_dir: Path,
-    dataset_preset: Any,
-    only_fps: int,
-    logger: logging.Logger,
-) -> Any:
-    import pandas as pd
-
-    dataframe_list: list[Any] = []
-
-    for dataset_config in iter_dataset_configs(dataset_preset):
-        if dataset_config.fps != only_fps:
-            continue
-
-        csv_path = root_dir / f"{dataset_config.record_name}_preprocessed" / f"{dataset_config.mode_index}_raw_sequence_frame_index.csv"
-        if not csv_path.is_file():
-            logger.warning("Dataset CSV missing", extra={"csv_path": str(csv_path)})
-            continue
-
-        dataframe = pd.read_csv(csv_path)
-        dataframe["record"] = dataset_config.record
-        dataframe["mode"] = dataset_config.mode_path
-        dataframe_list.append(dataframe)
-        logger.info("Loaded dataset CSV %s rows=%s", csv_path, len(dataframe))
-
-    if len(dataframe_list) == 0:
-        raise RuntimeError(f"No dataset CSV found under root_dir={root_dir}")
-
-    merged = pd.concat(dataframe_list, ignore_index=True)
-    logger.info("Merged dataset size=%s", len(merged))
-    return merged
-
-
-def build_run_logger(log_root: Path) -> tuple[logging.Logger, Path]:
-    log_root.mkdir(parents=True, exist_ok=True)
-    run_dir = log_root / time.strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    logger = logging.getLogger("GFITrain")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S")
-
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    file_handler = logging.FileHandler(run_dir / "train.log")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    logger.info("Log dir: %s", run_dir)
-    return logger, run_dir
-
-
-def forward_model(
-    model_name: str,
-    model: Any,
-    img0: Any,
-    img1: Any,
-    embt: Any,
-    imgt: Any,
-    bmv: Any,
-    fmv: Any,
-) -> Any:
-    import torch
-
-    if model_name == "IFRNet":
-        flow = torch.cat([bmv, fmv], dim=1).float()
-        return model(img0, img1, embt, imgt, flow)
-
-    return model(img0, img1, embt, imgt, init_flow0=bmv, init_flow1=fmv)
-
-
-def build_loss_record(
-    loss_rec: Any,
-    loss_geo: Any,
-    loss_dis: Any,
-    total_loss: Any,
-) -> dict[str, float]:
-    return {
-        "loss_rec": float(loss_rec.detach().cpu()),
-        "loss_geo": float(loss_geo.detach().cpu()),
-        "loss_dis": float(loss_dis.detach().cpu()),
-        "loss_total": float(total_loss.detach().cpu()),
-    }
-
-
 def resolve_path(path_value: str) -> Path:
     return Path(path_value).expanduser().resolve()
 
 
-def read_resume_start_epoch(checkpoint_path: Path) -> int | None:
-    import torch
+def resolve_optional_path(path_value: str | None) -> Path | None:
+    if path_value is None:
+        return None
 
+    return resolve_path(path_value)
+
+
+def read_resume_start_epoch(checkpoint_path: Path) -> int | None:
     if not checkpoint_path.is_file():
         return None
 
@@ -212,6 +117,7 @@ def resolve_resume_path(user_resume_path: str | None, default_resume_path: str |
     resume_path = resolve_path(default_resume_path)
     if resume_path.is_file():
         return str(resume_path)
+
     return None
 
 
@@ -230,15 +136,103 @@ def resolve_output_dir(
     return build_unique_output_dir(resolve_path(default_output_dir)), "auto_fresh"
 
 
+def build_logger(output_dir: Path) -> tuple[logging.Logger, Path]:
+    logs_dir = output_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = logs_dir / time.strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("GFITrain")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    file_handler = logging.FileHandler(run_dir / "train.log")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    return logger, run_dir
+
+
+def build_merged_dataframe(
+    root_dir: Path,
+    dataset_preset_name: str,
+    only_fps: int,
+    logger: logging.Logger,
+) -> Any:
+    dataset_preset = get_dataset_preset(dataset_preset_name)
+    dataframe_list: list[Any] = []
+
+    for dataset_config in get_dataset_configs(dataset_preset):
+        if dataset_config.fps != only_fps:
+            continue
+
+        csv_path = root_dir / f"{dataset_config.record_name}_preprocessed" / f"{dataset_config.mode_index}_raw_sequence_frame_index.csv"
+        if not csv_path.is_file():
+            logger.warning("Dataset CSV missing: %s", csv_path)
+            continue
+
+        dataframe = pd.read_csv(csv_path)
+        dataframe["record"] = dataset_config.record
+        dataframe["mode"] = dataset_config.mode_path
+        dataframe_list.append(dataframe)
+        logger.info("Loaded dataset CSV %s rows=%s", csv_path, len(dataframe))
+
+    if len(dataframe_list) == 0:
+        raise RuntimeError(f"No dataset CSV found under root_dir={root_dir} for preset={dataset_preset_name}")
+
+    merged = pd.concat(dataframe_list, ignore_index=True)
+    logger.info("Merged dataset size=%s preset=%s", len(merged), dataset_preset_name)
+    return merged
+
+
+def get_dataset_configs(dataset_preset: Any) -> list[Any]:
+    return list(iter_dataset_configs(dataset_preset))
+
+
+def forward_model(
+    model_name: str,
+    model: Any,
+    img0: Any,
+    img1: Any,
+    embt: Any,
+    imgt: Any,
+    bmv: Any,
+    fmv: Any,
+) -> Any:
+    if model_name == "IFRNet":
+        flow = torch.cat([bmv, fmv], dim=1).float()
+        return model(img0, img1, embt, imgt, flow)
+
+    return model(img0, img1, embt, imgt, init_flow0=bmv, init_flow1=fmv)
+
+
+def build_loss_record(
+    loss_rec: Any,
+    loss_geo: Any,
+    loss_dis: Any,
+    total_loss: Any,
+) -> dict[str, float]:
+    return {
+        "loss_rec": float(loss_rec.detach().cpu()),
+        "loss_geo": float(loss_geo.detach().cpu()),
+        "loss_dis": float(loss_dis.detach().cpu()),
+        "loss_total": float(total_loss.detach().cpu()),
+    }
+
+
 def save_checkpoint(
-    checkpoint_path: str,
+    checkpoint_path: Path,
     model: Any,
     optimizer: Any,
     epoch: int,
     best_psnr: float,
 ) -> None:
-    import torch
-
     torch.save(
         {
             "model": model.state_dict(),
@@ -246,94 +240,67 @@ def save_checkpoint(
             "epoch": epoch,
             "best_psnr": best_psnr,
         },
-        checkpoint_path,
+        str(checkpoint_path),
     )
 
 
-@dataclass(frozen=True)
-class RunPlan:
-    mode: str
-    model_name: str
-    train_preset: str
-    test_preset: str
-    active_root_key: str
-    dataset_root_dir: str
-    csv_root_dir: str
-    output_dir: str
-    output_dir_reason: str
-    resume_path: str | None
-    epochs: int
-    batch_size: int
-    eval_interval: int
-    input_fps: int
-    only_fps: int
-
-
-@torch_no_grad()
 def evaluate(
     model_name: str,
     model: Any,
     loader: Any,
     device: Any,
 ) -> tuple[float, Any]:
-    import pandas as pd
-
     model.eval()
     evaluator = TaskEvaluator("VFI", VFI_METRICS)
-    records: list[dict[str, float]] = []
-    progress = make_tqdm(loader)
+    loss_records: list[dict[str, float]] = []
 
-    for batch in progress:
-        img0, imgt, img1, bmv, fmv, embt, info = batch
-        del info
-        img0 = img0.to(device)
-        img1 = img1.to(device)
-        imgt = imgt.to(device)
-        bmv = bmv.to(device)
-        fmv = fmv.to(device)
-        embt = embt.to(device)
+    with torch.no_grad():
+        for batch in tqdm(loader):
+            img0, imgt, img1, bmv, fmv, embt, _info = batch
+            img0 = img0.to(device)
+            img1 = img1.to(device)
+            imgt = imgt.to(device)
+            bmv = bmv.to(device)
+            fmv = fmv.to(device)
+            embt = embt.to(device)
 
-        imgt_pred, loss_rec, loss_geo, loss_dis, up_flow0_1, up_flow1_1, up_mask_1 = forward_model(
-            model_name,
-            model,
-            img0,
-            img1,
-            embt,
-            imgt,
-            bmv,
-            fmv,
-        )
-        del up_mask_1
-
-        total_loss = loss_rec + loss_geo + loss_dis
-        loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
-        batch_size = imgt_pred.shape[0]
-
-        for batch_index in range(batch_size):
-            pred_np = (imgt_pred[batch_index].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-            gt_np = (imgt[batch_index].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-            evaluator.evaluate(
-                meta={},
-                img_gt=gt_np,
-                img_pred=pred_np,
-                flow_1_to_0=up_flow0_1[batch_index],
-                flow_1_to_2=up_flow1_1[batch_index],
-                bmv=bmv[batch_index],
-                fmv=fmv[batch_index],
+            imgt_pred, loss_rec, loss_geo, loss_dis, up_flow0_1, up_flow1_1, up_mask_1 = forward_model(
+                model_name,
+                model,
+                img0,
+                img1,
+                embt,
+                imgt,
+                bmv,
+                fmv,
             )
-            records.append(loss_record)
 
-        progress.set_postfix(loss=f"Evaluate Loss {loss_record['loss_total']:.6f}")
+            total_loss = loss_rec + loss_geo + loss_dis
+            loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
+            batch_size = imgt_pred.shape[0]
 
-    dataframe = evaluator.to_dataframe()
-    loss_df = pd.DataFrame(records)
-    dataframe = pd.concat([dataframe.reset_index(drop=True), loss_df.reset_index(drop=True)], axis=1)
-    return float(dataframe["psnr"].mean()), dataframe
+            for batch_index in range(batch_size):
+                pred_np = (imgt_pred[batch_index].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
+                gt_np = (imgt[batch_index].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
+                evaluator.evaluate(
+                    meta={},
+                    img_gt=gt_np,
+                    img_pred=pred_np,
+                    flow_1_to_0=up_flow0_1[batch_index],
+                    flow_1_to_2=up_flow1_1[batch_index],
+                    bmv=bmv[batch_index],
+                    fmv=fmv[batch_index],
+                )
+                loss_records.append(loss_record)
+
+    metric_df = evaluator.to_dataframe()
+    loss_df = pd.DataFrame(loss_records)
+    eval_df = pd.concat([metric_df.reset_index(drop=True), loss_df.reset_index(drop=True)], axis=1)
+    return float(eval_df["psnr"].mean()), eval_df
 
 
 def train(
     args: argparse.Namespace,
-    model_name: str,
     model: Any,
     optimizer: Any,
     train_loader: Any,
@@ -342,20 +309,17 @@ def train(
     logger: logging.Logger,
     training_state: TrainingState,
 ) -> None:
-    import pandas as pd
-
     best_psnr = training_state.best_psnr
     global_step = training_state.global_step
+    checkpoints_dir = Path(args.output_dir) / "checkpoints"
 
     for epoch in range(training_state.start_epoch, args.epochs):
         model.train()
-        progress = make_tqdm(train_loader)
-        train_evaluator = TaskEvaluator("VFI", VFI_METRICS)
+        evaluator = TaskEvaluator("VFI", VFI_METRICS)
         train_loss_records: list[dict[str, float]] = []
 
-        for batch in progress:
-            img0, imgt, img1, bmv, fmv, embt, info = batch
-            del info
+        for batch in tqdm(train_loader):
+            img0, imgt, img1, bmv, fmv, embt, _info = batch
             img0 = img0.to(device)
             img1 = img1.to(device)
             imgt = imgt.to(device)
@@ -368,7 +332,7 @@ def train(
             optimizer.zero_grad()
 
             imgt_pred, loss_rec, loss_geo, loss_dis, up_flow0_1, up_flow1_1, up_mask_1 = forward_model(
-                model_name,
+                args.model_name,
                 model,
                 img0,
                 img1,
@@ -377,7 +341,6 @@ def train(
                 bmv,
                 fmv,
             )
-            del up_mask_1
 
             total_loss = loss_rec + loss_geo + loss_dis
             total_loss.backward()
@@ -389,7 +352,7 @@ def train(
             for batch_index in range(batch_size):
                 pred_np = (imgt_pred[batch_index].detach().permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
                 gt_np = (imgt[batch_index].detach().permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-                train_evaluator.evaluate(
+                evaluator.evaluate(
                     meta={},
                     img_gt=gt_np,
                     img_pred=pred_np,
@@ -400,43 +363,25 @@ def train(
                 )
                 train_loss_records.append(loss_record)
 
-            progress.set_postfix(
-                loss=f"Training Loss {loss_record['loss_total']:.6f}",
-                lr=f"{lr:.2e}",
-            )
             global_step += 1
 
         if (epoch + 1) % args.eval_interval == 0:
-            train_df = train_evaluator.to_dataframe()
+            train_metric_df = evaluator.to_dataframe()
             train_loss_df = pd.DataFrame(train_loss_records)
-            train_df = pd.concat([train_df.reset_index(drop=True), train_loss_df.reset_index(drop=True)], axis=1)
+            train_df = pd.concat([train_metric_df.reset_index(drop=True), train_loss_df.reset_index(drop=True)], axis=1)
             train_psnr = float(train_df["psnr"].mean())
-            train_csv_path = Path(args.output_dir) / "checkpoints" / f"train_epoch_{epoch + 1}.csv"
-            train_df.to_csv(train_csv_path, index=False)
-            logger.info("Epoch %s Train PSNR %.6f", epoch + 1, train_psnr)
+            train_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}.csv", index=False)
+            logger.info("Epoch %s train_psnr=%.6f", epoch + 1, train_psnr)
 
-            test_psnr, test_df = evaluate(model_name, model, test_loader, device)
-            test_csv_path = Path(args.output_dir) / "checkpoints" / f"test_epoch_{epoch + 1}.csv"
-            test_df.to_csv(test_csv_path, index=False)
-            logger.info("Epoch %s Test PSNR %.6f", epoch + 1, test_psnr)
+            test_psnr, test_df = evaluate(args.model_name, model, test_loader, device)
+            test_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}.csv", index=False)
+            logger.info("Epoch %s test_psnr=%.6f", epoch + 1, test_psnr)
 
             if test_psnr > best_psnr:
                 best_psnr = test_psnr
-                save_checkpoint(
-                    str(Path(args.output_dir) / "checkpoints" / "best.pth"),
-                    model,
-                    optimizer,
-                    epoch,
-                    best_psnr,
-                )
+                save_checkpoint(checkpoints_dir / "best.pth", model, optimizer, epoch, best_psnr)
 
-        save_checkpoint(
-            str(Path(args.output_dir) / "checkpoints" / "latest.pth"),
-            model,
-            optimizer,
-            epoch,
-            best_psnr,
-        )
+        save_checkpoint(checkpoints_dir / "latest.pth", model, optimizer, epoch, best_psnr)
 
 
 def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -445,10 +390,9 @@ def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-name", default="IFRNet", choices=["IFRNet", "IFRNet_Residual"])
     parser.add_argument("--root-dir", default="./datasets/data", help="Directory containing preprocessed CSV indexes.")
     parser.add_argument("--dataset-root-dir", default=None, type=str, help="Root directory containing frame and velocity assets.")
-    parser.add_argument("--paths-config", default=None, type=str, help="Optional path to the shared paths config.")
+    parser.add_argument("--paths-config", default=None, type=str, help="Optional path to configs/paths/default.yaml.")
     parser.add_argument("--train-preset", default="train_vfx_0416", choices=list_dataset_presets())
     parser.add_argument("--test-preset", default="test_vfx_0416", choices=list_dataset_presets())
-    parser.add_argument("--resume-epoch", default=None, type=int, help="Optional sanity check for the next epoch when resuming.")
     parser.add_argument("--epochs", default=60, type=int, help="Total number of epochs to run.")
     parser.add_argument("--resume-path", default=None, type=str, help="Checkpoint to resume from.")
     parser.add_argument("--eval-interval", default=1, type=int, help="Run validation every N epochs.")
@@ -472,8 +416,8 @@ def prepare_args(args: argparse.Namespace) -> argparse.Namespace:
     )
 
     if args.dataset_root_dir is None:
-        paths_config_path: Path | None = resolve_optional_path(args.paths_config)
-        args.dataset_root_dir = str(resolve_active_dataset_root(paths_config_path=paths_config_path))
+        paths_config_path = resolve_optional_path(args.paths_config)
+        args.dataset_root_dir = str(resolve_active_dataset_root(paths_config_path))
 
     return args
 
@@ -485,8 +429,6 @@ def load_training_state(
     device: Any,
     logger: logging.Logger,
 ) -> TrainingState:
-    import torch
-
     if args.resume_path is not None:
         checkpoint = torch.load(args.resume_path, map_location=device)
         model.load_state_dict(checkpoint["model"])
@@ -498,23 +440,21 @@ def load_training_state(
             start_epoch=start_epoch,
             global_step=start_epoch * args.iters_per_epoch,
             best_psnr=float(checkpoint.get("best_psnr", 0.0)),
-            resume_path=args.resume_path,
             mode="resume",
         )
 
     pretrained_path = get_model_config(args.model_name)["pretrained_checkpoint"]
     if pretrained_path is not None:
-        pretrained_path = str(resolve_path(pretrained_path))
-        if not os.path.isfile(pretrained_path):
-            raise FileNotFoundError(f"Pretrained checkpoint not found: {pretrained_path}")
+        pretrained_checkpoint_path = resolve_path(pretrained_path)
+        if not pretrained_checkpoint_path.is_file():
+            raise FileNotFoundError(f"Pretrained checkpoint not found: {pretrained_checkpoint_path}")
 
-        logger.info("Loading pretrained checkpoint from %s", pretrained_path)
-        model.load_state_dict(torch.load(pretrained_path, map_location=device))
+        logger.info("Loading pretrained checkpoint from %s", pretrained_checkpoint_path)
+        model.load_state_dict(torch.load(str(pretrained_checkpoint_path), map_location=device))
         return TrainingState(
             start_epoch=0,
             global_step=0,
             best_psnr=0.0,
-            resume_path=None,
             mode="pretrained",
         )
 
@@ -523,26 +463,26 @@ def load_training_state(
         start_epoch=0,
         global_step=0,
         best_psnr=0.0,
-        resume_path=None,
         mode="scratch",
     )
 
 
 def log_run_summary(
     args: argparse.Namespace,
-    training_state: TrainingState,
     train_dataset: Any,
     test_dataset: Any,
-    logger: logging.Logger,
+    training_state: TrainingState,
     device: Any,
+    logger: logging.Logger,
 ) -> None:
     logger.info(
-        "Starting run with model=%s mode=%s device=%s output_dir=%s output_dir_reason=%s train_samples=%s test_samples=%s start_epoch=%s epochs=%s batch_size=%s",
+        "model=%s mode=%s device=%s output_dir=%s output_dir_reason=%s dataset_root_dir=%s train_samples=%s test_samples=%s start_epoch=%s epochs=%s batch_size=%s",
         args.model_name,
         training_state.mode,
         device,
         args.output_dir,
         args.output_dir_reason,
+        args.dataset_root_dir,
         len(train_dataset),
         len(test_dataset),
         training_state.start_epoch,
@@ -551,52 +491,44 @@ def log_run_summary(
     )
 
 
-def build_run_plan(args: argparse.Namespace) -> RunPlan:
-    return RunPlan(
-        mode=args.mode,
-        model_name=args.model_name,
-        train_preset=args.train_preset,
-        test_preset=args.test_preset,
-        active_root_key=ACTIVE_DATASET_ROOT_KEY,
-        dataset_root_dir=args.dataset_root_dir,
-        csv_root_dir=str(resolve_path(args.root_dir)),
-        output_dir=args.output_dir,
-        output_dir_reason=args.output_dir_reason,
-        resume_path=args.resume_path,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        eval_interval=args.eval_interval,
-        input_fps=args.input_fps,
-        only_fps=args.only_fps,
-    )
+def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "mode": args.mode,
+        "model_name": args.model_name,
+        "train_preset": args.train_preset,
+        "test_preset": args.test_preset,
+        "active_root_key": ACTIVE_DATASET_ROOT_KEY,
+        "dataset_root_dir": args.dataset_root_dir,
+        "csv_root_dir": str(resolve_path(args.root_dir)),
+        "output_dir": args.output_dir,
+        "output_dir_reason": args.output_dir_reason,
+        "resume_path": args.resume_path,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "eval_interval": args.eval_interval,
+        "input_fps": args.input_fps,
+        "only_fps": args.only_fps,
+    }
 
 
 def run_training(args: argparse.Namespace) -> None:
-    import torch
-    import torch.optim as optim
-    from torch.utils.data import DataLoader
+    output_dir = Path(args.output_dir)
+    checkpoints_dir = output_dir / "checkpoints"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
-    from src.data.dataset_loader import VFITrainDataset
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
-
-    logger, run_dir = build_run_logger(Path(args.output_dir) / "logs")
+    logger, run_dir = build_logger(output_dir)
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Device %s", device)
+    logger.info("device=%s", device)
 
-    train_preset = get_dataset_preset(args.train_preset)
-    test_preset = get_dataset_preset(args.test_preset)
+    train_df = build_merged_dataframe(resolve_path(args.root_dir), args.train_preset, args.only_fps, logger)
+    test_df = build_merged_dataframe(resolve_path(args.root_dir), args.test_preset, args.only_fps, logger)
+    if "valid" in train_df.columns:
+        train_df = train_df[train_df["valid"] == True]
 
-    merged_df = build_merged_dataframe(resolve_path(args.root_dir), train_preset, only_fps=args.only_fps, logger=logger)
-    test_df = build_merged_dataframe(resolve_path(args.root_dir), test_preset, only_fps=args.only_fps, logger=logger)
-    if "valid" in merged_df.columns:
-        merged_df = merged_df[merged_df["valid"] == True]
-
-    train_dataset = VFITrainDataset(merged_df, args.dataset_root_dir, augment=True, input_fps=args.input_fps)
-    test_dataset = VFITrainDataset(test_df, args.dataset_root_dir, augment=False, input_fps=args.input_fps)
-
+    train_dataset = VFITrainDataset(train_df, args.dataset_root_dir, True, args.input_fps)
+    test_dataset = VFITrainDataset(test_df, args.dataset_root_dir, False, args.input_fps)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True)
 
@@ -606,12 +538,11 @@ def run_training(args: argparse.Namespace) -> None:
     optimizer = optim.AdamW(model.parameters(), lr=args.lr_start, weight_decay=0)
     training_state = load_training_state(args, model, optimizer, device, logger)
 
-    log_run_summary(args, training_state, train_dataset, test_dataset, logger, device)
-    logger.info("Run log directory %s", run_dir)
+    log_run_summary(args, train_dataset, test_dataset, training_state, device, logger)
+    logger.info("run_log_dir=%s", run_dir)
 
     train(
         args,
-        args.model_name,
         model,
         optimizer,
         train_loader,
@@ -622,32 +553,12 @@ def run_training(args: argparse.Namespace) -> None:
     )
 
 
-def resolve_optional_path(path_value: str | None) -> Path | None:
-    if path_value is None:
-        return None
-
-    return resolve_path(path_value)
-
-
-def make_tqdm(iterable: Any) -> Any:
-    from tqdm import tqdm
-
-    return tqdm(iterable)
-
-
-def torch_no_grad() -> Any:
-    import torch
-
-    return torch.no_grad()
-
-
 def main(argv: list[str] | None = None) -> None:
     args = parse_train_args(argv)
     args = prepare_args(args)
-    run_plan = build_run_plan(args)
 
     if args.mode == "dry-run":
-        print(json.dumps(asdict(run_plan), indent=2))
+        print(json.dumps(build_dry_run_summary(args), indent=2))
         return
 
     run_training(args)

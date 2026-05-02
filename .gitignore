@@ -5,12 +5,25 @@ __pycache__/
 *.pyo
 *.pyd
 
-outputs/checkpoints/*
-!outputs/checkpoints/.gitkeep
-outputs/logs/*
-!outputs/logs/.gitkeep
-outputs/predictions/*
-!outputs/predictions/.gitkeep
-outputs/figures/*
-!outputs/figures/.gitkeep
+# Generated artifacts
+outputs/
+data/
+dataset/
+datasets/
 
+# Local dataset mounts outside the formal repo layout
+*.zip
+
+# Keep tracked placeholders if you decide to add them later
+!outputs/.gitkeep
+!outputs/**/.gitkeep
+
+# Personal or machine-specific config overrides
+configs/**/*local*.yaml
+configs/**/*private*.yaml
+configs/**/*secret*.yaml
+configs/**/*override*.yaml
+configs/**/*user*.yaml
+configs/**/*machine*.yaml
+*.env
+*.env.*

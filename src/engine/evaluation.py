@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
+import pandas as pd
 
 VFI_METRICS: tuple[str, ...] = ("psnr",)
 
@@ -26,19 +27,10 @@ class TaskEvaluator:
         bmv: Any,
         fmv: Any,
     ) -> None:
-        del meta
-        del flow_1_to_0
-        del flow_1_to_2
-        del bmv
-        del fmv
-
         diff = img_gt.astype("float32") - img_pred.astype("float32")
         mse = float((diff * diff).mean())
         psnr = float("inf") if mse == 0.0 else 20.0 * math.log10(255.0) - 10.0 * math.log10(mse)
         self.records.append({"psnr": psnr})
 
     def to_dataframe(self) -> Any:
-        import pandas as pd
-
         return pd.DataFrame(self.records)
-

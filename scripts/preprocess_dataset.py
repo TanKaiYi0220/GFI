@@ -1,151 +1,232 @@
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 import sys
+
+import pandas as pd
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset_config import ACTIVE_DATASET_ROOT_KEY
-from src.data.dataset_config import build_sequence_directory
+from src.data.dataset_config import DatasetConfig
 from src.data.dataset_config import get_dataset_preset
 from src.data.dataset_config import iter_dataset_configs
-from src.data.dataset_config import list_dataset_presets
-from src.data.dataset import DatasetSample
-from src.data.dataset import collect_samples_from_directories
-from src.data.dataset import resolve_split_directory
-
-INPUT_FRAME_NAMES: list[str] = ["frame_000.png", "frame_002.png"]
-TARGET_FRAME_NAME: str = "frame_001.png"
-
-
-def parse_args() -> argparse.Namespace:
-    """Parse dataset preprocessing arguments."""
-    parser: argparse.ArgumentParser = argparse.ArgumentParser(description="Dataset preprocessing template.")
-    parser.add_argument("--dataset-root", required=False, help="Root directory that contains train, val, or test folders.")
-    parser.add_argument("--split", required=False, help="Split name under the dataset root, such as train or val.")
-    parser.add_argument("--dataset-preset", required=False, help=f"Named preset from dataset_config.py. Available presets: {', '.join(list_dataset_presets())}.")
-    parser.add_argument("--paths-config", required=False, help="Optional path to the shared paths config YAML file.")
-    parser.add_argument("--output-dir", required=True, help="Directory where processed files should be written.")
-    parser.add_argument("--mode", required=True, choices=["dry-run", "scan", "run"], help="Use 'scan' to validate dataset layout or 'run' after filling the template hooks.")
-    return parser.parse_args()
+from src.data.dataset_config import resolve_active_dataset_root
+from src.data.manual_labeling import review_images
+from src.data.preprocess import apply_linearity_check
+from src.data.preprocess import build_difficult_only_dataframe
+from src.data.preprocess import build_frame_index_csv_path
+from src.data.preprocess import build_frame_index_for_mode
+from src.data.preprocess import build_preprocessed_csv_path
+from src.data.preprocess import build_raw_sequence_dataframe
+from src.data.preprocess import check_identical_images_cross_fps
+from src.data.preprocess import merge_easy_medium_dataframes
+from src.data.preprocess import remove_identical_frames
+from src.utils.io import ensure_directory
 
 
-def main() -> int:
-    """Load preprocessing arguments and run the selected mode."""
-    args: argparse.Namespace = parse_args()
-    output_dir: Path = Path(args.output_dir).resolve()
-    dataset_root_arg: str | None = args.dataset_root
-    split_name: str | None = args.split
-    dataset_preset_name: str | None = args.dataset_preset
-    paths_config_path: Path | None = Path(args.paths_config).resolve() if args.paths_config is not None else None
+DATASET_PRESET_NAME: str = "test_3d_vfx_0326"
+DATASET_ROOT_DIR_OVERRIDE: str | None = None
+PATHS_CONFIG_PATH: str | None = None
+DATA_DIR: str = "./data"
+MERGE_STRATEGY: str = "only-difficult"
+ONLY_FPS: int = 60
 
-    if args.mode == "dry-run":
-        if dataset_preset_name is not None:
-            sequence_directories: list[Path] = collect_preset_directories(
-                dataset_preset_name=dataset_preset_name,
-                paths_config_path=paths_config_path,
-            )
-            print(f"dataset_preset={dataset_preset_name}")
-            print(f"active_root_key={ACTIVE_DATASET_ROOT_KEY}")
-            print(f"sequence_count={len(sequence_directories)}")
-            print(f"first_sequence_dir={sequence_directories[0]}")
-        else:
-            dataset_root: Path = require_dataset_root(dataset_root_arg=dataset_root_arg)
-            resolved_split_name: str = require_split_name(split_name=split_name)
-            print(f"dataset_root={dataset_root}")
-            print(f"split={resolved_split_name}")
-        print(f"output_dir={output_dir}")
-        print(f"input_frame_names={INPUT_FRAME_NAMES}")
-        print(f"target_frame_name={TARGET_FRAME_NAME}")
-        return 0
-
-    if dataset_preset_name is not None:
-        sequence_directories = collect_preset_directories(
-            dataset_preset_name=dataset_preset_name,
-            paths_config_path=paths_config_path,
-        )
-        if args.mode == "scan":
-            print(f"sequence_count={len(sequence_directories)}")
-            print(f"first_sequence_dir={sequence_directories[0]}")
-            return 0
-
-        run_preset_preprocess_template(sequence_directories=sequence_directories, output_dir=output_dir)
-        return 0
-
-    dataset_root = require_dataset_root(dataset_root_arg=dataset_root_arg)
-    resolved_split_name = require_split_name(split_name=split_name)
-    split_root: Path = resolve_split_directory(dataset_root=dataset_root, split_name=resolved_split_name)
-    samples: list[DatasetSample] = collect_samples_from_directories(
-        split_root=split_root,
-        split_name=resolved_split_name,
-        input_frame_names=INPUT_FRAME_NAMES,
-        target_frame_name=TARGET_FRAME_NAME,
-    )
-
-    if args.mode == "scan":
-        print(f"sample_count={len(samples)}")
-        print(f"first_sample_id={samples[0]['sample_id']}")
-        print(f"first_sample_dir={samples[0]['metadata']['sample_dir']}")
-        return 0
-
-    run_custom_preprocess_template(samples=samples, output_dir=output_dir)
-    return 0
+DRY_RUN: bool = True
+REMOVE_IDENTICAL: bool = False
+CHECK_IDENTICAL_CROSS_FPS: bool = False
+MANUAL_LABELING: bool = False
+MERGE_DATASETS: bool = False
+RAW_SEQUENCE: bool = False
+LINEARITY_CHECK: bool = False
 
 
-def run_custom_preprocess_template(
-    samples: list[DatasetSample],
-    output_dir: Path,
+def resolve_dataset_root_dir(dataset_root_dir: str | None, paths_config: str | None) -> Path:
+    if dataset_root_dir is not None:
+        return Path(dataset_root_dir).expanduser().resolve()
+
+    paths_config_path = Path(paths_config).expanduser().resolve() if paths_config is not None else None
+    return resolve_active_dataset_root(paths_config_path)
+
+
+def get_target_configs(dataset_preset_name: str) -> list[DatasetConfig]:
+    dataset_preset = get_dataset_preset(dataset_preset_name)
+    return list(iter_dataset_configs(dataset_preset))
+
+
+def should_use_sequence_config(dataset_config: DatasetConfig, merge_strategy: str) -> bool:
+    if merge_strategy == "only-difficult":
+        return dataset_config.difficulty == "Difficult"
+
+    return dataset_config.difficulty == "Medium"
+
+
+def print_run_summary(
+    dataset_root_dir: Path,
+    data_dir: Path,
+    dataset_configs: list[DatasetConfig],
 ) -> None:
-    """Run the custom preprocessing template after the project-specific hooks are implemented."""
-    for sample in samples:
-        preprocess_sample(sample=sample, output_dir=output_dir)
+    print(f"dataset_preset={DATASET_PRESET_NAME}")
+    print(f"active_root_key={ACTIVE_DATASET_ROOT_KEY}")
+    print(f"dataset_root_dir={dataset_root_dir}")
+    print(f"data_dir={data_dir}")
+    print(f"config_count={len(dataset_configs)}")
+    print(f"merge_strategy={MERGE_STRATEGY}")
+    print(f"only_fps={ONLY_FPS}")
 
 
-def run_preset_preprocess_template(sequence_directories: list[Path], output_dir: Path) -> None:
-    """Run the custom preprocessing template for dataset presets."""
-    for sequence_directory in sequence_directories:
-        preprocess_sequence(sequence_directory=sequence_directory, output_dir=output_dir)
+def run_remove_identical(dataset_root_dir: Path, data_dir: Path, dataset_configs: list[DatasetConfig]) -> None:
+    for dataset_config in dataset_configs:
+        print(f"Processing record={dataset_config.record_name} mode={dataset_config.mode_path}")
+        raw_df = build_frame_index_for_mode(dataset_root_dir, dataset_config.record, dataset_config.mode_path)
+        raw_df = raw_df.sort_values(by="frame_idx").reset_index(drop=True)
+        raw_df = remove_identical_frames(raw_df, dataset_root_dir)
+        output_path = build_frame_index_csv_path(data_dir, dataset_config.record_name, dataset_config.mode_name)
+        ensure_directory(output_path.parent)
+        raw_df.to_csv(output_path, index=False)
+        print(output_path)
 
 
-def preprocess_sample(sample: DatasetSample, output_dir: Path) -> None:
-    """Replace this hook with your sample-level preprocessing logic."""
-    raise NotImplementedError(
-        "Implement preprocess_sample() in scripts/preprocess_dataset.py with your custom preprocessing logic.",
-    )
+def run_check_cross_fps(dataset_root_dir: Path, data_dir: Path, dataset_configs: list[DatasetConfig]) -> None:
+    for dataset_config in dataset_configs:
+        if dataset_config.fps != 30:
+            continue
+
+        fps_60_name = dataset_config.mode_name.replace("fps_30", "fps_60")
+        fps_30_path = build_frame_index_csv_path(data_dir, dataset_config.record_name, dataset_config.mode_name)
+        fps_60_path = build_frame_index_csv_path(data_dir, dataset_config.record_name, fps_60_name)
+        fps_30_df = pd.read_csv(fps_30_path, dtype={"reason": "string"})
+        fps_60_df = pd.read_csv(fps_60_path, dtype={"reason": "string"})
+
+        print(f"Checking record={dataset_config.record_name} mode={dataset_config.mode_name}")
+        check_identical_images_cross_fps(fps_30_df, fps_60_df, dataset_root_dir)
 
 
-def preprocess_sequence(sequence_directory: Path, output_dir: Path) -> None:
-    """Replace this hook with your sequence-level preprocessing logic."""
-    raise NotImplementedError(
-        "Implement preprocess_sequence() in scripts/preprocess_dataset.py with your preset-based preprocessing logic.",
-    )
+def run_manual_labeling(dataset_root_dir: Path, data_dir: Path, dataset_configs: list[DatasetConfig]) -> None:
+    for dataset_config in dataset_configs:
+        if dataset_config.difficulty != "Medium":
+            continue
+
+        easy_mode_name = dataset_config.mode_name.replace("Medium", "Easy")
+        easy_path = build_frame_index_csv_path(data_dir, dataset_config.record_name, easy_mode_name)
+        medium_path = build_frame_index_csv_path(data_dir, dataset_config.record_name, dataset_config.mode_name)
+        easy_df = pd.read_csv(easy_path, dtype={"reason": "string"})
+        medium_df = pd.read_csv(medium_path, dtype={"reason": "string"})
+
+        print(f"Manual labeling record={dataset_config.record_name} mode={dataset_config.mode_name}")
+        review_images(easy_df, medium_df, dataset_root_dir)
+        easy_df.to_csv(easy_path, index=False)
+        medium_df.to_csv(medium_path, index=False)
 
 
-def collect_preset_directories(dataset_preset_name: str, paths_config_path: Path | None) -> list[Path]:
-    """Resolve all sequence directories defined by one dataset preset."""
-    dataset_preset = get_dataset_preset(preset_name=dataset_preset_name)
-    sequence_directories: list[Path] = []
+def run_merge(data_dir: Path, dataset_configs: list[DatasetConfig], merge_strategy: str) -> None:
+    for dataset_config in dataset_configs:
+        if merge_strategy == "only-difficult":
+            if dataset_config.difficulty != "Difficult":
+                continue
 
-    for dataset_config in iter_dataset_configs(dataset_preset=dataset_preset):
-        sequence_directories.append(
-            build_sequence_directory(dataset_config=dataset_config, paths_config_path=paths_config_path),
+            input_path = build_frame_index_csv_path(data_dir, dataset_config.record_name, dataset_config.mode_name)
+            dataframe = pd.read_csv(input_path, dtype={"reason": "string"})
+            merged_df = build_difficult_only_dataframe(dataframe)
+        else:
+            if dataset_config.difficulty != "Medium":
+                continue
+
+            medium_path = build_frame_index_csv_path(data_dir, dataset_config.record_name, dataset_config.mode_name)
+            medium_df = pd.read_csv(medium_path, dtype={"reason": "string"})
+
+            if merge_strategy == "ignore-easy":
+                merged_df = medium_df.copy()
+                merged_df["global_is_valid"] = medium_df["is_valid"]
+            else:
+                easy_mode_name = dataset_config.mode_name.replace("Medium", "Easy")
+                easy_path = build_frame_index_csv_path(data_dir, dataset_config.record_name, easy_mode_name)
+                easy_df = pd.read_csv(easy_path, dtype={"reason": "string"})
+                merged_df = merge_easy_medium_dataframes(easy_df, medium_df)
+
+        output_path = build_preprocessed_csv_path(
+            data_dir,
+            dataset_config.record_name,
+            dataset_config.mode_index,
+            "merged_frame_index",
         )
-
-    return sequence_directories
-
-
-def require_dataset_root(dataset_root_arg: str | None) -> Path:
-    """Resolve the dataset root for split-based scanning."""
-    return Path(dataset_root_arg or "").resolve()
+        ensure_directory(output_path.parent)
+        merged_df.to_csv(output_path, index=False)
+        print(output_path)
 
 
-def require_split_name(split_name: str | None) -> str:
-    """Resolve the split name for split-based scanning."""
-    return split_name or ""
+def run_raw_sequence(data_dir: Path, dataset_configs: list[DatasetConfig], merge_strategy: str, only_fps: int) -> None:
+    for dataset_config in dataset_configs:
+        if not should_use_sequence_config(dataset_config, merge_strategy):
+            continue
+        if dataset_config.fps != only_fps:
+            continue
+
+        fps_30_index = dataset_config.mode_index.replace("fps_60", "fps_30")
+        df_30_path = build_preprocessed_csv_path(data_dir, dataset_config.record_name, fps_30_index, "merged_frame_index")
+        df_60_path = build_preprocessed_csv_path(data_dir, dataset_config.record_name, dataset_config.mode_index, "merged_frame_index")
+        df_30 = pd.read_csv(df_30_path, dtype={"reason_easy": "string", "reason_medium": "string"})
+        df_60 = pd.read_csv(df_60_path, dtype={"reason_easy": "string", "reason_medium": "string"})
+
+        raw_seq_df = build_raw_sequence_dataframe(df_30, df_60, dataset_config)
+        output_path = build_preprocessed_csv_path(
+            data_dir,
+            dataset_config.record_name,
+            dataset_config.mode_index,
+            "raw_sequence_frame_index",
+        )
+        ensure_directory(output_path.parent)
+        raw_seq_df.to_csv(output_path, index=False)
+        print(output_path)
+
+
+def run_linearity_check(dataset_root_dir: Path, data_dir: Path, dataset_configs: list[DatasetConfig], merge_strategy: str, only_fps: int) -> None:
+    for dataset_config in dataset_configs:
+        if not should_use_sequence_config(dataset_config, merge_strategy):
+            continue
+        if dataset_config.fps != only_fps:
+            continue
+
+        raw_sequence_path = build_preprocessed_csv_path(
+            data_dir,
+            dataset_config.record_name,
+            dataset_config.mode_index,
+            "raw_sequence_frame_index",
+        )
+        raw_seq_df = pd.read_csv(raw_sequence_path)
+        raw_seq_df = apply_linearity_check(raw_seq_df, dataset_root_dir, dataset_config)
+        raw_seq_df.to_csv(raw_sequence_path, index=False)
+        print(raw_sequence_path)
+
+
+def main() -> None:
+    dataset_root_dir = resolve_dataset_root_dir(DATASET_ROOT_DIR_OVERRIDE, PATHS_CONFIG_PATH)
+    data_dir = Path(DATA_DIR).expanduser().resolve()
+    dataset_configs = get_target_configs(DATASET_PRESET_NAME)
+
+    if DRY_RUN:
+        print_run_summary(dataset_root_dir, data_dir, dataset_configs)
+
+    if REMOVE_IDENTICAL:
+        run_remove_identical(dataset_root_dir, data_dir, dataset_configs)
+
+    if CHECK_IDENTICAL_CROSS_FPS:
+        run_check_cross_fps(dataset_root_dir, data_dir, dataset_configs)
+
+    if MANUAL_LABELING:
+        run_manual_labeling(dataset_root_dir, data_dir, dataset_configs)
+
+    if MERGE_DATASETS:
+        run_merge(data_dir, dataset_configs, MERGE_STRATEGY)
+
+    if RAW_SEQUENCE:
+        run_raw_sequence(data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
+
+    if LINEARITY_CHECK:
+        run_linearity_check(dataset_root_dir, data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

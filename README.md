@@ -87,22 +87,52 @@ python scripts/inference.py --config configs/experiment/exp001.yaml --checkpoint
 
 ### Component Validation
 
-Check whether one split-based dataset layout can be scanned correctly.
+Edit the global variables at the top of `scripts/preprocess_dataset.py` to choose the preset, paths, merge strategy, and which preprocessing steps should run.
 
 ```powershell
-python scripts/preprocess_dataset.py --dataset-root C:\dataset --split train --output-dir C:\dataset_processed --mode scan
+python scripts/preprocess_dataset.py
 ```
 
-Run split-based preprocessing after implementing `preprocess_sample()`.
+Set `REMOVE_IDENTICAL = True` to generate one raw frame-index CSV per mode and mark frames identical to the previous frame as invalid.
 
 ```powershell
-python scripts/preprocess_dataset.py --dataset-root C:\dataset --split train --output-dir C:\dataset_processed --mode run
+python scripts/preprocess_dataset.py
 ```
 
-Check whether one dataset preset expands into the expected sequence directories.
+Set `CHECK_IDENTICAL_CROSS_FPS = True` to compare the generated 30fps and 60fps frame-index CSV files for cross-FPS image consistency.
 
 ```powershell
-python scripts/preprocess_dataset.py --dataset-preset train_vfx_0416 --output-dir C:\dataset_processed --mode dry-run
+python scripts/preprocess_dataset.py
+```
+
+Set `MANUAL_LABELING = True` to launch the Easy-vs-Medium review loop after implementing `review_images()` in `src/data/manual_labeling.py`.
+
+```powershell
+python scripts/preprocess_dataset.py
+```
+
+Set `MERGE_DATASETS = True`. Use `MERGE_STRATEGY = "only-difficult"` for the VFX-style workflow or switch to `merge-easy-medium` when you need one shared validity mask.
+
+```powershell
+python scripts/preprocess_dataset.py
+```
+
+Set `RAW_SEQUENCE = True` to generate `raw_sequence_frame_index.csv` files from the preprocessed 30fps and 60fps validity CSV files.
+
+```powershell
+python scripts/preprocess_dataset.py
+```
+
+Set `LINEARITY_CHECK = True` to append linearity statistics after implementing `load_backward_velocity()` in `src/data/image_ops.py`.
+
+```powershell
+python scripts/preprocess_dataset.py
+```
+
+Enable several global step flags at once when you want one end-to-end pass instead of one command per stage.
+
+```powershell
+python scripts/preprocess_dataset.py
 ```
 
 Summarize one split-based dataset to verify sample count and frame-count distribution.
