@@ -18,7 +18,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
+PROJECT_ROOT: Path = Path(__file__).parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -32,6 +32,7 @@ from src.engine.evaluation import TaskEvaluator
 from src.engine.evaluation import VFI_METRICS
 from src.models.registry import get_model_class
 from src.models.registry import get_model_config
+from src.utils.config import load_yaml_file
 
 
 @dataclass(frozen=True)
@@ -60,17 +61,6 @@ def set_lr(optimizer: Any, lr: float) -> None:
         param_group["lr"] = lr
 
 
-def resolve_path(path_value: str) -> Path:
-    return Path(path_value).expanduser().resolve()
-
-
-def resolve_optional_path(path_value: str | None) -> Path | None:
-    if path_value is None:
-        return None
-
-    return resolve_path(path_value)
-
-
 def read_resume_start_epoch(checkpoint_path: Path) -> int | None:
     if not checkpoint_path.is_file():
         return None
@@ -96,7 +86,7 @@ def build_unique_output_dir(base_dir: Path) -> str:
 
 
 def build_resume_output_dir(resume_path: str, start_epoch: int | None) -> str:
-    checkpoint_path = resolve_path(resume_path)
+    checkpoint_path = Path(resume_path)
     source_output_dir = checkpoint_path.parent.parent
     checkpoint_name = checkpoint_path.stem
     resume_epoch_label = f"e{start_epoch}" if start_epoch is not None else "resume"
@@ -106,7 +96,7 @@ def build_resume_output_dir(resume_path: str, start_epoch: int | None) -> str:
 
 def resolve_resume_path(user_resume_path: str | None, default_resume_path: str | None) -> str | None:
     if user_resume_path is not None:
-        resume_path = resolve_path(user_resume_path)
+        resume_path = Path(user_resume_path)
         if not resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         return str(resume_path)
@@ -114,7 +104,7 @@ def resolve_resume_path(user_resume_path: str | None, default_resume_path: str |
     if default_resume_path is None:
         return None
 
-    resume_path = resolve_path(default_resume_path)
+    resume_path = Path(default_resume_path)
     if resume_path.is_file():
         return str(resume_path)
 
@@ -127,13 +117,13 @@ def resolve_output_dir(
     default_output_dir: str,
 ) -> tuple[str, str]:
     if output_dir is not None:
-        return str(resolve_path(output_dir)), "user"
+        return str(Path(output_dir)), "user"
 
     if resume_path is not None:
-        start_epoch = read_resume_start_epoch(resolve_path(resume_path))
+        start_epoch = read_resume_start_epoch(Path(resume_path))
         return build_resume_output_dir(resume_path, start_epoch), "auto_resume"
 
-    return build_unique_output_dir(resolve_path(default_output_dir)), "auto_fresh"
+    return build_unique_output_dir(Path(default_output_dir)), "auto_fresh"
 
 
 def build_logger(output_dir: Path) -> tuple[logging.Logger, Path]:
@@ -168,7 +158,7 @@ def build_merged_dataframe(
     dataset_preset = get_dataset_preset(dataset_preset_name)
     dataframe_list: list[Any] = []
 
-    for dataset_config in get_dataset_configs(dataset_preset):
+    for dataset_config in iter_dataset_configs(dataset_preset):
         if dataset_config.fps != only_fps:
             continue
 
@@ -189,10 +179,6 @@ def build_merged_dataframe(
     merged = pd.concat(dataframe_list, ignore_index=True)
     logger.info("Merged dataset size=%s preset=%s", len(merged), dataset_preset_name)
     return merged
-
-
-def get_dataset_configs(dataset_preset: Any) -> list[Any]:
-    return list(iter_dataset_configs(dataset_preset))
 
 
 def forward_model(
@@ -385,25 +371,66 @@ def train(
 
 
 def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train IFRNet variants on the VFI dataset.")
-    parser.add_argument("--mode", default="dry-run", choices=["dry-run", "train"])
-    parser.add_argument("--model-name", default="IFRNet", choices=["IFRNet", "IFRNet_Residual"])
-    parser.add_argument("--root-dir", default="./datasets/data", help="Directory containing preprocessed CSV indexes.")
-    parser.add_argument("--dataset-root-dir", default=None, type=str, help="Root directory containing frame and velocity assets.")
-    parser.add_argument("--paths-config", default=None, type=str, help="Optional path to configs/paths/default.yaml.")
-    parser.add_argument("--train-preset", default="train_vfx_0416", choices=list_dataset_presets())
-    parser.add_argument("--test-preset", default="test_vfx_0416", choices=list_dataset_presets())
-    parser.add_argument("--epochs", default=60, type=int, help="Total number of epochs to run.")
-    parser.add_argument("--resume-path", default=None, type=str, help="Checkpoint to resume from.")
-    parser.add_argument("--eval-interval", default=1, type=int, help="Run validation every N epochs.")
-    parser.add_argument("--lr-start", default=1e-4, type=float, help="Initial learning rate.")
-    parser.add_argument("--lr-end", default=1e-5, type=float, help="Final learning rate after cosine decay.")
-    parser.add_argument("--seed", default=1234, type=int, help="Random seed.")
-    parser.add_argument("--batch-size", default=8, type=int, help="Training batch size.")
-    parser.add_argument("--output-dir", default=None, type=str, help="Output directory for checkpoints and logs.")
-    parser.add_argument("--only-fps", default=60, type=int, help="Use CSV entries for this FPS only.")
-    parser.add_argument("--input-fps", default=30, type=int, help="Input frame rate for the dataset loader.")
+    bootstrap_parser = argparse.ArgumentParser(add_help=False)
+    bootstrap_parser.add_argument("--config", default=None, type=str, help="Optional JSON-formatted YAML-compatible run config.")
+    bootstrap_args, _remaining_argv = bootstrap_parser.parse_known_args(argv)
+
+    config_path = None if bootstrap_args.config is None else Path(bootstrap_args.config)
+    config_defaults = load_train_run_config(config_path)
+    parser = build_train_arg_parser(config_defaults)
     return parser.parse_args(argv)
+
+
+def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train IFRNet variants on the VFI dataset.")
+    parser.add_argument("--config", default=config_defaults.get("config"), type=str, help="Optional JSON-formatted YAML-compatible run config.")
+    parser.add_argument("--mode", default=config_defaults.get("mode", "dry-run"), choices=["dry-run", "train"])
+    parser.add_argument("--model-name", default=config_defaults.get("model_name", "IFRNet"), choices=["IFRNet", "IFRNet_Residual"])
+    parser.add_argument(
+        "--root-dir",
+        default=config_defaults.get("root_dir", "./datasets/data"),
+        help="Directory containing preprocessed CSV indexes.",
+    )
+    parser.add_argument(
+        "--dataset-root-dir",
+        default=config_defaults.get("dataset_root_dir"),
+        type=str,
+        help="Root directory containing frame and velocity assets.",
+    )
+    parser.add_argument(
+        "--paths-config",
+        default=config_defaults.get("paths_config"),
+        type=str,
+        help="Optional path to configs/paths/default.yaml.",
+    )
+    parser.add_argument(
+        "--train-preset",
+        default=config_defaults.get("train_preset", "train_vfx_0416"),
+        choices=list_dataset_presets(),
+    )
+    parser.add_argument(
+        "--test-preset",
+        default=config_defaults.get("test_preset", "test_vfx_0416"),
+        choices=list_dataset_presets(),
+    )
+    parser.add_argument("--epochs", default=config_defaults.get("epochs", 60), type=int, help="Total number of epochs to run.")
+    parser.add_argument("--resume-path", default=config_defaults.get("resume_path"), type=str, help="Checkpoint to resume from.")
+    parser.add_argument("--eval-interval", default=config_defaults.get("eval_interval", 1), type=int, help="Run validation every N epochs.")
+    parser.add_argument("--lr-start", default=config_defaults.get("lr_start", 1e-4), type=float, help="Initial learning rate.")
+    parser.add_argument("--lr-end", default=config_defaults.get("lr_end", 1e-5), type=float, help="Final learning rate after cosine decay.")
+    parser.add_argument("--seed", default=config_defaults.get("seed", 1234), type=int, help="Random seed.")
+    parser.add_argument("--batch-size", default=config_defaults.get("batch_size", 8), type=int, help="Training batch size.")
+    parser.add_argument("--output-dir", default=config_defaults.get("output_dir"), type=str, help="Output directory for checkpoints and logs.")
+    parser.add_argument("--only-fps", default=config_defaults.get("only_fps", 60), type=int, help="Use CSV entries for this FPS only.")
+    parser.add_argument("--input-fps", default=config_defaults.get("input_fps", 30), type=int, help="Input frame rate for the dataset loader.")
+    return parser
+
+
+def load_train_run_config(config_path: Path | None) -> dict[str, Any]:
+    if config_path is None:
+        return {}
+
+    return load_yaml_file(config_path=config_path)
 
 
 def prepare_args(args: argparse.Namespace) -> argparse.Namespace:
@@ -416,7 +443,7 @@ def prepare_args(args: argparse.Namespace) -> argparse.Namespace:
     )
 
     if args.dataset_root_dir is None:
-        paths_config_path = resolve_optional_path(args.paths_config)
+        paths_config_path = None if args.paths_config is None else Path(args.paths_config)
         args.dataset_root_dir = str(resolve_active_dataset_root(paths_config_path))
 
     return args
@@ -445,7 +472,7 @@ def load_training_state(
 
     pretrained_path = get_model_config(args.model_name)["pretrained_checkpoint"]
     if pretrained_path is not None:
-        pretrained_checkpoint_path = resolve_path(pretrained_path)
+        pretrained_checkpoint_path = Path(pretrained_path)
         if not pretrained_checkpoint_path.is_file():
             raise FileNotFoundError(f"Pretrained checkpoint not found: {pretrained_checkpoint_path}")
 
@@ -499,7 +526,7 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
         "test_preset": args.test_preset,
         "active_root_key": ACTIVE_DATASET_ROOT_KEY,
         "dataset_root_dir": args.dataset_root_dir,
-        "csv_root_dir": str(resolve_path(args.root_dir)),
+        "csv_root_dir": str(Path(args.root_dir)),
         "output_dir": args.output_dir,
         "output_dir_reason": args.output_dir_reason,
         "resume_path": args.resume_path,
@@ -522,8 +549,9 @@ def run_training(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("device=%s", device)
 
-    train_df = build_merged_dataframe(resolve_path(args.root_dir), args.train_preset, args.only_fps, logger)
-    test_df = build_merged_dataframe(resolve_path(args.root_dir), args.test_preset, args.only_fps, logger)
+    root_dir = Path(args.root_dir)
+    train_df = build_merged_dataframe(root_dir, args.train_preset, args.only_fps, logger)
+    test_df = build_merged_dataframe(root_dir, args.test_preset, args.only_fps, logger)
     if "valid" in train_df.columns:
         train_df = train_df[train_df["valid"] == True]
 

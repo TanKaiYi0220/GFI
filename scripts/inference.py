@@ -8,7 +8,7 @@ import sys
 from typing import Any
 from typing import Iterable
 
-PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
+PROJECT_ROOT: Path = Path(__file__).parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -31,9 +31,12 @@ def main() -> int:
     """Load config and run the selected inference mode."""
     args: argparse.Namespace = parse_args()
     project_root: Path = PROJECT_ROOT
-    config_path: Path = resolve_cli_path(project_root=project_root, cli_path=args.config)
-    checkpoint_path: Path = resolve_cli_path(project_root=project_root, cli_path=args.checkpoint)
-    output_path: Path = resolve_cli_path(project_root=project_root, cli_path=args.output_path)
+    config_arg_path: Path = Path(args.config)
+    checkpoint_arg_path: Path = Path(args.checkpoint)
+    output_arg_path: Path = Path(args.output_path)
+    config_path: Path = project_root / config_arg_path
+    checkpoint_path: Path = project_root / checkpoint_arg_path
+    output_path: Path = project_root / output_arg_path
     config: dict[str, Any] = load_experiment_config(project_root=project_root, experiment_config_path=config_path)
     plan: dict[str, object] = prepare_inference_plan(config=config, checkpoint_path=checkpoint_path, output_path=output_path)
     logger: logging.Logger = build_logger(logger_name="scripts.inference")
@@ -45,12 +48,6 @@ def main() -> int:
 
     run_inference_template(config=config, checkpoint_path=checkpoint_path, output_path=output_path, logger=logger)
     return 0
-
-
-def resolve_cli_path(project_root: Path, cli_path: str) -> Path:
-    """Resolve a CLI path relative to the project root."""
-    raw_path: Path = Path(cli_path)
-    return raw_path.resolve() if raw_path.is_absolute() else (project_root / raw_path).resolve()
 
 
 def run_inference_template(

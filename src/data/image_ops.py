@@ -38,13 +38,12 @@ def visualize_color_difference(image_a: np.ndarray, image_b: np.ndarray) -> None
 
 def load_png(image_path: Path) -> np.ndarray:
     """Load one PNG image and convert the sibling EXR file on demand when needed."""
-    resolved_image_path = image_path.expanduser().resolve()
-    if not resolved_image_path.exists():
-        convert_exr_to_png(resolved_image_path.with_suffix(".exr"), resolved_image_path)
+    if not image_path.exists():
+        convert_exr_to_png(image_path.with_suffix(".exr"), image_path)
 
-    image = cv2.imread(str(resolved_image_path), cv2.IMREAD_UNCHANGED)
+    image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
     if image is None:
-        raise ValueError(f"Failed to load image: {resolved_image_path}")
+        raise ValueError(f"Failed to load image: {image_path}")
 
     return image
 
@@ -63,10 +62,9 @@ def load_backward_velocity(velocity_path: Path) -> tuple[np.ndarray, np.ndarray]
 
 def load_exr(image_path: Path) -> np.ndarray:
     """Load one EXR image as a float array."""
-    resolved_image_path = image_path.expanduser().resolve()
-    exr_image = cv2.imread(str(resolved_image_path), cv2.IMREAD_UNCHANGED)
+    exr_image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
     if exr_image is None:
-        raise ValueError(f"Failed to load EXR image: {resolved_image_path}")
+        raise ValueError(f"Failed to load EXR image: {image_path}")
 
     return exr_image
 
@@ -80,11 +78,10 @@ def convert_exr_to_png(source_path: Path, target_path: Path) -> None:
 
 def save_image(image_path: Path, image: np.ndarray) -> None:
     """Write one image to disk and create the parent directory when needed."""
-    resolved_image_path = image_path.expanduser().resolve()
-    resolved_image_path.parent.mkdir(parents=True, exist_ok=True)
-    is_written = cv2.imwrite(str(resolved_image_path), image)
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    is_written = cv2.imwrite(str(image_path), image)
     if not is_written:
-        raise ValueError(f"Failed to save image: {resolved_image_path}")
+        raise ValueError(f"Failed to save image: {image_path}")
 
 
 def calculate_psnr(image_a: np.ndarray, image_b: np.ndarray, data_range: float) -> float:

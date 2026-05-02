@@ -44,11 +44,8 @@ def rewrite_sample_root(samples: list[DatasetSample], source_root: Path, target_
 
 def rewrite_path_root(path: Path, source_root: Path, target_root: Path) -> Path:
     """Rewrite one path from a source root to a target root."""
-    resolved_path: Path = path.resolve()
-    resolved_source_root: Path = source_root.resolve()
-    resolved_target_root: Path = target_root.resolve()
-    relative_path: Path = resolved_path.relative_to(resolved_source_root)
-    return (resolved_target_root / relative_path).resolve()
+    relative_path: Path = path.relative_to(source_root)
+    return target_root / relative_path
 
 
 def build_frame_index_for_mode(root_dir: Path, record: str, mode: str) -> Any:

@@ -5,7 +5,7 @@ import sys
 
 import pandas as pd
 
-PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
+PROJECT_ROOT: Path = Path(__file__).parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -45,9 +45,9 @@ LINEARITY_CHECK: bool = False
 
 def resolve_dataset_root_dir(dataset_root_dir: str | None, paths_config: str | None) -> Path:
     if dataset_root_dir is not None:
-        return Path(dataset_root_dir).expanduser().resolve()
+        return Path(dataset_root_dir)
 
-    paths_config_path = Path(paths_config).expanduser().resolve() if paths_config is not None else None
+    paths_config_path = Path(paths_config) if paths_config is not None else None
     return resolve_active_dataset_root(paths_config_path)
 
 
@@ -203,7 +203,7 @@ def run_linearity_check(dataset_root_dir: Path, data_dir: Path, dataset_configs:
 
 def main() -> None:
     dataset_root_dir = resolve_dataset_root_dir(DATASET_ROOT_DIR_OVERRIDE, PATHS_CONFIG_PATH)
-    data_dir = Path(DATA_DIR).expanduser().resolve()
+    data_dir = Path(DATA_DIR)
     dataset_configs = get_target_configs(DATASET_PRESET_NAME)
 
     if DRY_RUN:

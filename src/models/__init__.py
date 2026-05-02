@@ -1,2 +1,1 @@
-"""Model definitions, reusable components, and losses."""
-
+"""Root models package for clean model imports."""

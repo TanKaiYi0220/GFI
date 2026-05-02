@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
-PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
+PROJECT_ROOT: Path = Path(__file__).parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -41,7 +41,7 @@ def main() -> int:
     dataset_root_arg: str | None = args.dataset_root
     split_name: str | None = args.split
     dataset_preset_name: str | None = args.dataset_preset
-    paths_config_path: Path | None = Path(args.paths_config).resolve() if args.paths_config is not None else None
+    paths_config_path: Path | None = Path(args.paths_config) if args.paths_config is not None else None
 
     if args.mode == "dry-run":
         if dataset_preset_name is not None:
@@ -172,7 +172,7 @@ def collect_preset_directories(dataset_preset_name: str, paths_config_path: Path
 
 def require_dataset_root(dataset_root_arg: str | None) -> Path:
     """Resolve the dataset root for split-based scanning."""
-    return Path(dataset_root_arg or "").resolve()
+    return Path(dataset_root_arg or "")
 
 
 def require_split_name(split_name: str | None) -> str:

@@ -41,7 +41,7 @@ def build_sample(
 
 def resolve_split_directory(dataset_root: Path, split_name: str) -> Path:
     """Resolve the split directory under the dataset root."""
-    split_root: Path = (dataset_root / split_name).resolve()
+    split_root: Path = dataset_root / split_name
     if not split_root.exists():
         raise FileNotFoundError(f"Split directory does not exist: '{split_root}'.")
 
@@ -65,14 +65,14 @@ def collect_samples_from_directories(
 
         input_paths: list[str] = []
         for frame_name in input_frame_names:
-            frame_path: Path = (sample_dir / frame_name).resolve()
+            frame_path: Path = sample_dir / frame_name
             if not frame_path.exists():
                 raise FileNotFoundError(
                     f"Missing input frame '{frame_name}' for sample '{sample_dir.name}' in '{sample_dir}'.",
                 )
             input_paths.append(str(frame_path))
 
-        target_path: Path = (sample_dir / target_frame_name).resolve()
+        target_path: Path = sample_dir / target_frame_name
         if not target_path.exists():
             raise FileNotFoundError(
                 f"Missing target frame '{target_frame_name}' for sample '{sample_dir.name}' in '{sample_dir}'.",
@@ -84,7 +84,7 @@ def collect_samples_from_directories(
                 input_frames=input_paths,
                 target_frame=str(target_path),
                 split=split_name,
-                metadata={"sample_dir": str(sample_dir.resolve())},
+                metadata={"sample_dir": str(sample_dir)},
             ),
         )
 

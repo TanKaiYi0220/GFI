@@ -8,7 +8,7 @@ from typing import Iterator
 
 from src.utils.config import load_yaml_file
 
-DEFAULT_PATHS_CONFIG_PATH: Path = Path(__file__).resolve().parents[2] / "configs" / "paths" / "default.yaml"
+DEFAULT_PATHS_CONFIG_PATH: Path = Path(__file__).parents[2] / "configs" / "paths" / "default.yaml"
 ACTIVE_DATASET_ROOT_KEY: str = "default_dataset_root"
 
 
@@ -95,7 +95,7 @@ def iter_dataset_configs(dataset_preset: DatasetPreset) -> Iterator[DatasetConfi
 def build_sequence_directory(dataset_config: DatasetConfig, paths_config_path: Path | None) -> Path:
     """Resolve the directory for one dataset sequence config under the active root directory."""
     active_root_dir: Path = resolve_active_dataset_root(paths_config_path=paths_config_path)
-    return (active_root_dir / dataset_config.record / dataset_config.mode_path).resolve()
+    return active_root_dir / dataset_config.record / dataset_config.mode_path
 
 
 def get_dataset_preset(preset_name: str) -> DatasetPreset:
@@ -115,41 +115,16 @@ def list_dataset_presets() -> tuple[str, ...]:
 
 def load_dataset_roots(paths_config_path: Path | None) -> dict[str, Path]:
     """Load dataset root mappings from the shared paths config."""
-    resolved_paths_config_path: Path = resolve_paths_config_path(paths_config_path=paths_config_path)
-    paths_config: dict[str, object] = load_yaml_file(config_path=resolved_paths_config_path)
-    dataset_roots_raw: object = paths_config.get("dataset_roots")
-
-    if not isinstance(dataset_roots_raw, dict):
-        raise KeyError(f"Paths config '{resolved_paths_config_path}' must define a 'dataset_roots' mapping.")
-
-    dataset_roots: dict[str, Path] = {}
-    for root_key, root_value in dataset_roots_raw.items():
-        dataset_roots[root_key] = Path(root_value).resolve()
-
-    return dataset_roots
+    config_path: Path = DEFAULT_PATHS_CONFIG_PATH if paths_config_path is None else paths_config_path
+    paths_config: dict[str, object] = load_yaml_file(config_path=config_path)
+    dataset_roots_raw: dict[str, str] = paths_config["dataset_roots"]
+    return {root_key: Path(root_value) for root_key, root_value in dataset_roots_raw.items()}
 
 
 def resolve_active_dataset_root(paths_config_path: Path | None) -> Path:
     """Resolve the active dataset root from the global selector and shared paths config."""
     dataset_roots: dict[str, Path] = load_dataset_roots(paths_config_path=paths_config_path)
-    active_root_dir: Path | None = dataset_roots.get(ACTIVE_DATASET_ROOT_KEY)
-
-    if active_root_dir is None:
-        available_root_keys: str = ", ".join(sorted(dataset_roots.keys()))
-        raise KeyError(
-            f"ACTIVE_DATASET_ROOT_KEY='{ACTIVE_DATASET_ROOT_KEY}' is not defined. "
-            f"Available root keys: {available_root_keys}.",
-        )
-
-    return active_root_dir
-
-
-def resolve_paths_config_path(paths_config_path: Path | None) -> Path:
-    """Resolve the shared paths config path."""
-    if paths_config_path is None:
-        return DEFAULT_PATHS_CONFIG_PATH.resolve()
-
-    return paths_config_path.resolve()
+    return dataset_roots[ACTIVE_DATASET_ROOT_KEY]
 
 
 def set_active_dataset_root_key(root_key: str) -> None:
@@ -462,6 +437,19 @@ TEST_VFX_0416_DATASET_PRESET: DatasetPreset = build_dataset_preset(
     },
 )
 
+SMOKE_ARPG2_DUAL_PRESET: DatasetPreset = build_dataset_preset(
+    name="ARPG_2 Dual Difficult Smoke",
+    records={
+        "ARPG_2": make_record_config(
+            main_indices=("4", "4"),
+            difficulties=("Difficult",),
+            sub_indices=("0", "1"),
+            fps_values=(30, 60),
+            max_indices=(400, 800),
+        ),
+    },
+)
+
 DATASET_PRESETS: dict[str, DatasetPreset] = {
     "minor": MINOR_DATASET_PRESET,
     "full": FULL_DATASET_PRESET,
@@ -476,6 +464,7 @@ DATASET_PRESETS: dict[str, DatasetPreset] = {
     "test_3d_vfx_0326": TEST_3D_VFX_DATASET_PRESET,
     "train_vfx_0416": TRAIN_VFX_0416_DATASET_PRESET,
     "test_vfx_0416": TEST_VFX_0416_DATASET_PRESET,
+    "smoke_arpg2_dual": SMOKE_ARPG2_DUAL_PRESET,
 }
 
 TRAIN_VFX_0416_DATASET_CONFIGS: DatasetPreset = TRAIN_VFX_0416_DATASET_PRESET
@@ -487,5 +476,5 @@ if __name__ == "__main__":
     run_smoke_check(
         preset_name=module_args.preset,
         limit=module_args.limit,
-        paths_config_path=Path(module_args.paths_config).resolve() if module_args.paths_config is not None else None,
+        paths_config_path=Path(module_args.paths_config) if module_args.paths_config is not None else None,
     )

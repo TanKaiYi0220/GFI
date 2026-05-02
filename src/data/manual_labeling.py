@@ -83,7 +83,7 @@ def review_images(reference_df: Any, target_df: Any, dataset_root_dir: Path) -> 
 
 def build_sequence_directory(dataset_root_dir: Path, row: Any) -> Path:
     """Build the source directory for one review row."""
-    return (dataset_root_dir / str(row["record"]) / str(row["mode"])).resolve()
+    return dataset_root_dir / str(row["record"]) / str(row["mode"])
 
 
 def build_review_image(image_path: Path, velocity_path: Path, view_flow: bool) -> np.ndarray:
