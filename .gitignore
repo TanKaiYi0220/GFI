@@ -10,7 +10,7 @@ outputs/
 data/
 dataset/
 datasets/
-src/models/
+src/models/external/
 
 # Local dataset mounts outside the formal repo layout
 *.zip

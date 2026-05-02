@@ -2,6 +2,74 @@
 
 This repository provides a simplified academic project structure for IFRNet-based architecture research with custom datasets.
 
+## Docker
+
+This project can run in Docker on top of `nvcr.io/nvidia/pytorch:24.02-py3`.
+
+Before the first build, log in to NGC so Docker can pull `nvcr.io` images.
+
+```powershell
+docker login nvcr.io
+```
+
+Use username `$oauthtoken` and your NGC API key as the password.
+
+Included in the Docker setup:
+
+- Base image: `nvcr.io/nvidia/pytorch:24.02-py3`
+- Python runtime aligned to the container's Python 3.10 environment
+- Python packages from `pyproject.toml`: `pandas`, `scikit-image`, `scikit-learn`
+- Default interactive shell: `zsh`
+- Runtime layout aligned with your manual workflow:
+  - host dataset: `/datasets/VFI/datasets/VFI_0326`
+  - host project: `$HOME/Desktop/VFI`
+  - container dataset path: `/workspace/datasets`
+  - container project path: `/workspace/src`
+  - container name: `GFI`
+  - IPC mode: `host`
+
+Build the image:
+
+```powershell
+docker compose build
+```
+
+Open an interactive container with GPU access:
+
+```powershell
+docker compose run --rm gfi
+```
+
+Equivalent `docker run` command:
+
+```powershell
+docker run \
+  -v /datasets/VFI/datasets/VFI_0326:/workspace/datasets \
+  -v $HOME/Desktop/VFI:/workspace/src \
+  --name GFI \
+  --gpus all \
+  --ipc=host \
+  -it gfi:24.02-pytorch zsh
+```
+
+Run a project command inside the container:
+
+```powershell
+docker compose run --rm gfi python scripts/train.py --mode dry-run --model-name IFRNet --train-preset train_vfx_0416 --test-preset test_vfx_0416 --root-dir /workspace/datasets
+```
+
+### zsh Customization
+
+The container starts with `zsh` and automatically sources `docker/zshrc`.
+
+If you want to keep your own aliases or prompt customizations, create a project-local override file:
+
+```powershell
+New-Item -ItemType File .zshrc.local
+```
+
+Anything in `.zshrc.local` will be sourced automatically when the container starts.
+
 ## Layout
 
 ```text
@@ -29,9 +97,6 @@ src/
   models/
     external/       External or paper-derived model adapters
     registry.py     Model registration and default training-path metadata
-    custom/         Private research variants
-    components/     Reusable model blocks
-    losses/         Loss definitions
   utils/            Config, logging, seed, and filesystem helpers
 ```
 

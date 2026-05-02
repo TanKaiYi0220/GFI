@@ -1,10 +1,10 @@
 {
   "project_root": ".",
-  "dataset_root": "C:/datasets/gfi",
-  "manifest_root": "C:/datasets/gfi/manifests",
+  "dataset_root": "/datasets/VFI/datasets/VFX_0326",
+  "manifest_root": "/datasets/VFI/manifests",
   "output_root": "outputs",
   "dataset_roots": {
-    "default_dataset_root": "C:/datasets/VFI",
-    "default_workspace_root": "C:/datasets/VFI/workspace"
+    "default_dataset_root": "/datasets/VFI/datasets/VFX_0326",
+    "default_workspace_root": "/workspace/datasets"
   }
 }

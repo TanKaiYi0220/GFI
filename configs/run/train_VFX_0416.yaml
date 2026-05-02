@@ -1,0 +1,17 @@
+{
+  "mode": "train",
+  "model_name": "IFRNet",
+  "root_dir": "data/",
+  "dataset_root_dir": "/workspace/datasets/",
+  "train_preset": "train_vfx_0416",
+  "test_preset": "test_vfx_0416",
+  "epochs": 50,
+  "eval_interval": 1,
+  "lr_start": 2e-5,
+  "lr_end": 1e-5,
+  "seed": 1234,
+  "batch_size": 8,
+  "output_dir": "outputs/IFRNet_FineTuning_0423/run_ifrnet_config",
+  "only_fps": 60,
+  "input_fps": 30
+}

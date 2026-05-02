@@ -151,6 +151,7 @@ def build_logger(output_dir: Path) -> tuple[logging.Logger, Path]:
 
 def build_merged_dataframe(
     root_dir: Path,
+    checkpoints_dir: Path,
     dataset_preset_name: str,
     only_fps: int,
     logger: logging.Logger,
@@ -177,6 +178,7 @@ def build_merged_dataframe(
         raise RuntimeError(f"No dataset CSV found under root_dir={root_dir} for preset={dataset_preset_name}")
 
     merged = pd.concat(dataframe_list, ignore_index=True)
+    merged.to_csv(checkpoints_dir / f"{dataset_preset_name}_merged.csv", index=False)
     logger.info("Merged dataset size=%s preset=%s", len(merged), dataset_preset_name)
     return merged
 
@@ -550,10 +552,15 @@ def run_training(args: argparse.Namespace) -> None:
     logger.info("device=%s", device)
 
     root_dir = Path(args.root_dir)
-    train_df = build_merged_dataframe(root_dir, args.train_preset, args.only_fps, logger)
-    test_df = build_merged_dataframe(root_dir, args.test_preset, args.only_fps, logger)
+    train_df = build_merged_dataframe(root_dir, checkpoints_dir, args.train_preset, args.only_fps, logger)
+    test_df = build_merged_dataframe(root_dir, checkpoints_dir, args.test_preset, args.only_fps, logger)
+
     if "valid" in train_df.columns:
+        logger.info("Valid Count %s in %s", train_df["valid"].value_counts().to_dict(), args.train_preset)
         train_df = train_df[train_df["valid"] == True]
+    if "valid" in test_df.columns:
+        logger.info("Valid Count %s in %s", test_df["valid"].value_counts().to_dict(), args.test_preset)
+        test_df = test_df[test_df["valid"] == True]
 
     train_dataset = VFITrainDataset(train_df, args.dataset_root_dir, True, args.input_fps)
     test_dataset = VFITrainDataset(test_df, args.dataset_root_dir, False, args.input_fps)

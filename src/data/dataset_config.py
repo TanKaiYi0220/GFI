@@ -9,7 +9,7 @@ from typing import Iterator
 from src.utils.config import load_yaml_file
 
 DEFAULT_PATHS_CONFIG_PATH: Path = Path(__file__).parents[2] / "configs" / "paths" / "default.yaml"
-ACTIVE_DATASET_ROOT_KEY: str = "default_dataset_root"
+ACTIVE_DATASET_ROOT_KEY: str = "default_workspace_root"
 
 
 @dataclass(frozen=True)
@@ -31,7 +31,7 @@ class DatasetConfig:
 
     @property
     def mode_index(self) -> str:
-        return f"{self.main_idx}_fps_{self.fps}"
+        return f"{self.main_idx}_{self.sub_idx}_fps_{self.fps}"
 
     @property
     def record_name(self) -> str:
@@ -400,16 +400,16 @@ TEST_VFX_0416_DATASET_PRESET: DatasetPreset = build_dataset_preset(
     name="ARPG_2nd_Patch_Test_VFX",
     records={
         "ARPG_3": make_record_config(
-            main_indices=("0", "0", "1", "1", "2", "2", "3", "3"),
+            main_indices=("0", "0", "1", "1", "2", "2", "3", "3", "6", "6", "6", "6", "6", "6"),
             difficulties=("Difficult",),
-            sub_indices=("2", "5", "2", "5", "2", "5", "2", "5"),
+            sub_indices=("2", "5", "2", "5", "2", "5", "2", "5", "0", "1", "2", "3", "4", "5"),
             fps_values=(30, 60),
             max_indices=(400, 800),
         ),
         "ARPG_2": make_record_config(
-            main_indices=("4", "4"),
+            main_indices=("4", "4", "5", "5", "5", "5", "5", "5"),
             difficulties=("Difficult",),
-            sub_indices=("2", "5"),
+            sub_indices=("2", "5", "0", "1", "2", "3", "4", "5"),
             fps_values=(30, 60),
             max_indices=(400, 800),
         ),
