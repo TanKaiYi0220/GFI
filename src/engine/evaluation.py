@@ -1,12 +1,19 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
 import pandas as pd
+import torch
+
+from src.models.IFRNet.metric import calculate_psnr as ifrnet_calculate_psnr
 
 VFI_METRICS: tuple[str, ...] = ("psnr",)
+
+
+def compute_batch_psnr(img_gt: torch.Tensor, img_pred: torch.Tensor) -> torch.Tensor:
+    mse = ((img_gt - img_pred) * (img_gt - img_pred)).mean(dim=(1, 2, 3))
+    return -10.0 * torch.log10(mse)
 
 
 @dataclass
@@ -16,6 +23,10 @@ class TaskEvaluator:
     task_name: str
     metrics: tuple[str, ...]
     records: list[dict[str, float]] = field(default_factory=list)
+
+    def evaluate_batch(self, img_gt: torch.Tensor, img_pred: torch.Tensor) -> None:
+        psnr_batch = compute_batch_psnr(img_gt, img_pred)
+        self.records.extend({"psnr": float(psnr)} for psnr in psnr_batch.detach().cpu().tolist())
 
     def evaluate(
         self,
@@ -27,9 +38,9 @@ class TaskEvaluator:
         bmv: Any,
         fmv: Any,
     ) -> None:
-        diff = img_gt.astype("float32") - img_pred.astype("float32")
-        mse = float((diff * diff).mean())
-        psnr = float("inf") if mse == 0.0 else 20.0 * math.log10(255.0) - 10.0 * math.log10(mse)
+        gt_tensor = torch.from_numpy(img_gt).to(dtype=torch.float32).permute(2, 0, 1)
+        pred_tensor = torch.from_numpy(img_pred).to(dtype=torch.float32).permute(2, 0, 1)
+        psnr = float(ifrnet_calculate_psnr(gt_tensor, pred_tensor))
         self.records.append({"psnr": psnr})
 
     def to_dataframe(self) -> Any:

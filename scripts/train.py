@@ -214,6 +214,14 @@ def build_loss_record(
     }
 
 
+def append_batch_loss_records(
+    target_records: list[dict[str, float]],
+    loss_record: dict[str, float],
+    batch_size: int,
+) -> None:
+    target_records.extend(loss_record.copy() for _ in range(batch_size))
+
+
 def save_checkpoint(
     checkpoint_path: Path,
     model: Any,
@@ -265,21 +273,10 @@ def evaluate(
 
             total_loss = loss_rec + loss_geo + loss_dis
             loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
-            batch_size = imgt_pred.shape[0]
+            batch_size = int(imgt_pred.shape[0])
 
-            for batch_index in range(batch_size):
-                pred_np = (imgt_pred[batch_index].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-                gt_np = (imgt[batch_index].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-                evaluator.evaluate(
-                    meta={},
-                    img_gt=gt_np,
-                    img_pred=pred_np,
-                    flow_1_to_0=up_flow0_1[batch_index],
-                    flow_1_to_2=up_flow1_1[batch_index],
-                    bmv=bmv[batch_index],
-                    fmv=fmv[batch_index],
-                )
-                loss_records.append(loss_record)
+            evaluator.evaluate_batch(img_gt=imgt, img_pred=imgt_pred)
+            append_batch_loss_records(loss_records, loss_record, batch_size)
 
     metric_df = evaluator.to_dataframe()
     loss_df = pd.DataFrame(loss_records)
@@ -335,21 +332,10 @@ def train(
             optimizer.step()
 
             loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
-            batch_size = imgt_pred.shape[0]
+            batch_size = int(imgt_pred.shape[0])
 
-            for batch_index in range(batch_size):
-                pred_np = (imgt_pred[batch_index].detach().permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-                gt_np = (imgt[batch_index].detach().permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-                evaluator.evaluate(
-                    meta={},
-                    img_gt=gt_np,
-                    img_pred=pred_np,
-                    flow_1_to_0=up_flow0_1[batch_index],
-                    flow_1_to_2=up_flow1_1[batch_index],
-                    bmv=bmv[batch_index],
-                    fmv=fmv[batch_index],
-                )
-                train_loss_records.append(loss_record)
+            evaluator.evaluate_batch(img_gt=imgt.detach(), img_pred=imgt_pred.detach())
+            append_batch_loss_records(train_loss_records, loss_record, batch_size)
 
             global_step += 1
 
