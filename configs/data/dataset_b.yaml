@@ -1,0 +1,14 @@
+{
+  "name": "dataset_b",
+  "task": "restoration",
+  "dataset_root": "C:/datasets/gfi/dataset_b",
+  "splits": {
+    "train": "train",
+    "val": "val",
+    "test": "test"
+  },
+  "sample_layout": {
+    "input_frame_names": ["degraded.png"],
+    "target_frame_name": "clean.png"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "experiment": {
+    "name": "exp002",
+    "description": "custom-variant scaffold experiment"
+  },
+  "config_refs": {
+    "paths": "configs/paths/default.yaml",
+    "data": "configs/data/dataset_b.yaml",
+    "model": "configs/model/custom_variant.yaml",
+    "train": "configs/train/ablation_x.yaml"
+  }
+}

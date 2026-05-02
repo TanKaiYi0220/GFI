@@ -1,0 +1,8 @@
+{
+  "name": "ifrnet_base",
+  "family": "ifrnet",
+  "variant": "baseline",
+  "input_channels": 6,
+  "output_channels": 3,
+  "losses": ["l1"]
+}

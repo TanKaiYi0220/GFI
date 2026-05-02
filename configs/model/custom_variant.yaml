@@ -1,0 +1,8 @@
+{
+  "name": "custom_variant",
+  "family": "ifrnet",
+  "variant": "academy_work",
+  "input_channels": 6,
+  "output_channels": 3,
+  "losses": ["l1", "edge_aware"]
+}

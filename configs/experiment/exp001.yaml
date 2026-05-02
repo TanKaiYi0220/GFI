@@ -1,0 +1,12 @@
+{
+  "experiment": {
+    "name": "exp001",
+    "description": "baseline scaffold experiment"
+  },
+  "config_refs": {
+    "paths": "configs/paths/default.yaml",
+    "data": "configs/data/dataset_a.yaml",
+    "model": "configs/model/ifrnet_base.yaml",
+    "train": "configs/train/default.yaml"
+  }
+}

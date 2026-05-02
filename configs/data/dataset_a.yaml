@@ -1,0 +1,14 @@
+{
+  "name": "dataset_a",
+  "task": "frame_synthesis",
+  "dataset_root": "C:/datasets/gfi/dataset_a",
+  "splits": {
+    "train": "train",
+    "val": "val",
+    "test": "test"
+  },
+  "sample_layout": {
+    "input_frame_names": ["frame_000.png", "frame_002.png"],
+    "target_frame_name": "frame_001.png"
+  }
+}
