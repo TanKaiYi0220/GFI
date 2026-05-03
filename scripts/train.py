@@ -217,6 +217,7 @@ def evaluate(
     model.eval()
     psnr_meter = AverageMeter()
     loss_meter = AverageMeter()
+    record_name: list[dict[str, str]] = []
     metric_records: list[dict[str, float]] = []
     loss_records: list[dict[str, float]] = []
 
@@ -246,13 +247,15 @@ def evaluate(
             loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
             batch_size = int(imgt_pred.shape[0])
             loss_meter.update(total_loss.item(), batch_size)
+            record_name.append({"record_name": _info["record_name"][0]})
             append_batch_psnr_records(metric_records, psnr_meter, imgt_pred, imgt)
             append_batch_loss_records(loss_records, loss_record, batch_size)
             pbar.set_postfix({"eval_psnr": f"{psnr_meter.avg:.6f}", "eval_loss": f"{loss_meter.avg:.6f}"})
 
+    record_df = pd.DataFrame(record_name)
     metric_df = pd.DataFrame(metric_records)
     loss_df = pd.DataFrame(loss_records)
-    eval_df = pd.concat([metric_df.reset_index(drop=True), loss_df.reset_index(drop=True)], axis=1)
+    eval_df = pd.concat([record_df, metric_df.reset_index(drop=True), loss_df.reset_index(drop=True)], axis=1)
     return psnr_meter.avg, eval_df
 
 
@@ -337,7 +340,8 @@ def train(
                 best_psnr = test_psnr
                 save_checkpoint(checkpoints_dir / "best.pth", model, optimizer, epoch, best_psnr)
                 logger.info("New Best PSNR - Epoch %s test_psnr=%.6f", epoch + 1, test_psnr)
-
+                            
+        save_checkpoint(checkpoints_dir / f"epoch_{epoch + 1}.pth", model, optimizer, epoch, best_psnr)
         save_checkpoint(checkpoints_dir / "latest.pth", model, optimizer, epoch, best_psnr)
 
 
@@ -509,6 +513,7 @@ def run_training(args: argparse.Namespace) -> None:
 
     # temporary code for quick testing
     # train_df = train_df[:100]
+    # test_df = test_df.sample(frac=1, random_state=args.seed).reset_index(drop=True)  # shuffle test_df for more representative quick tests
     # test_df = test_df[:10]
 
     train_dataset = VFITrainDataset(train_df, args.dataset_root_dir, True, args.input_fps)

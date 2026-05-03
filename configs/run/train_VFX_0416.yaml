@@ -11,9 +11,9 @@
   "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 16,
-  "output_dir": "outputs/IFRNet_FineTuning_0423/run_ifrnet_config",
+  "output_dir": "outputs/IFRNet_FineTuning_0423/",
   "only_fps": 60,
   "input_fps": 30,
-  "resume_path": null,
+  "resume_path": "outputs/IFRNet_FineTuning_0423/checkpoints/latest.pth",
   "pretrained_checkpoint_path": "src/models/external/IFRNet/checkpoints/IFRNet/IFRNet_Vimeo90K.pth"
 }

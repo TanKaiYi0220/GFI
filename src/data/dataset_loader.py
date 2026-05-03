@@ -223,6 +223,7 @@ class VFITrainDataset(BaseDataset):
         mode = str(row["mode"])
 
         info = {
+            "record_name": f"{record}_{mode}",
             "frame_range": f"frame_{frame_0_idx:04d}_{frame_2_idx:04d}",
             "valid": bool(row["valid"]) if "valid" in row.index else True,
             "distance_indexing": build_distance_indexing(row),
