@@ -177,9 +177,9 @@ def append_batch_psnr_records(
 ) -> None:
     batch_size = int(imgt_pred.shape[0])
     for batch_index in range(batch_size):
-        pred_np = imgt_pred[batch_index].detach().permute(1, 2, 0).cpu().numpy()
-        gt_np = imgt[batch_index].detach().permute(1, 2, 0).cpu().numpy()
-        psnr_value = calculate_psnr(gt_np, pred_np)
+        # pred_np = imgt_pred[batch_index].detach().permute(1, 2, 0).cpu().numpy()
+        # gt_np = imgt[batch_index].detach().permute(1, 2, 0).cpu().numpy()
+        psnr_value = calculate_psnr(imgt[batch_index], imgt_pred[batch_index]).detach().cpu().item()
         psnr_meter.update(psnr_value, 1)
         target_records.append({"psnr": psnr_value})
 
@@ -216,11 +216,13 @@ def evaluate(
 
     model.eval()
     psnr_meter = AverageMeter()
+    loss_meter = AverageMeter()
     metric_records: list[dict[str, float]] = []
     loss_records: list[dict[str, float]] = []
 
     with torch.no_grad():
-        for batch in tqdm(loader):
+        pbar = tqdm(loader, desc="Evaluating")
+        for batch in pbar:
             img0, imgt, img1, bmv, fmv, embt, _info = batch
             img0 = img0.to(device)
             img1 = img1.to(device)
@@ -243,8 +245,10 @@ def evaluate(
             total_loss = loss_rec + loss_geo + loss_dis
             loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
             batch_size = int(imgt_pred.shape[0])
+            loss_meter.update(total_loss.item(), batch_size)
             append_batch_psnr_records(metric_records, psnr_meter, imgt_pred, imgt)
             append_batch_loss_records(loss_records, loss_record, batch_size)
+            pbar.set_postfix({"eval_psnr": f"{psnr_meter.avg:.6f}", "eval_loss": f"{loss_meter.avg:.6f}"})
 
     metric_df = pd.DataFrame(metric_records)
     loss_df = pd.DataFrame(loss_records)
@@ -272,10 +276,13 @@ def train(
     for epoch in range(training_state.start_epoch, args.epochs):
         model.train()
         train_psnr_meter = AverageMeter()
+        train_loss_meter = AverageMeter()
         train_metric_records: list[dict[str, float]] = []
         train_loss_records: list[dict[str, float]] = []
 
-        for batch in tqdm(train_loader):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
+
+        for batch in pbar:
             img0, imgt, img1, bmv, fmv, embt, _info = batch
             img0 = img0.to(device)
             img1 = img1.to(device)
@@ -304,13 +311,14 @@ def train(
             optimizer.step()
 
             global_step += 1
-            
+            batch_size = int(imgt_pred.shape[0])
+            train_loss_meter.update(total_loss.item(), batch_size)
+            pbar.set_postfix({"train_loss": f"{train_loss_meter.avg:.6f}", "lr": f"{lr:.6f}"})
             if (epoch + 1) % args.eval_interval != 0:
                 continue
             
             # During evaluation epochs, we also record training metrics and losses for analysis.
             loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
-            batch_size = int(imgt_pred.shape[0])
             append_batch_psnr_records(train_metric_records, train_psnr_meter, imgt_pred, imgt)
             append_batch_loss_records(train_loss_records, loss_record, batch_size)
 
@@ -328,6 +336,7 @@ def train(
             if test_psnr > best_psnr:
                 best_psnr = test_psnr
                 save_checkpoint(checkpoints_dir / "best.pth", model, optimizer, epoch, best_psnr)
+                logger.info("New Best PSNR - Epoch %s test_psnr=%.6f", epoch + 1, test_psnr)
 
         save_checkpoint(checkpoints_dir / "latest.pth", model, optimizer, epoch, best_psnr)
 
@@ -498,10 +507,14 @@ def run_training(args: argparse.Namespace) -> None:
         logger.info("Valid Count %s in %s", test_df["valid"].value_counts().to_dict(), args.test_preset)
         test_df = test_df[test_df["valid"] == True]
 
+    # temporary code for quick testing
+    # train_df = train_df[:100]
+    # test_df = test_df[:10]
+
     train_dataset = VFITrainDataset(train_df, args.dataset_root_dir, True, args.input_fps)
     test_dataset = VFITrainDataset(test_df, args.dataset_root_dir, False, args.input_fps)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     args.iters_per_epoch = len(train_loader)
     model_class = resolve_model_class(args.model_name)

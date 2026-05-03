@@ -2,19 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import torch
 
-
-def calculate_psnr(img_gt: object, img_pred: object) -> float:
-    import numpy as np
-
-    gt_float = img_gt.astype(np.float32, copy=False)
-    pred_float = img_pred.astype(np.float32, copy=False)
-    mse = float(np.mean((gt_float - pred_float) ** 2))
-    if mse == 0.0:
-        return float("inf")
-
-    return float(-10.0 * math.log10(mse))
-
+def calculate_psnr(img1, img2):
+    psnr = -10 * torch.log10(((img1 - img2) * (img1 - img2)).mean())
+    return psnr
 
 @dataclass
 class AverageMeter:
