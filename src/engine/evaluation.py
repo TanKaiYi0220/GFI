@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
-import torch
 
 def calculate_psnr(img1, img2):
+    import torch
+
     psnr = -10 * torch.log10(((img1 - img2) * (img1 - img2)).mean())
     return psnr
 

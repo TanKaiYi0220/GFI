@@ -286,6 +286,9 @@ class FlowEstimationTrainDataset(BaseDataset):
         mode_30 = mode.replace("fps_60", "fps_30")
 
         info = {
+            "record": record,
+            "mode": mode,
+            "record_name": f"{record}_{mode}",
             "frame_range": f"frame_{frame_60_0_idx:04d}_{frame_60_2_idx:04d}",
             "valid": bool(row["valid"]) if "valid" in row.index else True,
             "distance_indexing": build_distance_indexing(row),
@@ -298,8 +301,8 @@ class FlowEstimationTrainDataset(BaseDataset):
         fmv_60_path = self._build_modality_path(record, mode, frame_60_1_idx, "forwardVel_Depth")
         bmv_30_path = self._build_modality_path(record, mode_30, frame_30_1_idx, "backwardVel_Depth")
         fmv_30_path = self._build_modality_path(record, mode_30, frame_30_0_idx, "forwardVel_Depth")
-        img_30_0_path = self._build_modality_path(record, mode_30, frame_30_0_idx, "colorNoScreenUI")
-        img_30_1_path = self._build_modality_path(record, mode_30, frame_30_1_idx, "colorNoScreenUI")
+        # img_30_0_path = self._build_modality_path(record, mode_30, frame_30_0_idx, "colorNoScreenUI")
+        # img_30_1_path = self._build_modality_path(record, mode_30, frame_30_1_idx, "colorNoScreenUI")
 
         img0 = self._load_image(img_60_0_path)
         imgt = self._load_image(img_60_1_path)
@@ -308,8 +311,8 @@ class FlowEstimationTrainDataset(BaseDataset):
         fmv_60 = self._load_game_motion(fmv_60_path)
         bmv_30 = self._load_game_motion(bmv_30_path)
         fmv_30 = self._load_game_motion(fmv_30_path)
-        img0_30 = self._load_image(img_30_0_path)
-        img1_30 = self._load_image(img_30_1_path)
+        # img0_30 = self._load_image(img_30_0_path)
+        # img1_30 = self._load_image(img_30_1_path)
 
         img0_tensor = image_to_tensor(img0)
         imgt_tensor = image_to_tensor(imgt)
@@ -318,8 +321,8 @@ class FlowEstimationTrainDataset(BaseDataset):
         fmv_60_tensor = flow_to_tensor(fmv_60)
         bmv_30_tensor = flow_to_tensor(bmv_30)
         fmv_30_tensor = flow_to_tensor(fmv_30)
-        img0_30_tensor = image_to_tensor(img0_30)
-        img1_30_tensor = image_to_tensor(img1_30)
+        # img0_30_tensor = image_to_tensor(img0_30)
+        # img1_30_tensor = image_to_tensor(img1_30)
         embt_tensor = build_embedding_tensor()
 
         # Add paths to info for debugging purposes
@@ -334,8 +337,8 @@ class FlowEstimationTrainDataset(BaseDataset):
             fmv_60_tensor,
             bmv_30_tensor,
             fmv_30_tensor,
-            img0_30_tensor,
-            img1_30_tensor,
+            # img0_30_tensor,
+            # img1_30_tensor,
             embt_tensor,
             info,
         )
