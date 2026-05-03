@@ -30,6 +30,8 @@ from src.data.dataset_config import iter_dataset_configs
 from src.data.dataset_loader import VFITrainDataset
 from src.engine.evaluation import TaskEvaluator
 from src.engine.evaluation import VFI_METRICS
+from src.engine.evaluation import calculate_psnr_skimage
+from src.engine.evaluation import calculate_psnr_torch
 from src.models.registry import get_model_class
 from src.models.registry import get_model_config
 from src.utils.config import load_yaml_file
@@ -275,7 +277,11 @@ def evaluate(
             loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
             batch_size = int(imgt_pred.shape[0])
 
-            evaluator.evaluate_batch(img_gt=imgt, img_pred=imgt_pred)
+            for b in range(batch_size):
+                psnr = calculate_psnr_torch(img_gt=imgt[b], img_pred=imgt_pred[b])
+                # sklearn_psnr = calculate_psnr_skimage(img_gt=imgt[b], img_pred=imgt_pred[b])
+                evaluator.records.append({"psnr": float(psnr)})
+
             append_batch_loss_records(loss_records, loss_record, batch_size)
 
     metric_df = evaluator.to_dataframe()
@@ -334,7 +340,10 @@ def train(
             loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
             batch_size = int(imgt_pred.shape[0])
 
-            evaluator.evaluate_batch(img_gt=imgt.detach(), img_pred=imgt_pred.detach())
+            for b in range(batch_size):
+                psnr = calculate_psnr_torch(img_gt=imgt[b], img_pred=imgt_pred[b])
+                evaluator.records.append({"psnr": float(psnr)})
+
             append_batch_loss_records(train_loss_records, loss_record, batch_size)
 
             global_step += 1
@@ -403,6 +412,7 @@ def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.Argument
     )
     parser.add_argument("--epochs", default=config_defaults.get("epochs", 60), type=int, help="Total number of epochs to run.")
     parser.add_argument("--resume-path", default=config_defaults.get("resume_path"), type=str, help="Checkpoint to resume from.")
+    parser.add_argument("--pretrained-checkpoint-path", default=config_defaults.get("pretrained_checkpoint_path"), type=str, help="Path to pretrained checkpoint.")
     parser.add_argument("--eval-interval", default=config_defaults.get("eval_interval", 1), type=int, help="Run validation every N epochs.")
     parser.add_argument("--lr-start", default=config_defaults.get("lr_start", 1e-4), type=float, help="Initial learning rate.")
     parser.add_argument("--lr-end", default=config_defaults.get("lr_end", 1e-5), type=float, help="Final learning rate after cosine decay.")
@@ -458,9 +468,8 @@ def load_training_state(
             mode="resume",
         )
 
-    pretrained_path = get_model_config(args.model_name)["pretrained_checkpoint"]
-    if pretrained_path is not None:
-        pretrained_checkpoint_path = Path(pretrained_path)
+    if args.pretrained_checkpoint_path is not None:
+        pretrained_checkpoint_path = Path(args.pretrained_checkpoint_path)
         if not pretrained_checkpoint_path.is_file():
             raise FileNotFoundError(f"Pretrained checkpoint not found: {pretrained_checkpoint_path}")
 
@@ -518,6 +527,7 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
         "output_dir": args.output_dir,
         "output_dir_reason": args.output_dir_reason,
         "resume_path": args.resume_path,
+        "pretrained_checkpoint_path": args.pretrained_checkpoint_path,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "eval_interval": args.eval_interval,
@@ -550,8 +560,9 @@ def run_training(args: argparse.Namespace) -> None:
 
     train_dataset = VFITrainDataset(train_df, args.dataset_root_dir, True, args.input_fps)
     test_dataset = VFITrainDataset(test_df, args.dataset_root_dir, False, args.input_fps)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True)
+    args.num_workers = args.batch_size
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.num_workers, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
     args.iters_per_epoch = len(train_loader)
     model_class = get_model_class(args.model_name)

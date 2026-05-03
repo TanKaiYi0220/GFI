@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from src.data.analysis import show_images_switchable
+from skimage.metrics import peak_signal_noise_ratio as psnr
 
 IDENTICAL_PSNR_THRESHOLD: float = 48.0
 PNG_DATA_RANGE: float = 255.0
@@ -22,13 +23,13 @@ def identical_images(image_a: np.ndarray, image_b: np.ndarray) -> bool:
     if np.array_equal(image_a, image_b):
         return True
 
-    difference = calculate_psnr(image_a, image_b, PNG_DATA_RANGE)
+    difference = psnr(image_a, image_b)
     return difference >= IDENTICAL_PSNR_THRESHOLD
 
 
 def visualize_color_difference(image_a: np.ndarray, image_b: np.ndarray) -> None:
     """Show two images and their absolute color difference."""
-    difference = calculate_psnr(image_a, image_b, PNG_DATA_RANGE)
+    difference = psnr(image_a, image_b)
     color_difference = cv2.absdiff(image_a, image_b)
     show_images_switchable(
         [image_a, image_b, color_difference],
@@ -82,18 +83,6 @@ def save_image(image_path: Path, image: np.ndarray) -> None:
     is_written = cv2.imwrite(str(image_path), image)
     if not is_written:
         raise ValueError(f"Failed to save image: {image_path}")
-
-
-def calculate_psnr(image_a: np.ndarray, image_b: np.ndarray, data_range: float) -> float:
-    """Compute PSNR with an infinity result for zero-error pairs."""
-    image_a_float = image_a.astype(np.float32)
-    image_b_float = image_b.astype(np.float32)
-    mse = float(np.mean((image_a_float - image_b_float) ** 2))
-    if mse == 0.0:
-        return float("inf")
-
-    return float(20.0 * np.log10(data_range) - 10.0 * np.log10(mse))
-
 
 def make_colorwheel() -> np.ndarray:
     """Generate the classic Middlebury optical-flow color wheel."""

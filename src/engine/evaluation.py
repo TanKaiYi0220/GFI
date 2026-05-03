@@ -6,9 +6,18 @@ from typing import Any
 import pandas as pd
 import torch
 
-from src.models.IFRNet.metric import calculate_psnr as ifrnet_calculate_psnr
+from src.models.external.IFRNet.metric import calculate_psnr
+from skimage.metrics import peak_signal_noise_ratio as psnr
 
 VFI_METRICS: tuple[str, ...] = ("psnr",)
+
+def calculate_psnr_torch(img_gt: torch.Tensor, img_pred: torch.Tensor) -> torch.Tensor:
+    return calculate_psnr(img_gt, img_pred)
+
+def calculate_psnr_skimage(img_gt: torch.Tensor, img_pred: torch.Tensor) -> float:
+    img_gt_np = img_gt.cpu().numpy().transpose(1, 2, 0)
+    img_pred_np = img_pred.cpu().numpy().transpose(1, 2, 0)
+    return psnr(img_gt_np, img_pred_np)
 
 
 def compute_batch_psnr(img_gt: torch.Tensor, img_pred: torch.Tensor) -> torch.Tensor:
@@ -40,8 +49,9 @@ class TaskEvaluator:
     ) -> None:
         gt_tensor = torch.from_numpy(img_gt).to(dtype=torch.float32).permute(2, 0, 1)
         pred_tensor = torch.from_numpy(img_pred).to(dtype=torch.float32).permute(2, 0, 1)
-        psnr = float(ifrnet_calculate_psnr(gt_tensor, pred_tensor))
-        self.records.append({"psnr": psnr})
+        psnr = float(calculate_psnr(gt_tensor, pred_tensor))
+        sklearn_psnr = psnr(img_gt, img_pred)
+        self.records.append({"psnr": psnr, "sklearn_psnr": sklearn_psnr})
 
     def to_dataframe(self) -> Any:
         return pd.DataFrame(self.records)
