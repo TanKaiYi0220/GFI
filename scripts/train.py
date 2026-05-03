@@ -4,19 +4,12 @@ import argparse
 import json
 import logging
 import math
-import os
 import random
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-import numpy as np
-import pandas as pd
-import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 PROJECT_ROOT: Path = Path(__file__).parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -24,17 +17,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.data.dataset_config import ACTIVE_DATASET_ROOT_KEY
 from src.data.dataset_config import get_dataset_preset
-from src.data.dataset_config import list_dataset_presets
-from src.data.dataset_config import resolve_active_dataset_root
 from src.data.dataset_config import iter_dataset_configs
-from src.data.dataset_loader import VFITrainDataset
-from src.engine.evaluation import TaskEvaluator
-from src.engine.evaluation import VFI_METRICS
-from src.engine.evaluation import calculate_psnr_skimage
-from src.engine.evaluation import calculate_psnr_torch
-from src.models.registry import get_model_class
-from src.models.registry import get_model_config
+from src.data.dataset_config import list_dataset_presets
+from src.engine.evaluation import AverageMeter
+from src.engine.evaluation import calculate_psnr
 from src.utils.config import load_yaml_file
+
+MODEL_NAMES: tuple[str, ...] = ("IFRNet", "IFRNet_Residual")
 
 
 @dataclass(frozen=True)
@@ -45,7 +34,24 @@ class TrainingState:
     mode: str
 
 
+def resolve_model_class(model_name: str) -> type[Any]:
+    if model_name == "IFRNet":
+        from src.models.IFRNet import Model as IFRNetModel
+
+        return IFRNetModel
+    if model_name == "IFRNet_Residual":
+        from src.models.IFRNet_Residual import Model as IFRNetResidualModel
+
+        return IFRNetResidualModel
+
+    available_models = ", ".join(MODEL_NAMES)
+    raise KeyError(f"Unknown model '{model_name}'. Available models: {available_models}")
+
+
 def set_seed(seed: int) -> None:
+    import numpy as np
+    import torch
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -61,71 +67,6 @@ def get_lr(args: argparse.Namespace, step: int) -> float:
 def set_lr(optimizer: Any, lr: float) -> None:
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
-
-
-def read_resume_start_epoch(checkpoint_path: Path) -> int | None:
-    if not checkpoint_path.is_file():
-        return None
-
-    checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
-    epoch = checkpoint.get("epoch")
-    if epoch is None:
-        return None
-
-    return int(epoch) + 1
-
-
-def build_unique_output_dir(base_dir: Path) -> str:
-    if not base_dir.exists():
-        return str(base_dir)
-
-    suffix_index = 1
-    while True:
-        candidate = base_dir.parent / f"{base_dir.name}_{suffix_index:02d}"
-        if not candidate.exists():
-            return str(candidate)
-        suffix_index += 1
-
-
-def build_resume_output_dir(resume_path: str, start_epoch: int | None) -> str:
-    checkpoint_path = Path(resume_path)
-    source_output_dir = checkpoint_path.parent.parent
-    checkpoint_name = checkpoint_path.stem
-    resume_epoch_label = f"e{start_epoch}" if start_epoch is not None else "resume"
-    base_dir = source_output_dir.parent / f"{source_output_dir.name}_{checkpoint_name}_{resume_epoch_label}"
-    return build_unique_output_dir(base_dir)
-
-
-def resolve_resume_path(user_resume_path: str | None, default_resume_path: str | None) -> str | None:
-    if user_resume_path is not None:
-        resume_path = Path(user_resume_path)
-        if not resume_path.is_file():
-            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
-        return str(resume_path)
-
-    if default_resume_path is None:
-        return None
-
-    resume_path = Path(default_resume_path)
-    if resume_path.is_file():
-        return str(resume_path)
-
-    return None
-
-
-def resolve_output_dir(
-    output_dir: str | None,
-    resume_path: str | None,
-    default_output_dir: str,
-) -> tuple[str, str]:
-    if output_dir is not None:
-        return str(Path(output_dir)), "user"
-
-    if resume_path is not None:
-        start_epoch = read_resume_start_epoch(Path(resume_path))
-        return build_resume_output_dir(resume_path, start_epoch), "auto_resume"
-
-    return build_unique_output_dir(Path(default_output_dir)), "auto_fresh"
 
 
 def build_logger(output_dir: Path) -> tuple[logging.Logger, Path]:
@@ -157,9 +98,11 @@ def build_merged_dataframe(
     dataset_preset_name: str,
     only_fps: int,
     logger: logging.Logger,
-) -> Any:
+) -> pd.DataFrame:
+    import pandas as pd
+
     dataset_preset = get_dataset_preset(dataset_preset_name)
-    dataframe_list: list[Any] = []
+    dataframe_list: list[pd.DataFrame] = []
 
     for dataset_config in iter_dataset_configs(dataset_preset):
         if dataset_config.fps != only_fps:
@@ -188,13 +131,15 @@ def build_merged_dataframe(
 def forward_model(
     model_name: str,
     model: Any,
-    img0: Any,
-    img1: Any,
-    embt: Any,
-    imgt: Any,
-    bmv: Any,
-    fmv: Any,
+    img0: torch.Tensor,
+    img1: torch.Tensor,
+    embt: torch.Tensor,
+    imgt: torch.Tensor,
+    bmv: torch.Tensor,
+    fmv: torch.Tensor,
 ) -> Any:
+    import torch
+
     if model_name == "IFRNet":
         flow = torch.cat([bmv, fmv], dim=1).float()
         return model(img0, img1, embt, imgt, flow)
@@ -203,10 +148,10 @@ def forward_model(
 
 
 def build_loss_record(
-    loss_rec: Any,
-    loss_geo: Any,
-    loss_dis: Any,
-    total_loss: Any,
+    loss_rec: torch.Tensor,
+    loss_geo: torch.Tensor,
+    loss_dis: torch.Tensor,
+    total_loss: torch.Tensor,
 ) -> dict[str, float]:
     return {
         "loss_rec": float(loss_rec.detach().cpu()),
@@ -224,6 +169,21 @@ def append_batch_loss_records(
     target_records.extend(loss_record.copy() for _ in range(batch_size))
 
 
+def append_batch_psnr_records(
+    target_records: list[dict[str, float]],
+    psnr_meter: AverageMeter,
+    imgt_pred: torch.Tensor,
+    imgt: torch.Tensor,
+) -> None:
+    batch_size = int(imgt_pred.shape[0])
+    for batch_index in range(batch_size):
+        pred_np = imgt_pred[batch_index].detach().permute(1, 2, 0).cpu().numpy()
+        gt_np = imgt[batch_index].detach().permute(1, 2, 0).cpu().numpy()
+        psnr_value = calculate_psnr(gt_np, pred_np)
+        psnr_meter.update(psnr_value, 1)
+        target_records.append({"psnr": psnr_value})
+
+
 def save_checkpoint(
     checkpoint_path: Path,
     model: Any,
@@ -231,6 +191,8 @@ def save_checkpoint(
     epoch: int,
     best_psnr: float,
 ) -> None:
+    import torch
+
     torch.save(
         {
             "model": model.state_dict(),
@@ -247,9 +209,14 @@ def evaluate(
     model: Any,
     loader: Any,
     device: Any,
-) -> tuple[float, Any]:
+) -> tuple[float, pd.DataFrame]:
+    import pandas as pd
+    import torch
+    from tqdm import tqdm
+
     model.eval()
-    evaluator = TaskEvaluator("VFI", VFI_METRICS)
+    psnr_meter = AverageMeter()
+    metric_records: list[dict[str, float]] = []
     loss_records: list[dict[str, float]] = []
 
     with torch.no_grad():
@@ -262,7 +229,7 @@ def evaluate(
             fmv = fmv.to(device)
             embt = embt.to(device)
 
-            imgt_pred, loss_rec, loss_geo, loss_dis, up_flow0_1, up_flow1_1, up_mask_1 = forward_model(
+            imgt_pred, loss_rec, loss_geo, loss_dis, _up_flow0_1, _up_flow1_1, _up_mask_1 = forward_model(
                 model_name,
                 model,
                 img0,
@@ -276,18 +243,13 @@ def evaluate(
             total_loss = loss_rec + loss_geo + loss_dis
             loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
             batch_size = int(imgt_pred.shape[0])
-
-            for b in range(batch_size):
-                psnr = calculate_psnr_torch(img_gt=imgt[b], img_pred=imgt_pred[b])
-                # sklearn_psnr = calculate_psnr_skimage(img_gt=imgt[b], img_pred=imgt_pred[b])
-                evaluator.records.append({"psnr": float(psnr)})
-
+            append_batch_psnr_records(metric_records, psnr_meter, imgt_pred, imgt)
             append_batch_loss_records(loss_records, loss_record, batch_size)
 
-    metric_df = evaluator.to_dataframe()
+    metric_df = pd.DataFrame(metric_records)
     loss_df = pd.DataFrame(loss_records)
     eval_df = pd.concat([metric_df.reset_index(drop=True), loss_df.reset_index(drop=True)], axis=1)
-    return float(eval_df["psnr"].mean()), eval_df
+    return psnr_meter.avg, eval_df
 
 
 def train(
@@ -300,13 +262,17 @@ def train(
     logger: logging.Logger,
     training_state: TrainingState,
 ) -> None:
+    import pandas as pd
+    from tqdm import tqdm
+
     best_psnr = training_state.best_psnr
     global_step = training_state.global_step
     checkpoints_dir = Path(args.output_dir) / "checkpoints"
 
     for epoch in range(training_state.start_epoch, args.epochs):
         model.train()
-        evaluator = TaskEvaluator("VFI", VFI_METRICS)
+        train_psnr_meter = AverageMeter()
+        train_metric_records: list[dict[str, float]] = []
         train_loss_records: list[dict[str, float]] = []
 
         for batch in tqdm(train_loader):
@@ -322,7 +288,7 @@ def train(
             set_lr(optimizer, lr)
             optimizer.zero_grad()
 
-            imgt_pred, loss_rec, loss_geo, loss_dis, up_flow0_1, up_flow1_1, up_mask_1 = forward_model(
+            imgt_pred, loss_rec, loss_geo, loss_dis, _up_flow0_1, _up_flow1_1, _up_mask_1 = forward_model(
                 args.model_name,
                 model,
                 img0,
@@ -337,24 +303,23 @@ def train(
             total_loss.backward()
             optimizer.step()
 
+            global_step += 1
+            
+            if (epoch + 1) % args.eval_interval != 0:
+                continue
+            
+            # During evaluation epochs, we also record training metrics and losses for analysis.
             loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
             batch_size = int(imgt_pred.shape[0])
-
-            for b in range(batch_size):
-                psnr = calculate_psnr_torch(img_gt=imgt[b], img_pred=imgt_pred[b])
-                evaluator.records.append({"psnr": float(psnr)})
-
+            append_batch_psnr_records(train_metric_records, train_psnr_meter, imgt_pred, imgt)
             append_batch_loss_records(train_loss_records, loss_record, batch_size)
 
-            global_step += 1
-
         if (epoch + 1) % args.eval_interval == 0:
-            train_metric_df = evaluator.to_dataframe()
+            train_metric_df = pd.DataFrame(train_metric_records)
             train_loss_df = pd.DataFrame(train_loss_records)
             train_df = pd.concat([train_metric_df.reset_index(drop=True), train_loss_df.reset_index(drop=True)], axis=1)
-            train_psnr = float(train_df["psnr"].mean())
             train_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}.csv", index=False)
-            logger.info("Epoch %s train_psnr=%.6f", epoch + 1, train_psnr)
+            logger.info("Epoch %s train_psnr=%.6f", epoch + 1, train_psnr_meter.avg)
 
             test_psnr, test_df = evaluate(args.model_name, model, test_loader, device)
             test_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}.csv", index=False)
@@ -365,6 +330,42 @@ def train(
                 save_checkpoint(checkpoints_dir / "best.pth", model, optimizer, epoch, best_psnr)
 
         save_checkpoint(checkpoints_dir / "latest.pth", model, optimizer, epoch, best_psnr)
+
+
+def load_train_run_config(config_path: Path | None) -> dict[str, Any]:
+    if config_path is None:
+        return {}
+
+    return load_yaml_file(config_path=config_path)
+
+
+def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train IFRNet variants on the VFI dataset.")
+    parser.add_argument("--config", default=config_defaults.get("config"), type=str, help="Optional JSON-formatted YAML-compatible run config.")
+    parser.add_argument("--mode", default=config_defaults.get("mode", "dry-run"), choices=["dry-run", "train"])
+    parser.add_argument("--model-name", default=config_defaults.get("model_name", "IFRNet"), choices=MODEL_NAMES)
+    parser.add_argument("--root-dir", default=config_defaults.get("root_dir", "./datasets/data"), help="Directory containing preprocessed CSV indexes.")
+    parser.add_argument("--dataset-root-dir", default=config_defaults.get("dataset_root_dir"), type=str, help="Root directory containing frame and velocity assets.")
+    parser.add_argument("--paths-config", default=config_defaults.get("paths_config"), type=str, help="Optional path to configs/paths/default.yaml.")
+    parser.add_argument("--train-preset", default=config_defaults.get("train_preset", "train_vfx_0416"), choices=list_dataset_presets())
+    parser.add_argument("--test-preset", default=config_defaults.get("test_preset", "test_vfx_0416"), choices=list_dataset_presets())
+    parser.add_argument("--epochs", default=config_defaults.get("epochs", 60), type=int, help="Total number of epochs to run.")
+    parser.add_argument("--resume-path", default=config_defaults.get("resume_path"), type=str, help="Checkpoint to resume from.")
+    parser.add_argument(
+        "--pretrained-checkpoint-path",
+        default=config_defaults.get("pretrained_checkpoint_path", config_defaults.get("pretrained_checkpoints_path")),
+        type=str,
+        help="Checkpoint to load when resume_path is None.",
+    )
+    parser.add_argument("--eval-interval", default=config_defaults.get("eval_interval", 1), type=int, help="Run validation every N epochs.")
+    parser.add_argument("--lr-start", default=config_defaults.get("lr_start", 1e-4), type=float, help="Initial learning rate.")
+    parser.add_argument("--lr-end", default=config_defaults.get("lr_end", 1e-5), type=float, help="Final learning rate after cosine decay.")
+    parser.add_argument("--seed", default=config_defaults.get("seed", 1234), type=int, help="Random seed.")
+    parser.add_argument("--batch-size", default=config_defaults.get("batch_size", 8), type=int, help="Training batch size.")
+    parser.add_argument("--output-dir", default=config_defaults.get("output_dir"), type=str, help="Output directory for checkpoints and logs.")
+    parser.add_argument("--only-fps", default=config_defaults.get("only_fps", 60), type=int, help="Use CSV entries for this FPS only.")
+    parser.add_argument("--input-fps", default=config_defaults.get("input_fps", 30), type=int, help="Input frame rate for the dataset loader.")
+    return parser
 
 
 def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -378,72 +379,7 @@ def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train IFRNet variants on the VFI dataset.")
-    parser.add_argument("--config", default=config_defaults.get("config"), type=str, help="Optional JSON-formatted YAML-compatible run config.")
-    parser.add_argument("--mode", default=config_defaults.get("mode", "dry-run"), choices=["dry-run", "train"])
-    parser.add_argument("--model-name", default=config_defaults.get("model_name", "IFRNet"), choices=["IFRNet", "IFRNet_Residual"])
-    parser.add_argument(
-        "--root-dir",
-        default=config_defaults.get("root_dir", "./datasets/data"),
-        help="Directory containing preprocessed CSV indexes.",
-    )
-    parser.add_argument(
-        "--dataset-root-dir",
-        default=config_defaults.get("dataset_root_dir"),
-        type=str,
-        help="Root directory containing frame and velocity assets.",
-    )
-    parser.add_argument(
-        "--paths-config",
-        default=config_defaults.get("paths_config"),
-        type=str,
-        help="Optional path to configs/paths/default.yaml.",
-    )
-    parser.add_argument(
-        "--train-preset",
-        default=config_defaults.get("train_preset", "train_vfx_0416"),
-        choices=list_dataset_presets(),
-    )
-    parser.add_argument(
-        "--test-preset",
-        default=config_defaults.get("test_preset", "test_vfx_0416"),
-        choices=list_dataset_presets(),
-    )
-    parser.add_argument("--epochs", default=config_defaults.get("epochs", 60), type=int, help="Total number of epochs to run.")
-    parser.add_argument("--resume-path", default=config_defaults.get("resume_path"), type=str, help="Checkpoint to resume from.")
-    parser.add_argument("--pretrained-checkpoint-path", default=config_defaults.get("pretrained_checkpoint_path"), type=str, help="Path to pretrained checkpoint.")
-    parser.add_argument("--eval-interval", default=config_defaults.get("eval_interval", 1), type=int, help="Run validation every N epochs.")
-    parser.add_argument("--lr-start", default=config_defaults.get("lr_start", 1e-4), type=float, help="Initial learning rate.")
-    parser.add_argument("--lr-end", default=config_defaults.get("lr_end", 1e-5), type=float, help="Final learning rate after cosine decay.")
-    parser.add_argument("--seed", default=config_defaults.get("seed", 1234), type=int, help="Random seed.")
-    parser.add_argument("--batch-size", default=config_defaults.get("batch_size", 8), type=int, help="Training batch size.")
-    parser.add_argument("--output-dir", default=config_defaults.get("output_dir"), type=str, help="Output directory for checkpoints and logs.")
-    parser.add_argument("--only-fps", default=config_defaults.get("only_fps", 60), type=int, help="Use CSV entries for this FPS only.")
-    parser.add_argument("--input-fps", default=config_defaults.get("input_fps", 30), type=int, help="Input frame rate for the dataset loader.")
-    return parser
-
-
-def load_train_run_config(config_path: Path | None) -> dict[str, Any]:
-    if config_path is None:
-        return {}
-
-    return load_yaml_file(config_path=config_path)
-
-
 def prepare_args(args: argparse.Namespace) -> argparse.Namespace:
-    model_config = get_model_config(args.model_name)
-    args.resume_path = resolve_resume_path(args.resume_path, model_config["default_resume_path"])
-    args.output_dir, args.output_dir_reason = resolve_output_dir(
-        args.output_dir,
-        args.resume_path,
-        model_config["default_output_dir"],
-    )
-
-    if args.dataset_root_dir is None:
-        paths_config_path = None if args.paths_config is None else Path(args.paths_config)
-        args.dataset_root_dir = str(resolve_active_dataset_root(paths_config_path))
-
     return args
 
 
@@ -451,9 +387,11 @@ def load_training_state(
     args: argparse.Namespace,
     model: Any,
     optimizer: Any,
-    device: Any,
+    device: torch.device,
     logger: logging.Logger,
 ) -> TrainingState:
+    import torch
+
     if args.resume_path is not None:
         checkpoint = torch.load(args.resume_path, map_location=device)
         model.load_state_dict(checkpoint["model"])
@@ -468,13 +406,11 @@ def load_training_state(
             mode="resume",
         )
 
-    if args.pretrained_checkpoint_path is not None:
-        pretrained_checkpoint_path = Path(args.pretrained_checkpoint_path)
-        if not pretrained_checkpoint_path.is_file():
-            raise FileNotFoundError(f"Pretrained checkpoint not found: {pretrained_checkpoint_path}")
-
-        logger.info("Loading pretrained checkpoint from %s", pretrained_checkpoint_path)
-        model.load_state_dict(torch.load(str(pretrained_checkpoint_path), map_location=device))
+    pretrained_path = args.pretrained_checkpoint_path
+    if pretrained_path is not None:
+        pretrained_path = Path(pretrained_path)
+        logger.info("Loading pretrained checkpoint from %s", pretrained_path)
+        model.load_state_dict(torch.load(str(pretrained_path), map_location=device))
         return TrainingState(
             start_epoch=0,
             global_step=0,
@@ -500,12 +436,11 @@ def log_run_summary(
     logger: logging.Logger,
 ) -> None:
     logger.info(
-        "model=%s mode=%s device=%s output_dir=%s output_dir_reason=%s dataset_root_dir=%s train_samples=%s test_samples=%s start_epoch=%s epochs=%s batch_size=%s",
+        "model=%s mode=%s device=%s output_dir=%s dataset_root_dir=%s train_samples=%s test_samples=%s start_epoch=%s epochs=%s batch_size=%s",
         args.model_name,
         training_state.mode,
         device,
         args.output_dir,
-        args.output_dir_reason,
         args.dataset_root_dir,
         len(train_dataset),
         len(test_dataset),
@@ -525,7 +460,6 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
         "dataset_root_dir": args.dataset_root_dir,
         "csv_root_dir": str(Path(args.root_dir)),
         "output_dir": args.output_dir,
-        "output_dir_reason": args.output_dir_reason,
         "resume_path": args.resume_path,
         "pretrained_checkpoint_path": args.pretrained_checkpoint_path,
         "epochs": args.epochs,
@@ -537,6 +471,12 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
 
 
 def run_training(args: argparse.Namespace) -> None:
+    import torch
+    import torch.optim as optim
+    from torch.utils.data import DataLoader
+
+    from src.data.dataset_loader import VFITrainDataset
+
     output_dir = Path(args.output_dir)
     checkpoints_dir = output_dir / "checkpoints"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -560,12 +500,11 @@ def run_training(args: argparse.Namespace) -> None:
 
     train_dataset = VFITrainDataset(train_df, args.dataset_root_dir, True, args.input_fps)
     test_dataset = VFITrainDataset(test_df, args.dataset_root_dir, False, args.input_fps)
-    args.num_workers = args.batch_size
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.num_workers, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True)
 
     args.iters_per_epoch = len(train_loader)
-    model_class = get_model_class(args.model_name)
+    model_class = resolve_model_class(args.model_name)
     model = model_class().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr_start, weight_decay=0)
     training_state = load_training_state(args, model, optimizer, device, logger)

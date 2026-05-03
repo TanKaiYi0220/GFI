@@ -92,11 +92,10 @@ src/
     preprocess.py   Reusable path-rewrite helpers
     analysis.py     Lightweight dataset analysis helpers
   engine/
-    evaluation.py   Lightweight metric collection used by training and validation
+    evaluation.py   Small PSNR helper and AverageMeter used by training
     pipeline.py     Shared training, inference, and evaluation runtime helpers
   models/
     external/       External or paper-derived model adapters
-    registry.py     Model registration and default training-path metadata
   utils/            Config, logging, seed, and filesystem helpers
 ```
 
@@ -132,7 +131,7 @@ Validate the integrated IFRNet-style training entrypoint and inspect resolved pr
 python scripts/train.py --mode dry-run --model-name IFRNet --train-preset train_vfx_0416 --test-preset test_vfx_0416 --root-dir C:\dataset_indexes
 ```
 
-Run the integrated training pipeline after registering your model class in `src/models/registry.py` and implementing `src/data/dataset_loader.py`.
+Run the integrated training pipeline after implementing `src/data/dataset_loader.py`. The model selection is resolved directly inside `scripts/train.py`.
 
 ```powershell
 python scripts/train.py --mode train --model-name IFRNet --train-preset train_vfx_0416 --test-preset test_vfx_0416 --root-dir C:\dataset_indexes --dataset-root-dir C:\datasets\VFI
@@ -224,7 +223,7 @@ python -m src.data.dataset_config --preset train_vfx_0416 --limit 3
 - Keep reusable dataset logic under the flat `src/data/` files.
 - Keep reusable ARPG-style dataset presets in `src/data/dataset_config.py`.
 - Keep dataset root paths in `configs/paths/default.yaml` and switch environments with `ACTIVE_DATASET_ROOT_KEY` in `src/data/dataset_config.py`.
-- Register concrete model classes in `src/models/registry.py` before running `scripts/train.py` or `scripts/inference.py`.
+- Keep the model-name to model-class mapping in `scripts/train.py` if you add more trainable variants.
 - Implement the row-to-tensor logic in `src/data/dataset_loader.py` for your actual CSV schema and frame layout.
 - Keep disposable exploratory work under `experiments/` so it does not leak into the formal pipeline.
 - Store dataset files outside the repository whenever possible.

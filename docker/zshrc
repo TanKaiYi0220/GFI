@@ -1,0 +1,10 @@
+export PROJECT_ROOT=/workspace/src
+export PYTHONPATH=/workspace/src${PYTHONPATH:+:$PYTHONPATH}
+
+if [ -d "$PROJECT_ROOT" ]; then
+    cd "$PROJECT_ROOT"
+fi
+
+if [ -f "$PROJECT_ROOT/.zshrc.local" ]; then
+    source "$PROJECT_ROOT/.zshrc.local"
+fi
