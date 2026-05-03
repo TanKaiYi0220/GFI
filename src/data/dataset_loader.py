@@ -71,14 +71,6 @@ def flow_to_tensor(flow: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(contiguous_flow)
 
 
-def image_tensor_to_numpy(image_tensor: torch.Tensor) -> np.ndarray:
-    return np.ascontiguousarray(image_tensor.detach().cpu().permute(1, 2, 0).float().numpy())
-
-
-def flow_tensor_to_numpy(flow_tensor: torch.Tensor) -> np.ndarray:
-    return np.ascontiguousarray(flow_tensor.detach().cpu().permute(1, 2, 0).float().numpy())
-
-
 class BaseDataset(Dataset):
     def __init__(
         self,
@@ -247,48 +239,6 @@ class VFITrainDataset(BaseDataset):
         img1 = self._load_image(img_2_path)
         bmv = self._load_game_motion(backward_path)
         fmv = self._load_game_motion(forward_path)
-
-        if self.augment:
-            img0, imgt, img1, bmv, fmv = random_crop(img0, imgt, img1, bmv, fmv, (224, 224))
-            img0, imgt, img1, bmv, fmv = random_reverse_channel(img0, imgt, img1, bmv, fmv, 0.5)
-            img0, imgt, img1, bmv, fmv = random_vertical_flip(img0, imgt, img1, bmv, fmv, 0.3)
-            img0, imgt, img1, bmv, fmv = random_horizontal_flip(img0, imgt, img1, bmv, fmv, 0.5)
-            img0, imgt, img1, bmv, fmv = random_rotate(img0, imgt, img1, bmv, fmv, 0.05)
-
-        img0_tensor = image_to_tensor(img0)
-        imgt_tensor = image_to_tensor(imgt)
-        img1_tensor = image_to_tensor(img1)
-        bmv_tensor = flow_to_tensor(bmv)
-        fmv_tensor = flow_to_tensor(fmv)
-        embt_tensor = build_embedding_tensor()
-
-        return img0_tensor, imgt_tensor, img1_tensor, bmv_tensor, fmv_tensor, embt_tensor, info
-
-
-class CachedVFITrainDataset(Dataset):
-    def __init__(
-        self,
-        manifest_path: str,
-        augment: bool,
-    ) -> None:
-        self.manifest = pd.read_csv(manifest_path)
-        self.augment = augment
-
-    def __len__(self) -> int:
-        return len(self.manifest)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
-        row = self.manifest.iloc[index]
-        cache_path = Path(str(row["cache_path"]))
-        payload = torch.load(str(cache_path), map_location="cpu")
-        tensors = payload["tensors"]
-        info = dict(payload["info"])
-
-        img0 = image_tensor_to_numpy(tensors["img0"])
-        imgt = image_tensor_to_numpy(tensors["imgt"])
-        img1 = image_tensor_to_numpy(tensors["img1"])
-        bmv = flow_tensor_to_numpy(tensors["bmv"])
-        fmv = flow_tensor_to_numpy(tensors["fmv"])
 
         if self.augment:
             img0, imgt, img1, bmv, fmv = random_crop(img0, imgt, img1, bmv, fmv, (224, 224))

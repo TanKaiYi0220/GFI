@@ -32,7 +32,6 @@ from scripts.train import prepare_args
 from scripts.train import save_checkpoint
 from scripts.train import set_lr
 from scripts.train import set_seed
-from src.data.dataset_loader import CachedVFITrainDataset
 from src.data.dataset_loader import VFITrainDataset
 from src.engine.evaluation import TaskEvaluator
 from src.engine.evaluation import VFI_METRICS
@@ -406,25 +405,18 @@ def run_training(args: argparse.Namespace) -> None:
     logger.info("device=%s", device)
 
     root_dir = Path(args.root_dir)
-    if args.train_cache_manifest is None:
-        train_df = build_merged_dataframe(root_dir, checkpoints_dir, args.train_preset, args.only_fps, logger)
-        if "valid" in train_df.columns:
-            logger.info("Valid Count %s in %s", train_df["valid"].value_counts().to_dict(), args.train_preset)
-            train_df = train_df[train_df["valid"] == True]
-        train_dataset = VFITrainDataset(train_df, args.dataset_root_dir, True, args.input_fps)
-    else:
-        logger.info("Using cached training manifest %s", args.train_cache_manifest)
-        train_dataset = CachedVFITrainDataset(args.train_cache_manifest, True)
+    train_df = build_merged_dataframe(root_dir, checkpoints_dir, args.train_preset, args.only_fps, logger)
+    test_df = build_merged_dataframe(root_dir, checkpoints_dir, args.test_preset, args.only_fps, logger)
 
-    if args.test_cache_manifest is None:
-        test_df = build_merged_dataframe(root_dir, checkpoints_dir, args.test_preset, args.only_fps, logger)
-        if "valid" in test_df.columns:
-            logger.info("Valid Count %s in %s", test_df["valid"].value_counts().to_dict(), args.test_preset)
-            test_df = test_df[test_df["valid"] == True]
-        test_dataset = VFITrainDataset(test_df, args.dataset_root_dir, False, args.input_fps)
-    else:
-        logger.info("Using cached validation manifest %s", args.test_cache_manifest)
-        test_dataset = CachedVFITrainDataset(args.test_cache_manifest, False)
+    if "valid" in train_df.columns:
+        logger.info("Valid Count %s in %s", train_df["valid"].value_counts().to_dict(), args.train_preset)
+        train_df = train_df[train_df["valid"] == True]
+    if "valid" in test_df.columns:
+        logger.info("Valid Count %s in %s", test_df["valid"].value_counts().to_dict(), args.test_preset)
+        test_df = test_df[test_df["valid"] == True]
+
+    train_dataset = VFITrainDataset(train_df, args.dataset_root_dir, True, args.input_fps)
+    test_dataset = VFITrainDataset(test_df, args.dataset_root_dir, False, args.input_fps)
     train_loader_kwargs = build_dataloader_kwargs(
         batch_size=args.batch_size,
         shuffle=True,
