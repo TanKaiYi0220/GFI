@@ -27,6 +27,7 @@ from src.data.dataset_config import get_dataset_preset
 from src.data.dataset_config import list_dataset_presets
 from src.data.dataset_config import resolve_active_dataset_root
 from src.data.dataset_config import iter_dataset_configs
+from src.data.dataset_loader import CachedVFITrainDataset
 from src.data.dataset_loader import VFITrainDataset
 from src.engine.evaluation import TaskEvaluator
 from src.engine.evaluation import VFI_METRICS
@@ -401,6 +402,8 @@ def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.Argument
         default=config_defaults.get("test_preset", "test_vfx_0416"),
         choices=list_dataset_presets(),
     )
+    parser.add_argument("--train-cache-manifest", default=config_defaults.get("train_cache_manifest"), type=str, help="Optional manifest.csv path for cached training samples.")
+    parser.add_argument("--test-cache-manifest", default=config_defaults.get("test_cache_manifest"), type=str, help="Optional manifest.csv path for cached validation samples.")
     parser.add_argument("--epochs", default=config_defaults.get("epochs", 60), type=int, help="Total number of epochs to run.")
     parser.add_argument("--resume-path", default=config_defaults.get("resume_path"), type=str, help="Checkpoint to resume from.")
     parser.add_argument("--eval-interval", default=config_defaults.get("eval_interval", 1), type=int, help="Run validation every N epochs.")
@@ -512,6 +515,8 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
         "model_name": args.model_name,
         "train_preset": args.train_preset,
         "test_preset": args.test_preset,
+        "train_cache_manifest": args.train_cache_manifest,
+        "test_cache_manifest": args.test_cache_manifest,
         "active_root_key": ACTIVE_DATASET_ROOT_KEY,
         "dataset_root_dir": args.dataset_root_dir,
         "csv_root_dir": str(Path(args.root_dir)),
@@ -538,18 +543,26 @@ def run_training(args: argparse.Namespace) -> None:
     logger.info("device=%s", device)
 
     root_dir = Path(args.root_dir)
-    train_df = build_merged_dataframe(root_dir, checkpoints_dir, args.train_preset, args.only_fps, logger)
-    test_df = build_merged_dataframe(root_dir, checkpoints_dir, args.test_preset, args.only_fps, logger)
+    if args.train_cache_manifest is None:
+        train_df = build_merged_dataframe(root_dir, checkpoints_dir, args.train_preset, args.only_fps, logger)
+        if "valid" in train_df.columns:
+            logger.info("Valid Count %s in %s", train_df["valid"].value_counts().to_dict(), args.train_preset)
+            train_df = train_df[train_df["valid"] == True]
+        train_dataset = VFITrainDataset(train_df, args.dataset_root_dir, True, args.input_fps)
+    else:
+        logger.info("Using cached training manifest %s", args.train_cache_manifest)
+        train_dataset = CachedVFITrainDataset(args.train_cache_manifest, True)
 
-    if "valid" in train_df.columns:
-        logger.info("Valid Count %s in %s", train_df["valid"].value_counts().to_dict(), args.train_preset)
-        train_df = train_df[train_df["valid"] == True]
-    if "valid" in test_df.columns:
-        logger.info("Valid Count %s in %s", test_df["valid"].value_counts().to_dict(), args.test_preset)
-        test_df = test_df[test_df["valid"] == True]
+    if args.test_cache_manifest is None:
+        test_df = build_merged_dataframe(root_dir, checkpoints_dir, args.test_preset, args.only_fps, logger)
+        if "valid" in test_df.columns:
+            logger.info("Valid Count %s in %s", test_df["valid"].value_counts().to_dict(), args.test_preset)
+            test_df = test_df[test_df["valid"] == True]
+        test_dataset = VFITrainDataset(test_df, args.dataset_root_dir, False, args.input_fps)
+    else:
+        logger.info("Using cached validation manifest %s", args.test_cache_manifest)
+        test_dataset = CachedVFITrainDataset(args.test_cache_manifest, False)
 
-    train_dataset = VFITrainDataset(train_df, args.dataset_root_dir, True, args.input_fps)
-    test_dataset = VFITrainDataset(test_df, args.dataset_root_dir, False, args.input_fps)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True)
 
