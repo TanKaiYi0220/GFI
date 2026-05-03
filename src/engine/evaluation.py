@@ -6,7 +6,7 @@ from typing import Any
 import pandas as pd
 import torch
 
-from src.models.IFRNet.metric import calculate_psnr as ifrnet_calculate_psnr
+from src.models.external.IFRNet.metric import calculate_psnr as ifrnet_calculate_psnr
 
 VFI_METRICS: tuple[str, ...] = ("psnr",)
 
