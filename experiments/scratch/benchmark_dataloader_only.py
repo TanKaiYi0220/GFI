@@ -18,16 +18,30 @@ from scripts.train import build_merged_dataframe
 from scripts.train import build_train_arg_parser
 from scripts.train import load_train_run_config
 from scripts.train import prepare_args
-from src.data.augment import random_crop
-from src.data.augment import random_horizontal_flip
-from src.data.augment import random_reverse_channel
-from src.data.augment import random_rotate
-from src.data.augment import random_vertical_flip
+from src.data.dataset_loader import NPZVFITrainDataset
 from src.data.dataset_loader import VFITrainDataset
+from src.data.dataset_loader import apply_vfi_train_augment
 from src.data.dataset_loader import build_distance_indexing
-from src.data.dataset_loader import build_embedding_tensor
-from src.data.dataset_loader import flow_to_tensor
-from src.data.dataset_loader import image_to_tensor
+from src.data.dataset_loader import build_vfi_training_tensors
+from src.data.dataset_loader import load_npz_arrays
+
+
+RAW_TIMING_FIELDS: tuple[str, ...] = (
+    "row_lookup_seconds",
+    "image_load_seconds",
+    "flow_load_seconds",
+    "augment_seconds",
+    "tensor_seconds",
+    "sample_total_seconds",
+)
+
+NPZ_TIMING_FIELDS: tuple[str, ...] = (
+    "row_lookup_seconds",
+    "npz_load_seconds",
+    "augment_seconds",
+    "tensor_seconds",
+    "sample_total_seconds",
+)
 
 
 def parse_bool_argument(value: str) -> bool:
@@ -42,7 +56,10 @@ def parse_bool_argument(value: str) -> bool:
 
 def build_benchmark_arg_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser = build_train_arg_parser(config_defaults)
-    parser.description = "Benchmark dataloader-only throughput and per-sample timing breakdown."
+    parser.description = "Benchmark dataloader-only throughput and compare raw files against .npz caches."
+    parser.add_argument("--data-source", default="raw", choices=["raw", "npz", "both"])
+    parser.add_argument("--npz-manifest", default=None, type=str, help="Manifest CSV written by cache_vfi_samples_npz.py.")
+    parser.add_argument("--npz-cache-dir", default=str(PROJECT_ROOT / "outputs" / "npz_cache"), type=str)
     parser.add_argument("--num-workers", default=config_defaults.get("num_workers", 0), type=int)
     parser.add_argument("--pin-memory", default=config_defaults.get("pin_memory", True), type=parse_bool_argument)
     parser.add_argument("--persistent-workers", default=config_defaults.get("persistent_workers", False), type=parse_bool_argument)
@@ -85,7 +102,20 @@ def build_dataloader_kwargs(
     return dataloader_kwargs
 
 
-class TimedVFITrainDataset(VFITrainDataset):
+def build_npz_manifest_path(args: argparse.Namespace) -> Path:
+    if args.npz_manifest is not None:
+        return Path(args.npz_manifest)
+
+    manifest_path = Path(args.npz_cache_dir) / args.train_preset / f"{args.train_preset}_manifest.csv"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"NPZ manifest not found: {manifest_path}")
+
+    return manifest_path
+
+
+class TimedRawVFITrainDataset(VFITrainDataset):
+    timing_fields: tuple[str, ...] = RAW_TIMING_FIELDS
+
     def __getitem__(self, index: int) -> tuple[Any, ...]:
         sample_start = time.perf_counter()
 
@@ -123,20 +153,17 @@ class TimedVFITrainDataset(VFITrainDataset):
 
         augment_start = time.perf_counter()
         if self.augment:
-            img0, imgt, img1, bmv, fmv = random_crop(img0, imgt, img1, bmv, fmv, (224, 224))
-            img0, imgt, img1, bmv, fmv = random_reverse_channel(img0, imgt, img1, bmv, fmv, 0.5)
-            img0, imgt, img1, bmv, fmv = random_vertical_flip(img0, imgt, img1, bmv, fmv, 0.3)
-            img0, imgt, img1, bmv, fmv = random_horizontal_flip(img0, imgt, img1, bmv, fmv, 0.5)
-            img0, imgt, img1, bmv, fmv = random_rotate(img0, imgt, img1, bmv, fmv, 0.05)
+            img0, imgt, img1, bmv, fmv = apply_vfi_train_augment(img0, imgt, img1, bmv, fmv)
         augment_end = time.perf_counter()
 
         tensor_start = time.perf_counter()
-        img0_tensor = image_to_tensor(img0)
-        imgt_tensor = image_to_tensor(imgt)
-        img1_tensor = image_to_tensor(img1)
-        bmv_tensor = flow_to_tensor(bmv)
-        fmv_tensor = flow_to_tensor(fmv)
-        embt_tensor = build_embedding_tensor()
+        img0_tensor, imgt_tensor, img1_tensor, bmv_tensor, fmv_tensor, embt_tensor = build_vfi_training_tensors(
+            img0,
+            imgt,
+            img1,
+            bmv,
+            fmv,
+        )
         tensor_end = time.perf_counter()
 
         sample_end = time.perf_counter()
@@ -152,26 +179,85 @@ class TimedVFITrainDataset(VFITrainDataset):
         return img0_tensor, imgt_tensor, img1_tensor, bmv_tensor, fmv_tensor, embt_tensor, info
 
 
+class TimedNPZVFITrainDataset(NPZVFITrainDataset):
+    timing_fields: tuple[str, ...] = NPZ_TIMING_FIELDS
+
+    def __getitem__(self, index: int) -> tuple[Any, ...]:
+        sample_start = time.perf_counter()
+
+        row_lookup_start = time.perf_counter()
+        row = self.manifest.iloc[index]
+        cache_path = Path(str(row["cache_path"]))
+        info = {
+            "frame_range": str(row["frame_range"]),
+            "valid": bool(row["valid"]),
+            "distance_indexing": [
+                float(row["distance_index_mean"]),
+                float(row["distance_index_median"]),
+            ],
+        }
+        row_lookup_end = time.perf_counter()
+
+        npz_load_start = time.perf_counter()
+        arrays = load_npz_arrays(cache_path)
+        img0 = arrays["img0"]
+        imgt = arrays["imgt"]
+        img1 = arrays["img1"]
+        bmv = arrays["bmv"]
+        fmv = arrays["fmv"]
+        npz_load_end = time.perf_counter()
+
+        augment_start = time.perf_counter()
+        if self.augment:
+            img0, imgt, img1, bmv, fmv = apply_vfi_train_augment(img0, imgt, img1, bmv, fmv)
+        augment_end = time.perf_counter()
+
+        tensor_start = time.perf_counter()
+        img0_tensor, imgt_tensor, img1_tensor, bmv_tensor, fmv_tensor, embt_tensor = build_vfi_training_tensors(
+            img0,
+            imgt,
+            img1,
+            bmv,
+            fmv,
+        )
+        tensor_end = time.perf_counter()
+
+        sample_end = time.perf_counter()
+        info["timing"] = {
+            "row_lookup_seconds": row_lookup_end - row_lookup_start,
+            "npz_load_seconds": npz_load_end - npz_load_start,
+            "augment_seconds": augment_end - augment_start,
+            "tensor_seconds": tensor_end - tensor_start,
+            "sample_total_seconds": sample_end - sample_start,
+        }
+
+        return img0_tensor, imgt_tensor, img1_tensor, bmv_tensor, fmv_tensor, embt_tensor, info
+
+
 def build_batch_record(
     batch_index: int,
     batch_size: int,
     batch_wait_seconds: float,
     timing_info: dict[str, Any],
+    timing_fields: tuple[str, ...],
 ) -> dict[str, float | int]:
-    return {
+    batch_record: dict[str, float | int] = {
         "batch_index": batch_index,
         "batch_size": batch_size,
         "batch_wait_seconds": batch_wait_seconds,
-        "row_lookup_seconds_mean": float(timing_info["row_lookup_seconds"].float().mean().item()),
-        "image_load_seconds_mean": float(timing_info["image_load_seconds"].float().mean().item()),
-        "flow_load_seconds_mean": float(timing_info["flow_load_seconds"].float().mean().item()),
-        "augment_seconds_mean": float(timing_info["augment_seconds"].float().mean().item()),
-        "tensor_seconds_mean": float(timing_info["tensor_seconds"].float().mean().item()),
-        "sample_total_seconds_mean": float(timing_info["sample_total_seconds"].float().mean().item()),
     }
+    for timing_field in timing_fields:
+        batch_record[f"{timing_field}_mean"] = float(timing_info[timing_field].float().mean().item())
+
+    return batch_record
 
 
-def build_summary(records: list[dict[str, float | int]], warmup_batches: int) -> dict[str, float]:
+def build_summary(
+    records: list[dict[str, float | int]],
+    warmup_batches: int,
+    timing_fields: tuple[str, ...],
+    data_source: str,
+) -> dict[str, float | int | str]:
     if len(records) == 0:
         raise RuntimeError("No dataloader benchmark records were collected.")
 
@@ -183,31 +269,59 @@ def build_summary(records: list[dict[str, float | int]], warmup_batches: int) ->
     average_batch_wait = float(benchmark_df["batch_wait_seconds"].mean())
     end_to_end_samples_per_second = average_batch_size / average_batch_wait if average_batch_wait > 0.0 else 0.0
 
-    return {
+    summary: dict[str, float | int | str] = {
+        "data_source": data_source,
         "batch_wait_seconds": average_batch_wait,
-        "row_lookup_seconds_mean": float(benchmark_df["row_lookup_seconds_mean"].mean()),
-        "image_load_seconds_mean": float(benchmark_df["image_load_seconds_mean"].mean()),
-        "flow_load_seconds_mean": float(benchmark_df["flow_load_seconds_mean"].mean()),
-        "augment_seconds_mean": float(benchmark_df["augment_seconds_mean"].mean()),
-        "tensor_seconds_mean": float(benchmark_df["tensor_seconds_mean"].mean()),
-        "sample_total_seconds_mean": float(benchmark_df["sample_total_seconds_mean"].mean()),
         "end_to_end_samples_per_second": end_to_end_samples_per_second,
+        "average_batch_size": average_batch_size,
+        "measured_batch_count": int(len(benchmark_df)),
+    }
+    for timing_field in timing_fields:
+        summary[f"{timing_field}_mean"] = float(benchmark_df[f"{timing_field}_mean"].mean())
+
+    return summary
+
+
+def build_comparison_summary(raw_summary: dict[str, Any], npz_summary: dict[str, Any]) -> dict[str, Any]:
+    raw_wait = float(raw_summary["batch_wait_seconds"])
+    npz_wait = float(npz_summary["batch_wait_seconds"])
+    raw_throughput = float(raw_summary["end_to_end_samples_per_second"])
+    npz_throughput = float(npz_summary["end_to_end_samples_per_second"])
+
+    return {
+        "raw_data_source": raw_summary["data_source"],
+        "npz_data_source": npz_summary["data_source"],
+        "batch_wait_speedup": (raw_wait / npz_wait) if npz_wait > 0.0 else float("inf"),
+        "throughput_speedup": (npz_throughput / raw_throughput) if raw_throughput > 0.0 else float("inf"),
+        "raw_batch_wait_seconds": raw_wait,
+        "npz_batch_wait_seconds": npz_wait,
+        "raw_end_to_end_samples_per_second": raw_throughput,
+        "npz_end_to_end_samples_per_second": npz_throughput,
     }
 
 
-def main(argv: list[str] | None = None) -> None:
-    args = parse_benchmark_args(argv)
-    args = prepare_args(args)
+def print_benchmark_header(args: argparse.Namespace, data_source: str, dataset_len: int) -> None:
+    header = {
+        "data_source": data_source,
+        "dataset_len": dataset_len,
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "pin_memory": args.pin_memory,
+        "persistent_workers": args.persistent_workers,
+        "prefetch_factor": args.prefetch_factor,
+        "num_batches": args.num_batches,
+        "warmup_batches": args.warmup_batches,
+    }
+    if data_source == "npz":
+        header["npz_manifest"] = str(build_npz_manifest_path(args))
 
-    root_dir = Path(args.root_dir)
-    checkpoints_dir = PROJECT_ROOT / "outputs" / "dataloader_benchmark"
-    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    print(json.dumps(header, indent=2))
 
-    train_df = build_merged_dataframe(root_dir, checkpoints_dir, args.train_preset, args.only_fps, logger=_SilentLogger())
-    if "valid" in train_df.columns:
-        train_df = train_df[train_df["valid"] == True]
 
-    dataset = TimedVFITrainDataset(train_df, args.dataset_root_dir, True, args.input_fps)
+def run_one_benchmark(
+    args: argparse.Namespace,
+    data_source: str,
+) -> dict[str, Any]:
     loader_kwargs = build_dataloader_kwargs(
         batch_size=args.batch_size,
         shuffle=True,
@@ -216,24 +330,25 @@ def main(argv: list[str] | None = None) -> None:
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
     )
+
+    if data_source == "raw":
+        root_dir = Path(args.root_dir)
+        checkpoints_dir = PROJECT_ROOT / "outputs" / "dataloader_benchmark"
+        checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        train_df = build_merged_dataframe(root_dir, checkpoints_dir, args.train_preset, args.only_fps, logger=_SilentLogger())
+        if "valid" in train_df.columns:
+            train_df = train_df[train_df["valid"] == True]
+        dataset = TimedRawVFITrainDataset(train_df, args.dataset_root_dir, True, args.input_fps)
+    else:
+        manifest_path = build_npz_manifest_path(args)
+        dataset = TimedNPZVFITrainDataset(str(manifest_path), True)
+
+    print_benchmark_header(args, data_source, len(dataset))
+
     loader = DataLoader(dataset, **loader_kwargs)
-
-    print(json.dumps(
-        {
-            "dataset_len": len(dataset),
-            "batch_size": args.batch_size,
-            "num_workers": args.num_workers,
-            "pin_memory": args.pin_memory,
-            "persistent_workers": args.persistent_workers,
-            "prefetch_factor": args.prefetch_factor,
-            "num_batches": args.num_batches,
-            "warmup_batches": args.warmup_batches,
-        },
-        indent=2,
-    ))
-
-    batch_records: list[dict[str, float | int]] = []
     iterator = iter(loader)
+    batch_records: list[dict[str, float | int]] = []
+    timing_fields = dataset.timing_fields
 
     for batch_index in range(1, args.num_batches + 1):
         batch_start = time.perf_counter()
@@ -248,14 +363,34 @@ def main(argv: list[str] | None = None) -> None:
             batch_size=int(img0.shape[0]),
             batch_wait_seconds=batch_end - batch_start,
             timing_info=info["timing"],
+            timing_fields=timing_fields,
         )
         batch_records.append(batch_record)
 
         if batch_index == 1 or batch_index == args.warmup_batches or batch_index == args.num_batches:
             print(json.dumps(batch_record, indent=2))
 
-    summary = build_summary(batch_records, args.warmup_batches)
+    summary = build_summary(batch_records, args.warmup_batches, timing_fields, data_source)
     print(json.dumps(summary, indent=2))
+    return summary
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_benchmark_args(argv)
+    args = prepare_args(args)
+
+    if args.data_source == "raw":
+        run_one_benchmark(args, "raw")
+        return
+
+    if args.data_source == "npz":
+        run_one_benchmark(args, "npz")
+        return
+
+    raw_summary = run_one_benchmark(args, "raw")
+    npz_summary = run_one_benchmark(args, "npz")
+    comparison_summary = build_comparison_summary(raw_summary, npz_summary)
+    print(json.dumps(comparison_summary, indent=2))
 
 
 class _SilentLogger:

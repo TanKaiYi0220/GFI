@@ -71,6 +71,42 @@ def flow_to_tensor(flow: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(contiguous_flow)
 
 
+def apply_vfi_train_augment(
+    img0: np.ndarray,
+    imgt: np.ndarray,
+    img1: np.ndarray,
+    bmv: np.ndarray,
+    fmv: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    img0, imgt, img1, bmv, fmv = random_crop(img0, imgt, img1, bmv, fmv, (224, 224))
+    img0, imgt, img1, bmv, fmv = random_reverse_channel(img0, imgt, img1, bmv, fmv, 0.5)
+    img0, imgt, img1, bmv, fmv = random_vertical_flip(img0, imgt, img1, bmv, fmv, 0.3)
+    img0, imgt, img1, bmv, fmv = random_horizontal_flip(img0, imgt, img1, bmv, fmv, 0.5)
+    img0, imgt, img1, bmv, fmv = random_rotate(img0, imgt, img1, bmv, fmv, 0.05)
+    return img0, imgt, img1, bmv, fmv
+
+
+def build_vfi_training_tensors(
+    img0: np.ndarray,
+    imgt: np.ndarray,
+    img1: np.ndarray,
+    bmv: np.ndarray,
+    fmv: np.ndarray,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    img0_tensor = image_to_tensor(img0)
+    imgt_tensor = image_to_tensor(imgt)
+    img1_tensor = image_to_tensor(img1)
+    bmv_tensor = flow_to_tensor(bmv)
+    fmv_tensor = flow_to_tensor(fmv)
+    embt_tensor = build_embedding_tensor()
+    return img0_tensor, imgt_tensor, img1_tensor, bmv_tensor, fmv_tensor, embt_tensor
+
+
+def load_npz_arrays(cache_path: Path) -> dict[str, np.ndarray]:
+    with np.load(cache_path, allow_pickle=False) as payload:
+        return {key: np.ascontiguousarray(payload[key]) for key in payload.files}
+
+
 class BaseDataset(Dataset):
     def __init__(
         self,
@@ -241,18 +277,60 @@ class VFITrainDataset(BaseDataset):
         fmv = self._load_game_motion(forward_path)
 
         if self.augment:
-            img0, imgt, img1, bmv, fmv = random_crop(img0, imgt, img1, bmv, fmv, (224, 224))
-            img0, imgt, img1, bmv, fmv = random_reverse_channel(img0, imgt, img1, bmv, fmv, 0.5)
-            img0, imgt, img1, bmv, fmv = random_vertical_flip(img0, imgt, img1, bmv, fmv, 0.3)
-            img0, imgt, img1, bmv, fmv = random_horizontal_flip(img0, imgt, img1, bmv, fmv, 0.5)
-            img0, imgt, img1, bmv, fmv = random_rotate(img0, imgt, img1, bmv, fmv, 0.05)
+            img0, imgt, img1, bmv, fmv = apply_vfi_train_augment(img0, imgt, img1, bmv, fmv)
 
-        img0_tensor = image_to_tensor(img0)
-        imgt_tensor = image_to_tensor(imgt)
-        img1_tensor = image_to_tensor(img1)
-        bmv_tensor = flow_to_tensor(bmv)
-        fmv_tensor = flow_to_tensor(fmv)
-        embt_tensor = build_embedding_tensor()
+        img0_tensor, imgt_tensor, img1_tensor, bmv_tensor, fmv_tensor, embt_tensor = build_vfi_training_tensors(
+            img0,
+            imgt,
+            img1,
+            bmv,
+            fmv,
+        )
+
+        return img0_tensor, imgt_tensor, img1_tensor, bmv_tensor, fmv_tensor, embt_tensor, info
+
+
+class NPZVFITrainDataset(Dataset):
+    def __init__(
+        self,
+        manifest_path: str,
+        augment: bool,
+    ) -> None:
+        self.manifest = pd.read_csv(manifest_path)
+        self.augment = augment
+
+    def __len__(self) -> int:
+        return len(self.manifest)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
+        row = self.manifest.iloc[index]
+        cache_path = Path(str(row["cache_path"]))
+        arrays = load_npz_arrays(cache_path)
+
+        img0 = arrays["img0"]
+        imgt = arrays["imgt"]
+        img1 = arrays["img1"]
+        bmv = arrays["bmv"]
+        fmv = arrays["fmv"]
+
+        if self.augment:
+            img0, imgt, img1, bmv, fmv = apply_vfi_train_augment(img0, imgt, img1, bmv, fmv)
+
+        img0_tensor, imgt_tensor, img1_tensor, bmv_tensor, fmv_tensor, embt_tensor = build_vfi_training_tensors(
+            img0,
+            imgt,
+            img1,
+            bmv,
+            fmv,
+        )
+        info = {
+            "frame_range": str(row["frame_range"]),
+            "valid": bool(row["valid"]),
+            "distance_indexing": [
+                float(row["distance_index_mean"]),
+                float(row["distance_index_median"]),
+            ],
+        }
 
         return img0_tensor, imgt_tensor, img1_tensor, bmv_tensor, fmv_tensor, embt_tensor, info
 
