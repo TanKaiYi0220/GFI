@@ -269,6 +269,9 @@ class FlowEstimationTrainDataset(BaseDataset):
     ) -> None:
         super().__init__(dataframe, dataset_root_dir, input_fps, modality_config, transform, None, None)
         self.augment = augment
+        
+    def __len__(self) -> int:
+        return len(self.dataframe)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
         if self.df_fps == self.input_fps:
