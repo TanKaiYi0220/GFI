@@ -13,13 +13,11 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from src.data.augment import random_crop
-from src.data.augment import random_horizontal_flip
-from src.data.augment import random_reverse_channel
-from src.data.augment import random_reverse_time
-from src.data.augment import random_resize
-from src.data.augment import random_rotate
-from src.data.augment import random_vertical_flip
+from src.data.augment import shared_random_crop
+from src.data.augment import shared_random_horizontal_flip
+from src.data.augment import shared_random_reverse_channel
+from src.data.augment import shared_random_rotate
+from src.data.augment import shared_random_vertical_flip
 from src.data.image_ops import load_backward_velocity
 from src.data.image_ops import load_png
 
@@ -242,11 +240,12 @@ class VFITrainDataset(BaseDataset):
         fmv = self._load_game_motion(forward_path)
 
         if self.augment:
-            img0, imgt, img1, bmv, fmv = random_crop(img0, imgt, img1, bmv, fmv, (224, 224))
-            img0, imgt, img1, bmv, fmv = random_reverse_channel(img0, imgt, img1, bmv, fmv, 0.5)
-            img0, imgt, img1, bmv, fmv = random_vertical_flip(img0, imgt, img1, bmv, fmv, 0.3)
-            img0, imgt, img1, bmv, fmv = random_horizontal_flip(img0, imgt, img1, bmv, fmv, 0.5)
-            img0, imgt, img1, bmv, fmv = random_rotate(img0, imgt, img1, bmv, fmv, 0.05)
+            img0, imgt, img1, flow_fields = shared_random_crop(img0, imgt, img1, (bmv, fmv), (224, 224))
+            img0, imgt, img1 = shared_random_reverse_channel(img0, imgt, img1, 0.5)
+            img0, imgt, img1, flow_fields = shared_random_vertical_flip(img0, imgt, img1, flow_fields, 0.3)
+            img0, imgt, img1, flow_fields = shared_random_horizontal_flip(img0, imgt, img1, flow_fields, 0.5)
+            img0, imgt, img1, flow_fields = shared_random_rotate(img0, imgt, img1, flow_fields, 0.05)
+            bmv, fmv = flow_fields
 
         img0_tensor = image_to_tensor(img0)
         imgt_tensor = image_to_tensor(imgt)
@@ -313,6 +312,20 @@ class FlowEstimationTrainDataset(BaseDataset):
         fmv_30 = self._load_game_motion(fmv_30_path)
         # img0_30 = self._load_image(img_30_0_path)
         # img1_30 = self._load_image(img_30_1_path)
+
+        if self.augment:
+            img0, imgt, img1, flow_fields = shared_random_crop(
+                img0,
+                imgt,
+                img1,
+                (bmv_60, fmv_60, bmv_30, fmv_30),
+                (224, 224),
+            )
+            img0, imgt, img1 = shared_random_reverse_channel(img0, imgt, img1, 0.5)
+            img0, imgt, img1, flow_fields = shared_random_vertical_flip(img0, imgt, img1, flow_fields, 0.3)
+            img0, imgt, img1, flow_fields = shared_random_horizontal_flip(img0, imgt, img1, flow_fields, 0.5)
+            img0, imgt, img1, flow_fields = shared_random_rotate(img0, imgt, img1, flow_fields, 0.05)
+            bmv_60, fmv_60, bmv_30, fmv_30 = flow_fields
 
         img0_tensor = image_to_tensor(img0)
         imgt_tensor = image_to_tensor(imgt)
