@@ -184,6 +184,39 @@ def append_batch_psnr_records(
         target_records.append({"psnr": psnr_value})
 
 
+def append_batch_metric_records(
+    target_records: list[dict[str, object]],
+    psnr_meter: AverageMeter,
+    info: dict[str, Any],
+    imgt_pred: Any,
+    imgt: Any,
+    loss_record: dict[str, float],
+) -> None:
+    batch_size = int(imgt_pred.shape[0])
+
+    for batch_index in range(batch_size):
+        psnr_value = float(calculate_psnr(imgt[batch_index], imgt_pred[batch_index]).detach().cpu())
+        psnr_meter.update(psnr_value, 1)
+        target_records.append(
+            {
+                "record_name": info["record_name"][batch_index],
+                "frame_range": info["frame_range"][batch_index],
+                "psnr": psnr_value,
+                **loss_record,
+            }
+        )
+
+
+def build_record_name_summary(dataframe: Any) -> Any:
+    summary_columns = ["psnr", "loss_rec", "loss_geo", "loss_dis", "loss_total"]
+    return (
+        dataframe.groupby(["record_name"], as_index=False)[summary_columns]
+        .mean()
+        .sort_values(["record_name"])
+        .reset_index(drop=True)
+    )
+
+
 def save_checkpoint(
     checkpoint_path: Path,
     model: Any,
@@ -209,22 +242,19 @@ def evaluate(
     model: Any,
     loader: Any,
     device: Any,
-) -> tuple[float, pd.DataFrame]:
+) -> tuple[float, Any, Any]:
     import pandas as pd
     import torch
     from tqdm import tqdm
 
     model.eval()
     psnr_meter = AverageMeter()
-    loss_meter = AverageMeter()
-    record_name: list[dict[str, str]] = []
-    metric_records: list[dict[str, float]] = []
-    loss_records: list[dict[str, float]] = []
+    eval_records: list[dict[str, object]] = []
 
     with torch.no_grad():
         pbar = tqdm(loader, desc="Evaluating")
         for batch in pbar:
-            img0, imgt, img1, bmv, fmv, embt, _info = batch
+            img0, imgt, img1, bmv, fmv, embt, info = batch
             img0 = img0.to(device)
             img1 = img1.to(device)
             imgt = imgt.to(device)
@@ -245,18 +275,12 @@ def evaluate(
 
             total_loss = loss_rec + loss_geo + loss_dis
             loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
-            batch_size = int(imgt_pred.shape[0])
-            loss_meter.update(total_loss.item(), batch_size)
-            record_name.append({"record_name": _info["record_name"][0]})
-            append_batch_psnr_records(metric_records, psnr_meter, imgt_pred, imgt)
-            append_batch_loss_records(loss_records, loss_record, batch_size)
-            pbar.set_postfix({"eval_psnr": f"{psnr_meter.avg:.6f}", "eval_loss": f"{loss_meter.avg:.6f}"})
+            append_batch_metric_records(eval_records, psnr_meter, info, imgt_pred, imgt, loss_record)
+            pbar.set_postfix({"eval_psnr": f"{psnr_meter.avg:.6f}"})
 
-    record_df = pd.DataFrame(record_name)
-    metric_df = pd.DataFrame(metric_records)
-    loss_df = pd.DataFrame(loss_records)
-    eval_df = pd.concat([record_df, metric_df.reset_index(drop=True), loss_df.reset_index(drop=True)], axis=1)
-    return psnr_meter.avg, eval_df
+    eval_df = pd.DataFrame(eval_records)
+    record_name_df = build_record_name_summary(eval_df)
+    return psnr_meter.avg, eval_df, record_name_df
 
 
 def train(
@@ -279,14 +303,12 @@ def train(
     for epoch in range(training_state.start_epoch, args.epochs):
         model.train()
         train_psnr_meter = AverageMeter()
-        train_loss_meter = AverageMeter()
-        train_metric_records: list[dict[str, float]] = []
-        train_loss_records: list[dict[str, float]] = []
+        train_records: list[dict[str, object]] = []
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
 
         for batch in pbar:
-            img0, imgt, img1, bmv, fmv, embt, _info = batch
+            img0, imgt, img1, bmv, fmv, embt, info = batch
             img0 = img0.to(device)
             img1 = img1.to(device)
             imgt = imgt.to(device)
@@ -314,26 +336,24 @@ def train(
             optimizer.step()
 
             global_step += 1
-            batch_size = int(imgt_pred.shape[0])
-            train_loss_meter.update(total_loss.item(), batch_size)
-            pbar.set_postfix({"train_loss": f"{train_loss_meter.avg:.6f}", "lr": f"{lr:.6f}"})
+            pbar.set_postfix({"train_loss": f"{float(total_loss.detach().cpu()):.6f}", "lr": f"{lr:.6f}"})
             if (epoch + 1) % args.eval_interval != 0:
                 continue
             
             # During evaluation epochs, we also record training metrics and losses for analysis.
             loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
-            append_batch_psnr_records(train_metric_records, train_psnr_meter, imgt_pred, imgt)
-            append_batch_loss_records(train_loss_records, loss_record, batch_size)
+            append_batch_metric_records(train_records, train_psnr_meter, info, imgt_pred, imgt, loss_record)
 
         if (epoch + 1) % args.eval_interval == 0:
-            train_metric_df = pd.DataFrame(train_metric_records)
-            train_loss_df = pd.DataFrame(train_loss_records)
-            train_df = pd.concat([train_metric_df.reset_index(drop=True), train_loss_df.reset_index(drop=True)], axis=1)
+            train_df = pd.DataFrame(train_records)
+            train_record_name_df = build_record_name_summary(train_df)
             train_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}.csv", index=False)
+            train_record_name_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}_record_name.csv", index=False)
             logger.info("Epoch %s train_psnr=%.6f", epoch + 1, train_psnr_meter.avg)
 
-            test_psnr, test_df = evaluate(args.model_name, model, test_loader, device)
+            test_psnr, test_df, test_record_name_df = evaluate(args.model_name, model, test_loader, device)
             test_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}.csv", index=False)
+            test_record_name_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}_record_name.csv", index=False)
             logger.info("Epoch %s test_psnr=%.6f", epoch + 1, test_psnr)
 
             if test_psnr > best_psnr:

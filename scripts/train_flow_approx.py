@@ -118,8 +118,6 @@ def append_batch_metric_records(
         psnr_meter.update(psnr_value, 1)
         target_records.append(
             {
-                "record": info["record"][batch_index],
-                "mode": info["mode"][batch_index],
                 "record_name": info["record_name"][batch_index],
                 "frame_range": info["frame_range"][batch_index],
                 "psnr": psnr_value,
@@ -128,12 +126,12 @@ def append_batch_metric_records(
         )
 
 
-def build_mode_summary(dataframe: Any) -> Any:
+def build_record_name_summary(dataframe: Any) -> Any:
     summary_columns = ["psnr", "loss_rec", "loss_geo", "loss_dis", "loss_total"]
     return (
-        dataframe.groupby(["record", "mode"], as_index=False)[summary_columns]
+        dataframe.groupby(["record_name"], as_index=False)[summary_columns]
         .mean()
-        .sort_values(["record", "mode"])
+        .sort_values(["record_name"])
         .reset_index(drop=True)
     )
 
@@ -182,8 +180,8 @@ def evaluate(
             pbar.set_postfix({"eval_psnr": f"{psnr_meter.avg:.6f}"})
 
     eval_df = pd.DataFrame(eval_records)
-    mode_df = build_mode_summary(eval_df)
-    return psnr_meter.avg, eval_df, mode_df
+    record_name_df = build_record_name_summary(eval_df)
+    return psnr_meter.avg, eval_df, record_name_df
 
 
 def train(
@@ -250,14 +248,14 @@ def train(
 
         if (epoch + 1) % args.eval_interval == 0:
             train_df = pd.DataFrame(train_records)
-            train_mode_df = build_mode_summary(train_df)
+            train_record_name_df = build_record_name_summary(train_df)
             train_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}.csv", index=False)
-            train_mode_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}_mode.csv", index=False)
+            train_record_name_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}_record_name.csv", index=False)
             logger.info("Epoch %s train_psnr=%.6f", epoch + 1, train_psnr_meter.avg)
 
-            test_psnr, test_df, test_mode_df = evaluate(args, model, test_loader, device)
+            test_psnr, test_df, test_record_name_df = evaluate(args, model, test_loader, device)
             test_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}.csv", index=False)
-            test_mode_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}_mode.csv", index=False)
+            test_record_name_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}_record_name.csv", index=False)
             logger.info("Epoch %s test_psnr=%.6f", epoch + 1, test_psnr)
 
             if test_psnr > best_psnr:

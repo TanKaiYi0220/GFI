@@ -274,7 +274,7 @@ class FlowEstimationTrainDataset(BaseDataset):
         if self.df_fps == self.input_fps:
             raise NotImplementedError("FlowEstimationTrainDataset currently expects 30fps input against 60fps targets.")
 
-        row = self.dataframe.iloc[index * 2]
+        row = self.dataframe.iloc[index]
         frame_30_0_idx = int(row["img0"]) // 2
         frame_30_1_idx = int(row["img2"]) // 2
         frame_60_0_idx = int(row["img0"])
@@ -285,8 +285,6 @@ class FlowEstimationTrainDataset(BaseDataset):
         mode_30 = mode.replace("fps_60", "fps_30")
 
         info = {
-            "record": record,
-            "mode": mode,
             "record_name": f"{record}_{mode}",
             "frame_range": f"frame_{frame_60_0_idx:04d}_{frame_60_2_idx:04d}",
             "valid": bool(row["valid"]) if "valid" in row.index else True,
