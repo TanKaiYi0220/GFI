@@ -11,5 +11,7 @@
   "only_fps": 60,
   "input_fps": 30,
   "scale_factor": 1.0,
-  "flow_approx_method": "combination"
+  "flow_approx_method": "combination",
+  "flow_diff_threshold": 1.0,
+  "flow_diff_percentile": 99.0
 }
