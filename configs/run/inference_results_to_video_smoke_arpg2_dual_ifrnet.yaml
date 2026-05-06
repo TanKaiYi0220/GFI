@@ -1,0 +1,15 @@
+{
+  "mode": "export",
+  "root": "outputs/train_smoke_dual/video_frames_ifrnet",
+  "record": "ARPG_2",
+  "target_mode": "4_Difficult/4_Difficult_0/fps_60",
+  "out_dir": "outputs/train_smoke_dual/videos_ifrnet",
+  "fps": 60,
+  "export_grid": false,
+  "layout": "basic",
+  "tile_scale": 0.5,
+  "pad": 8,
+  "export_all": false,
+  "export_vfi60": true,
+  "single_files": []
+}

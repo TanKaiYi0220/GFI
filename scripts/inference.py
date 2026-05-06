@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run inference from one config file.")
     parser.add_argument("--config", required=True, type=str, help="Path to one inference config file.")
     return parser.parse_args(argv)
+
+
+def natural_key(text: str) -> list[object]:
+    return [int(token) if token.isdigit() else token.lower() for token in re.split(r"(\d+)", text)]
 
 
 def save_flow_diff_visuals(
@@ -109,6 +114,9 @@ def main(argv: list[str] | None = None) -> None:
     save_topk_worst_psnr = int(config.get("save_topk_worst_psnr", 3))
     save_topk_best_psnr = int(config.get("save_topk_best_psnr", 0))
     save_topk_largest_flow_diff = int(config.get("save_topk_largest_flow_diff", 3))
+    save_video_frames = bool(config.get("save_video_frames", False))
+    video_save_debug_streams = bool(config.get("video_save_debug_streams", False))
+    metrics_use_valid_only = bool(config.get("metrics_use_valid_only", True))
     seed = int(config["seed"])
     batch_size = int(config["batch_size"])
     only_fps = int(config["only_fps"])
@@ -129,6 +137,10 @@ def main(argv: list[str] | None = None) -> None:
     output_dir = Path(str(config["output_dir"]))
     if not output_dir.is_absolute():
         output_dir = PROJECT_ROOT / output_dir
+
+    video_frames_output_dir = Path(str(config.get("video_frames_output_dir", output_dir / "video_frames")))
+    if not video_frames_output_dir.is_absolute():
+        video_frames_output_dir = PROJECT_ROOT / video_frames_output_dir
 
     if model_name == "IFRNet_Residual" and flow_approx_method not in FLOW_APPROX_METHODS:
         raise ValueError(f"Unsupported flow_approx_method: {flow_approx_method}")
@@ -151,12 +163,18 @@ def main(argv: list[str] | None = None) -> None:
         "save_topk_worst_psnr": save_topk_worst_psnr,
         "save_topk_best_psnr": save_topk_best_psnr,
         "save_topk_largest_flow_diff": save_topk_largest_flow_diff,
+        "save_video_frames": save_video_frames,
+        "video_frames_output_dir": str(video_frames_output_dir),
+        "video_save_debug_streams": video_save_debug_streams,
+        "metrics_use_valid_only": metrics_use_valid_only,
     }
     if mode == "dry-run":
         print(json.dumps(summary, indent=2))
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    if save_video_frames:
+        video_frames_output_dir.mkdir(parents=True, exist_ok=True)
     import cv2
     import numpy as np
     import pandas as pd
@@ -179,7 +197,7 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("device=%s model=%s", device, model_name)
 
     dataframe = build_merged_dataframe(root_dir, output_dir, inference_preset, only_fps, logger)
-    if "valid" in dataframe.columns:
+    if not save_video_frames and "valid" in dataframe.columns:
         dataframe = dataframe[dataframe["valid"] == True].reset_index(drop=True)
     model = resolve_model_class(model_name)().to(device)
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
@@ -244,9 +262,12 @@ def main(argv: list[str] | None = None) -> None:
                 for batch_index in range(int(imgt_pred.shape[0])):
                     row = group_dataframe.iloc[sample_offset + batch_index]
                     frame_range = f"frame_{int(row['img0']):04d}_{int(row['img2']):04d}"
+                    is_valid = bool(row["valid"]) if "valid" in row.index else True
+                    eligible_for_metrics = is_valid or not metrics_use_valid_only
                     psnr_value = float(calculate_psnr(imgt[batch_index], imgt_pred[batch_index]).detach().cpu().item())
-                    psnr_meter.update(psnr_value, 1)
-                    record_meter.update(psnr_value, 1)
+                    if eligible_for_metrics:
+                        psnr_meter.update(psnr_value, 1)
+                        record_meter.update(psnr_value, 1)
 
                     diff_1_to_0 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
                     diff_1_to_2 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
@@ -277,7 +298,8 @@ def main(argv: list[str] | None = None) -> None:
                             "mode": str(mode_name),
                             "record_name": f"{record}_{mode_name}",
                             "frame_range": frame_range,
-                            "valid": bool(row["valid"]) if "valid" in row.index else True,
+                            "valid": is_valid,
+                            "eligible_for_metrics": eligible_for_metrics,
                             "distance_index_mean": float(row["D_index Mean"]) if "D_index Mean" in row.index else -1.0,
                             "distance_index_median": float(row["D_index Median"]) if "D_index Median" in row.index else -1.0,
                             "psnr": psnr_value,
@@ -292,6 +314,67 @@ def main(argv: list[str] | None = None) -> None:
                         }
                     )
 
+                    if save_video_frames:
+                        video_save_dir = video_frames_output_dir / str(record) / str(mode_name) / frame_range
+                        img0_np = np.round(img0[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                        img1_np = np.round(img1[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                        imgt_np = np.round(imgt[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                        img_pred_np = np.round(imgt_pred[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                        save_image(video_save_dir / "image_0.png", img0_np)
+                        save_image(video_save_dir / "image_1.png", img1_np)
+                        save_image(video_save_dir / "image_gt.png", imgt_np)
+                        save_image(video_save_dir / "image_pred.png", img_pred_np)
+
+                        if video_save_debug_streams:
+                            imgt_merge_np = None if imgt_merge is None else np.round(imgt_merge[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                            bmv_np = flow_to_image(bmv[batch_index].detach().cpu().permute(1, 2, 0).numpy())
+                            fmv_np = flow_to_image(fmv[batch_index].detach().cpu().permute(1, 2, 0).numpy())
+                            flow_1_to_0_np = flow_to_image(up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
+                            flow_1_to_2_np = flow_to_image(up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
+                            flow_mask_np = np.round(up_mask_1[batch_index, 0].detach().cpu().numpy() * 255.0).astype(np.uint8)
+                            img0_warped_np = np.round(img0_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                            img1_warped_np = np.round(img1_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                            img0_bmv_warped_np = np.round(warp(img0[batch_index : batch_index + 1], bmv[batch_index : batch_index + 1])[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                            img1_fmv_warped_np = np.round(warp(img1[batch_index : batch_index + 1], fmv[batch_index : batch_index + 1])[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                            if imgt_merge_np is not None:
+                                save_image(video_save_dir / "image_merge.png", imgt_merge_np)
+                            save_image(video_save_dir / "bmv.png", bmv_np)
+                            save_image(video_save_dir / "fmv.png", fmv_np)
+                            save_image(video_save_dir / "flow_1_to_0.png", flow_1_to_0_np)
+                            save_image(video_save_dir / "flow_1_to_2.png", flow_1_to_2_np)
+                            save_image(video_save_dir / "flow_mask.png", flow_mask_np)
+                            save_image(video_save_dir / "image_0_warped.png", img0_warped_np)
+                            save_image(video_save_dir / "image_1_warped.png", img1_warped_np)
+                            save_image(video_save_dir / "image_0_bmv_warped.png", img0_bmv_warped_np)
+                            save_image(video_save_dir / "image_1_fmv_warped.png", img1_fmv_warped_np)
+                            if approx_bmv is not None and approx_fmv is not None:
+                                save_flow_diff_visuals(
+                                    video_save_dir,
+                                    "1_to_0",
+                                    img0_np,
+                                    approx_bmv[batch_index].detach().cpu().permute(1, 2, 0).numpy(),
+                                    up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy(),
+                                    flow_to_image,
+                                    save_image,
+                                    cv2,
+                                    np,
+                                    flow_diff_threshold,
+                                    flow_diff_percentile,
+                                )
+                                save_flow_diff_visuals(
+                                    video_save_dir,
+                                    "1_to_2",
+                                    img1_np,
+                                    approx_fmv[batch_index].detach().cpu().permute(1, 2, 0).numpy(),
+                                    up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy(),
+                                    flow_to_image,
+                                    save_image,
+                                    cv2,
+                                    np,
+                                    flow_diff_threshold,
+                                    flow_diff_percentile,
+                                )
+
                 sample_offset += int(imgt_pred.shape[0])
                 progress.set_postfix({"mean_psnr": f"{record_meter.avg:.6f}"})
 
@@ -305,18 +388,19 @@ def main(argv: list[str] | None = None) -> None:
                 }
             )
             group_metrics_df = pd.DataFrame(group_rows)
+            selectable_metrics_df = group_metrics_df[group_metrics_df["eligible_for_metrics"]].reset_index(drop=True)
             selected_sample_reasons: dict[int, list[str]] = {}
 
-            if save_topk_worst_psnr > 0:
-                for sample_index in group_metrics_df.nsmallest(save_topk_worst_psnr, "psnr")["sample_index"].tolist():
+            if save_topk_worst_psnr > 0 and len(selectable_metrics_df) > 0:
+                for sample_index in selectable_metrics_df.nsmallest(save_topk_worst_psnr, "psnr")["sample_index"].tolist():
                     selected_sample_reasons.setdefault(int(sample_index), []).append("worst_psnr")
-            if save_topk_best_psnr > 0:
-                for sample_index in group_metrics_df.nlargest(save_topk_best_psnr, "psnr")["sample_index"].tolist():
+            if save_topk_best_psnr > 0 and len(selectable_metrics_df) > 0:
+                for sample_index in selectable_metrics_df.nlargest(save_topk_best_psnr, "psnr")["sample_index"].tolist():
                     selected_sample_reasons.setdefault(int(sample_index), []).append("best_psnr")
-            if model_name == "IFRNet_Residual" and save_topk_largest_flow_diff > 0:
-                for sample_index in group_metrics_df.nlargest(save_topk_largest_flow_diff, "flow_diff_1_to_0_changed_ratio")["sample_index"].tolist():
+            if model_name == "IFRNet_Residual" and save_topk_largest_flow_diff > 0 and len(selectable_metrics_df) > 0:
+                for sample_index in selectable_metrics_df.nlargest(save_topk_largest_flow_diff, "flow_diff_1_to_0_changed_ratio")["sample_index"].tolist():
                     selected_sample_reasons.setdefault(int(sample_index), []).append("largest_flow_diff_1_to_0")
-                for sample_index in group_metrics_df.nlargest(save_topk_largest_flow_diff, "flow_diff_1_to_2_changed_ratio")["sample_index"].tolist():
+                for sample_index in selectable_metrics_df.nlargest(save_topk_largest_flow_diff, "flow_diff_1_to_2_changed_ratio")["sample_index"].tolist():
                     selected_sample_reasons.setdefault(int(sample_index), []).append("largest_flow_diff_1_to_2")
 
             group_metrics_df["selected_for_save"] = group_metrics_df["sample_index"].map(lambda sample_index: int(sample_index) in selected_sample_reasons)

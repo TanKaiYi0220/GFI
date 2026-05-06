@@ -14,6 +14,10 @@
   "flow_approx_method": "combination",
   "flow_diff_threshold": 1.0,
   "flow_diff_percentile": 99.0,
+  "save_video_frames": false,
+  "video_frames_output_dir": "outputs/train_smoke_dual/video_frames_ifrnet",
+  "video_save_debug_streams": false,
+  "metrics_use_valid_only": true,
   "save_topk_worst_psnr": 3,
   "save_topk_best_psnr": 0,
   "save_topk_largest_flow_diff": 3
