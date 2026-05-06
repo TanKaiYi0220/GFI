@@ -7,6 +7,8 @@ __pycache__/
 
 # Generated artifacts
 outputs/
+analysis_outputs/
+inference_outputs/
 data/
 dataset/
 datasets/
