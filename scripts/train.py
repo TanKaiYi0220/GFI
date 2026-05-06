@@ -193,16 +193,17 @@ def append_batch_metric_records(
     loss_record: dict[str, float],
 ) -> None:
     batch_size = int(imgt_pred.shape[0])
+    normalized_loss_record = {metric_name: float(metric_value) for metric_name, metric_value in loss_record.items()}
 
     for batch_index in range(batch_size):
-        psnr_value = float(calculate_psnr(imgt[batch_index], imgt_pred[batch_index]).detach().cpu())
+        psnr_value = float(calculate_psnr(imgt[batch_index], imgt_pred[batch_index]).detach().cpu().item())
         psnr_meter.update(psnr_value, 1)
         target_records.append(
             {
                 "record_name": info["record_name"][batch_index],
                 "frame_range": info["frame_range"][batch_index],
                 "psnr": psnr_value,
-                **loss_record,
+                **normalized_loss_record,
             }
         )
 

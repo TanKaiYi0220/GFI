@@ -12,6 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 METRIC_NAMES: tuple[str, ...] = ("psnr", "loss_rec", "loss_geo", "loss_dis", "loss_total")
+NUMERIC_PATTERN: re.Pattern[str] = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 TRAIN_EPOCH_PATTERN: re.Pattern[str] = re.compile(r"train_epoch_(\d+)\.csv$")
 TEST_EPOCH_PATTERN: re.Pattern[str] = re.compile(r"test_epoch_(\d+)\.csv$")
 
@@ -19,9 +20,23 @@ TEST_EPOCH_PATTERN: re.Pattern[str] = re.compile(r"test_epoch_(\d+)\.csv$")
 def extract_epoch(csv_path: Path, pattern: re.Pattern[str]) -> int:
     match = pattern.match(csv_path.name)
     if match is None:
-        raise ValueError(f"Invalid test epoch filename: {csv_path}")
+        raise ValueError(f"Invalid epoch filename: {csv_path}")
 
     return int(match.group(1))
+
+
+def normalize_metric_series(series: pd.Series, csv_path: Path, metric_name: str) -> pd.Series:
+    numeric_series = pd.to_numeric(series, errors="coerce")
+    if not numeric_series.isna().any():
+        return numeric_series
+
+    extracted_series = series.astype(str).str.extract(f"({NUMERIC_PATTERN.pattern})", expand=False)
+    normalized_series = pd.to_numeric(extracted_series, errors="coerce")
+    if not normalized_series.isna().any():
+        return normalized_series
+
+    invalid_values = series[normalized_series.isna()].astype(str).head(3).tolist()
+    raise ValueError(f"Failed to parse {metric_name} in {csv_path}: {invalid_values}")
 
 
 def collect_metric_rows(checkpoints_dir: Path, glob_pattern: str, epoch_pattern: re.Pattern[str]) -> list[dict[str, float]]:
@@ -36,14 +51,19 @@ def collect_metric_rows(checkpoints_dir: Path, glob_pattern: str, epoch_pattern:
         if len(missing_columns) > 0:
             raise KeyError(f"Missing columns in {csv_path}: {missing_columns}")
 
+        metric_series_map = {
+            metric_name: normalize_metric_series(dataframe[metric_name], csv_path, metric_name)
+            for metric_name in METRIC_NAMES
+        }
+
         metric_rows.append(
             {
                 "epoch": float(extract_epoch(csv_path, epoch_pattern)),
-                "psnr": float(dataframe["psnr"].mean()),
-                "loss_rec": float(dataframe["loss_rec"].mean()),
-                "loss_geo": float(dataframe["loss_geo"].mean()),
-                "loss_dis": float(dataframe["loss_dis"].mean()),
-                "loss_total": float(dataframe["loss_total"].mean()),
+                "psnr": float(metric_series_map["psnr"].mean()),
+                "loss_rec": float(metric_series_map["loss_rec"].mean()),
+                "loss_geo": float(metric_series_map["loss_geo"].mean()),
+                "loss_dis": float(metric_series_map["loss_dis"].mean()),
+                "loss_total": float(metric_series_map["loss_total"].mean()),
             }
         )
 
