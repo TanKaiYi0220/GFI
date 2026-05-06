@@ -1,0 +1,15 @@
+{
+  "mode": "infer",
+  "model_name": "IFRNet",
+  "root_dir": "outputs/train_smoke_dual/preprocess_data",
+  "dataset_root_dir": "outputs/functional_validation_20260502_212347/dataset_subset",
+  "inference_preset": "smoke_arpg2_dual",
+  "checkpoint_path": "outputs/train_smoke_dual/run_ifrnet_config/checkpoints/latest.pth",
+  "output_dir": "outputs/train_smoke_dual/inference_ifrnet",
+  "seed": 1234,
+  "batch_size": 1,
+  "only_fps": 60,
+  "input_fps": 30,
+  "scale_factor": 1.0,
+  "flow_approx_method": "combination"
+}
