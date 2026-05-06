@@ -106,6 +106,9 @@ def main(argv: list[str] | None = None) -> None:
     scale_factor = float(config["scale_factor"])
     flow_diff_threshold = float(config.get("flow_diff_threshold", 1.0))
     flow_diff_percentile = float(config.get("flow_diff_percentile", 99.0))
+    save_topk_worst_psnr = int(config.get("save_topk_worst_psnr", 3))
+    save_topk_best_psnr = int(config.get("save_topk_best_psnr", 0))
+    save_topk_largest_flow_diff = int(config.get("save_topk_largest_flow_diff", 3))
     seed = int(config["seed"])
     batch_size = int(config["batch_size"])
     only_fps = int(config["only_fps"])
@@ -145,6 +148,9 @@ def main(argv: list[str] | None = None) -> None:
         "flow_approx_method": flow_approx_method,
         "flow_diff_threshold": flow_diff_threshold,
         "flow_diff_percentile": flow_diff_percentile,
+        "save_topk_worst_psnr": save_topk_worst_psnr,
+        "save_topk_best_psnr": save_topk_best_psnr,
+        "save_topk_largest_flow_diff": save_topk_largest_flow_diff,
     }
     if mode == "dry-run":
         print(json.dumps(summary, indent=2))
@@ -156,6 +162,7 @@ def main(argv: list[str] | None = None) -> None:
     import pandas as pd
     import torch
     from torch.utils.data import DataLoader
+    from torch.utils.data import Subset
     from tqdm import tqdm
 
     from src.data.dataset_loader import FlowEstimationTrainDataset
@@ -196,6 +203,7 @@ def main(argv: list[str] | None = None) -> None:
             record_meter = AverageMeter()
             progress = tqdm(loader, desc=f"{record}_{mode_name}", leave=True)
             sample_offset = 0
+            group_rows: list[dict[str, object]] = []
 
             for batch in progress:
                 if model_name == "IFRNet":
@@ -232,28 +240,169 @@ def main(argv: list[str] | None = None) -> None:
 
                 img0_warped = warp(img0, up_flow0_1)
                 img1_warped = warp(img1, up_flow1_1)
-                img0_bmv_warped = warp(img0, bmv)
-                img1_fmv_warped = warp(img1, fmv)
 
                 for batch_index in range(int(imgt_pred.shape[0])):
                     row = group_dataframe.iloc[sample_offset + batch_index]
                     frame_range = f"frame_{int(row['img0']):04d}_{int(row['img2']):04d}"
+                    psnr_value = float(calculate_psnr(imgt[batch_index], imgt_pred[batch_index]).detach().cpu().item())
+                    psnr_meter.update(psnr_value, 1)
+                    record_meter.update(psnr_value, 1)
+
+                    diff_1_to_0 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
+                    diff_1_to_2 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
+                    if approx_bmv is not None and approx_fmv is not None:
+                        init_flow_1_to_0_np = approx_bmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                        init_flow_1_to_2_np = approx_fmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                        final_flow_1_to_0_np = up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                        final_flow_1_to_2_np = up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                        diff_mag_1_to_0_np = np.linalg.norm(final_flow_1_to_0_np - init_flow_1_to_0_np, axis=2)
+                        diff_mag_1_to_2_np = np.linalg.norm(final_flow_1_to_2_np - init_flow_1_to_2_np, axis=2)
+                        diff_1_to_0 = {
+                            "diff_mag_mean": float(diff_mag_1_to_0_np.mean()),
+                            "diff_mag_max": float(diff_mag_1_to_0_np.max()),
+                            "diff_changed_ratio": float((diff_mag_1_to_0_np > flow_diff_threshold).mean()),
+                            "diff_percentile_value": float(max(np.percentile(diff_mag_1_to_0_np, flow_diff_percentile), 1e-6)),
+                        }
+                        diff_1_to_2 = {
+                            "diff_mag_mean": float(diff_mag_1_to_2_np.mean()),
+                            "diff_mag_max": float(diff_mag_1_to_2_np.max()),
+                            "diff_changed_ratio": float((diff_mag_1_to_2_np > flow_diff_threshold).mean()),
+                            "diff_percentile_value": float(max(np.percentile(diff_mag_1_to_2_np, flow_diff_percentile), 1e-6)),
+                        }
+
+                    group_rows.append(
+                        {
+                            "sample_index": int(sample_offset + batch_index),
+                            "record": str(record),
+                            "mode": str(mode_name),
+                            "record_name": f"{record}_{mode_name}",
+                            "frame_range": frame_range,
+                            "valid": bool(row["valid"]) if "valid" in row.index else True,
+                            "distance_index_mean": float(row["D_index Mean"]) if "D_index Mean" in row.index else -1.0,
+                            "distance_index_median": float(row["D_index Median"]) if "D_index Median" in row.index else -1.0,
+                            "psnr": psnr_value,
+                            "flow_diff_1_to_0_mean": diff_1_to_0["diff_mag_mean"],
+                            "flow_diff_1_to_0_max": diff_1_to_0["diff_mag_max"],
+                            "flow_diff_1_to_0_changed_ratio": diff_1_to_0["diff_changed_ratio"],
+                            "flow_diff_1_to_0_percentile_value": diff_1_to_0["diff_percentile_value"],
+                            "flow_diff_1_to_2_mean": diff_1_to_2["diff_mag_mean"],
+                            "flow_diff_1_to_2_max": diff_1_to_2["diff_mag_max"],
+                            "flow_diff_1_to_2_changed_ratio": diff_1_to_2["diff_changed_ratio"],
+                            "flow_diff_1_to_2_percentile_value": diff_1_to_2["diff_percentile_value"],
+                        }
+                    )
+
+                sample_offset += int(imgt_pred.shape[0])
+                progress.set_postfix({"mean_psnr": f"{record_meter.avg:.6f}"})
+
+            record_rows.append(
+                {
+                    "record": str(record),
+                    "mode": str(mode_name),
+                    "record_name": f"{record}_{mode_name}",
+                    "samples": int(len(group_dataframe)),
+                    "mean_psnr": float(record_meter.avg),
+                }
+            )
+            group_metrics_df = pd.DataFrame(group_rows)
+            selected_sample_reasons: dict[int, list[str]] = {}
+
+            if save_topk_worst_psnr > 0:
+                for sample_index in group_metrics_df.nsmallest(save_topk_worst_psnr, "psnr")["sample_index"].tolist():
+                    selected_sample_reasons.setdefault(int(sample_index), []).append("worst_psnr")
+            if save_topk_best_psnr > 0:
+                for sample_index in group_metrics_df.nlargest(save_topk_best_psnr, "psnr")["sample_index"].tolist():
+                    selected_sample_reasons.setdefault(int(sample_index), []).append("best_psnr")
+            if model_name == "IFRNet_Residual" and save_topk_largest_flow_diff > 0:
+                for sample_index in group_metrics_df.nlargest(save_topk_largest_flow_diff, "flow_diff_1_to_0_changed_ratio")["sample_index"].tolist():
+                    selected_sample_reasons.setdefault(int(sample_index), []).append("largest_flow_diff_1_to_0")
+                for sample_index in group_metrics_df.nlargest(save_topk_largest_flow_diff, "flow_diff_1_to_2_changed_ratio")["sample_index"].tolist():
+                    selected_sample_reasons.setdefault(int(sample_index), []).append("largest_flow_diff_1_to_2")
+
+            group_metrics_df["selected_for_save"] = group_metrics_df["sample_index"].map(lambda sample_index: int(sample_index) in selected_sample_reasons)
+            group_metrics_df["save_reason"] = group_metrics_df["sample_index"].map(
+                lambda sample_index: ";".join(selected_sample_reasons.get(int(sample_index), [])),
+            )
+            for column_name in (
+                "image_0_path",
+                "image_1_path",
+                "image_gt_path",
+                "image_pred_path",
+                "image_merge_path",
+                "bmv_path",
+                "fmv_path",
+                "flow_1_to_0_path",
+                "flow_1_to_2_path",
+                "flow_mask_path",
+                "image_0_warped_path",
+                "image_1_warped_path",
+                "image_0_bmv_warped_path",
+                "image_1_fmv_warped_path",
+            ):
+                group_metrics_df[column_name] = ""
+
+            selected_indices = sorted(selected_sample_reasons.keys())
+            if len(selected_indices) > 0:
+                selected_dataset = Subset(dataset, selected_indices)
+                selected_loader = DataLoader(selected_dataset, batch_size=1, shuffle=False)
+                selected_progress = tqdm(selected_loader, desc=f"save_{record}_{mode_name}", leave=True)
+
+                for selected_batch_index, batch in enumerate(selected_progress):
+                    selected_row = group_metrics_df[group_metrics_df["sample_index"] == selected_indices[selected_batch_index]].iloc[0]
+                    frame_range = str(selected_row["frame_range"])
                     save_dir = output_dir / str(record) / str(mode_name) / frame_range
 
-                    img0_np = np.round(img0[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                    img1_np = np.round(img1[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                    imgt_np = np.round(imgt[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                    img_pred_np = np.round(imgt_pred[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                    imgt_merge_np = None if imgt_merge is None else np.round(imgt_merge[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                    bmv_np = flow_to_image(bmv[batch_index].detach().cpu().permute(1, 2, 0).numpy())
-                    fmv_np = flow_to_image(fmv[batch_index].detach().cpu().permute(1, 2, 0).numpy())
-                    flow_1_to_0_np = flow_to_image(up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
-                    flow_1_to_2_np = flow_to_image(up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
-                    flow_mask_np = np.round(up_mask_1[batch_index, 0].detach().cpu().numpy() * 255.0).astype(np.uint8)
-                    img0_warped_np = np.round(img0_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                    img1_warped_np = np.round(img1_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                    img0_bmv_warped_np = np.round(img0_bmv_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                    img1_fmv_warped_np = np.round(img1_fmv_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                    if model_name == "IFRNet":
+                        img0, imgt, img1, bmv, fmv, embt, _info = batch
+                        img0 = img0.to(device)
+                        imgt = imgt.to(device)
+                        img1 = img1.to(device)
+                        bmv = bmv.to(device)
+                        fmv = fmv.to(device)
+                        embt = embt.to(device)
+                        imgt_pred, up_flow0_1, up_flow1_1, up_mask_1 = model.inference(img0, img1, embt, scale_factor)
+                        approx_bmv = None
+                        approx_fmv = None
+                        imgt_merge = None
+                    else:
+                        img0, imgt, img1, bmv, fmv, bmv_30, fmv_30, embt, _info = batch
+                        img0 = img0.to(device)
+                        imgt = imgt.to(device)
+                        img1 = img1.to(device)
+                        bmv = bmv.to(device)
+                        fmv = fmv.to(device)
+                        bmv_30 = bmv_30.to(device)
+                        fmv_30 = fmv_30.to(device)
+                        embt = embt.to(device)
+                        approx_bmv, approx_fmv = build_flow_init(fmv_30, bmv_30, embt, flow_approx_method)
+                        imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
+                            img0,
+                            img1,
+                            embt,
+                            scale_factor,
+                            init_flow0=approx_bmv,
+                            init_flow1=approx_fmv,
+                        )
+
+                    img0_warped = warp(img0, up_flow0_1)
+                    img1_warped = warp(img1, up_flow1_1)
+                    img0_bmv_warped = warp(img0, bmv)
+                    img1_fmv_warped = warp(img1, fmv)
+
+                    img0_np = np.round(img0[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                    img1_np = np.round(img1[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                    imgt_np = np.round(imgt[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                    img_pred_np = np.round(imgt_pred[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                    imgt_merge_np = None if imgt_merge is None else np.round(imgt_merge[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                    bmv_np = flow_to_image(bmv[0].detach().cpu().permute(1, 2, 0).numpy())
+                    fmv_np = flow_to_image(fmv[0].detach().cpu().permute(1, 2, 0).numpy())
+                    flow_1_to_0_np = flow_to_image(up_flow0_1[0].detach().cpu().permute(1, 2, 0).numpy())
+                    flow_1_to_2_np = flow_to_image(up_flow1_1[0].detach().cpu().permute(1, 2, 0).numpy())
+                    flow_mask_np = np.round(up_mask_1[0, 0].detach().cpu().numpy() * 255.0).astype(np.uint8)
+                    img0_warped_np = np.round(img0_warped[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                    img1_warped_np = np.round(img1_warped[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                    img0_bmv_warped_np = np.round(img0_bmv_warped[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                    img1_fmv_warped_np = np.round(img1_fmv_warped[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
 
                     image_0_path = save_dir / "image_0.png"
                     image_1_path = save_dir / "image_1.png"
@@ -286,18 +435,12 @@ def main(argv: list[str] | None = None) -> None:
                     save_image(image_0_bmv_warped_path, img0_bmv_warped_np)
                     save_image(image_1_fmv_warped_path, img1_fmv_warped_np)
 
-                    psnr_value = float(calculate_psnr(imgt[batch_index], imgt_pred[batch_index]).detach().cpu().item())
-                    psnr_meter.update(psnr_value, 1)
-                    record_meter.update(psnr_value, 1)
-
-                    diff_1_to_0 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
-                    diff_1_to_2 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
                     if approx_bmv is not None and approx_fmv is not None:
-                        init_flow_1_to_0_np = approx_bmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
-                        init_flow_1_to_2_np = approx_fmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
-                        final_flow_1_to_0_np = up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
-                        final_flow_1_to_2_np = up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
-                        diff_1_to_0 = save_flow_diff_visuals(
+                        init_flow_1_to_0_np = approx_bmv[0].detach().cpu().permute(1, 2, 0).numpy()
+                        init_flow_1_to_2_np = approx_fmv[0].detach().cpu().permute(1, 2, 0).numpy()
+                        final_flow_1_to_0_np = up_flow0_1[0].detach().cpu().permute(1, 2, 0).numpy()
+                        final_flow_1_to_2_np = up_flow1_1[0].detach().cpu().permute(1, 2, 0).numpy()
+                        save_flow_diff_visuals(
                             save_dir,
                             "1_to_0",
                             img0_np,
@@ -310,7 +453,7 @@ def main(argv: list[str] | None = None) -> None:
                             flow_diff_threshold,
                             flow_diff_percentile,
                         )
-                        diff_1_to_2 = save_flow_diff_visuals(
+                        save_flow_diff_visuals(
                             save_dir,
                             "1_to_2",
                             img1_np,
@@ -324,53 +467,23 @@ def main(argv: list[str] | None = None) -> None:
                             flow_diff_percentile,
                         )
 
-                    rows.append(
-                        {
-                            "record": str(record),
-                            "mode": str(mode_name),
-                            "record_name": f"{record}_{mode_name}",
-                            "frame_range": frame_range,
-                            "valid": bool(row["valid"]) if "valid" in row.index else True,
-                            "distance_index_mean": float(row["D_index Mean"]) if "D_index Mean" in row.index else -1.0,
-                            "distance_index_median": float(row["D_index Median"]) if "D_index Median" in row.index else -1.0,
-                            "psnr": psnr_value,
-                            "image_0_path": str(image_0_path),
-                            "image_1_path": str(image_1_path),
-                            "image_gt_path": str(image_gt_path),
-                            "image_pred_path": str(image_pred_path),
-                            "image_merge_path": "" if imgt_merge_np is None else str(image_merge_path),
-                            "bmv_path": str(bmv_path),
-                            "fmv_path": str(fmv_path),
-                            "flow_1_to_0_path": str(flow_1_to_0_path),
-                            "flow_1_to_2_path": str(flow_1_to_2_path),
-                            "flow_mask_path": str(flow_mask_path),
-                            "image_0_warped_path": str(image_0_warped_path),
-                            "image_1_warped_path": str(image_1_warped_path),
-                            "image_0_bmv_warped_path": str(image_0_bmv_warped_path),
-                            "image_1_fmv_warped_path": str(image_1_fmv_warped_path),
-                            "flow_diff_1_to_0_mean": diff_1_to_0["diff_mag_mean"],
-                            "flow_diff_1_to_0_max": diff_1_to_0["diff_mag_max"],
-                            "flow_diff_1_to_0_changed_ratio": diff_1_to_0["diff_changed_ratio"],
-                            "flow_diff_1_to_0_percentile_value": diff_1_to_0["diff_percentile_value"],
-                            "flow_diff_1_to_2_mean": diff_1_to_2["diff_mag_mean"],
-                            "flow_diff_1_to_2_max": diff_1_to_2["diff_mag_max"],
-                            "flow_diff_1_to_2_changed_ratio": diff_1_to_2["diff_changed_ratio"],
-                            "flow_diff_1_to_2_percentile_value": diff_1_to_2["diff_percentile_value"],
-                        }
-                    )
+                for row_index in group_metrics_df[group_metrics_df["selected_for_save"]].index:
+                    group_metrics_df.at[row_index, "image_0_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "image_0.png")
+                    group_metrics_df.at[row_index, "image_1_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "image_1.png")
+                    group_metrics_df.at[row_index, "image_gt_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "image_gt.png")
+                    group_metrics_df.at[row_index, "image_pred_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "image_pred.png")
+                    group_metrics_df.at[row_index, "image_merge_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "image_merge.png") if model_name == "IFRNet_Residual" else ""
+                    group_metrics_df.at[row_index, "bmv_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "bmv.png")
+                    group_metrics_df.at[row_index, "fmv_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "fmv.png")
+                    group_metrics_df.at[row_index, "flow_1_to_0_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "flow_1_to_0.png")
+                    group_metrics_df.at[row_index, "flow_1_to_2_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "flow_1_to_2.png")
+                    group_metrics_df.at[row_index, "flow_mask_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "flow_mask.png")
+                    group_metrics_df.at[row_index, "image_0_warped_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "image_0_warped.png")
+                    group_metrics_df.at[row_index, "image_1_warped_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "image_1_warped.png")
+                    group_metrics_df.at[row_index, "image_0_bmv_warped_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "image_0_bmv_warped.png")
+                    group_metrics_df.at[row_index, "image_1_fmv_warped_path"] = str(output_dir / str(record) / str(mode_name) / group_metrics_df.at[row_index, "frame_range"] / "image_1_fmv_warped.png")
 
-                sample_offset += int(imgt_pred.shape[0])
-                progress.set_postfix({"mean_psnr": f"{record_meter.avg:.6f}"})
-
-            record_rows.append(
-                {
-                    "record": str(record),
-                    "mode": str(mode_name),
-                    "record_name": f"{record}_{mode_name}",
-                    "samples": int(len(group_dataframe)),
-                    "mean_psnr": float(record_meter.avg),
-                }
-            )
+            rows.extend(group_metrics_df.to_dict("records"))
             logger.info("record=%s mode=%s samples=%s mean_psnr=%.6f", record, mode_name, len(group_dataframe), record_meter.avg)
 
     pd.DataFrame(rows).to_csv(output_dir / "metrics.csv", index=False)
