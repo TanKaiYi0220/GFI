@@ -5,7 +5,7 @@
   "dataset_root_dir": "/workspace/datasets/",
   "inference_preset": "test_vfx_0416",
   "checkpoint_path": "outputs/IFRNet_FineTuning_0423/checkpoints/best.pth",
-  "output_dir": "outputs/train_smoke_dual/inference_ifrnet",
+  "output_dir": "inference_outputs/train_smoke_dual/inference_ifrnet",
   "seed": 1234,
   "batch_size": 1,
   "only_fps": 60,

@@ -184,6 +184,8 @@ def main(argv: list[str] | None = None) -> None:
     model = resolve_model_class(model_name)().to(device)
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    # print("Load Pretrained Weights from IFRNet_Vimeo90K.pth as Baseline")
+    # state_dict = torch.load("src/models/external/IFRNet/checkpoints/IFRNet/IFRNet_Vimeo90K.pth", map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
 
@@ -215,10 +217,10 @@ def main(argv: list[str] | None = None) -> None:
                     fmv = fmv.to(device)
                     embt = embt.to(device)
                     imgt_pred, up_flow0_1, up_flow1_1, up_mask_1 = model.inference(img0, img1, embt, scale_factor)
-                    approx_bmv = None
-                    approx_fmv = None
+                    init_bmv = None
+                    init_fmv = None
                     imgt_merge = None
-                else:
+                elif model_name == "IFRNet_Residual_FlowApprox":
                     img0, imgt, img1, bmv, fmv, bmv_30, fmv_30, embt, _info = batch
                     img0 = img0.to(device)
                     imgt = imgt.to(device)
@@ -228,14 +230,31 @@ def main(argv: list[str] | None = None) -> None:
                     bmv_30 = bmv_30.to(device)
                     fmv_30 = fmv_30.to(device)
                     embt = embt.to(device)
-                    approx_bmv, approx_fmv = build_flow_init(fmv_30, bmv_30, embt, flow_approx_method)
+                    # calculate flow approximation
+                    init_bmv, init_fmv = build_flow_init(fmv_30, bmv_30, embt, flow_approx_method) 
                     imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
                         img0,
                         img1,
                         embt,
                         scale_factor,
-                        init_flow0=approx_bmv,
-                        init_flow1=approx_fmv,
+                        init_flow0=init_bmv,
+                        init_flow1=init_fmv,
+                    )
+                else: # expect is IFRNet Residual w/o Flow Approx
+                    img0, imgt, img1, bmv, fmv, _, _, embt, _info = batch
+                    img0 = img0.to(device)
+                    imgt = imgt.to(device)
+                    img1 = img1.to(device)
+                    init_bmv = bmv = bmv.to(device)
+                    init_fmv = fmv = fmv.to(device)
+                    embt = embt.to(device)
+                    imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
+                        img0,
+                        img1,
+                        embt,
+                        scale_factor,
+                        init_flow0=init_bmv,
+                        init_flow1=init_fmv,
                     )
 
                 img0_warped = warp(img0, up_flow0_1)
@@ -250,9 +269,9 @@ def main(argv: list[str] | None = None) -> None:
 
                     diff_1_to_0 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
                     diff_1_to_2 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
-                    if approx_bmv is not None and approx_fmv is not None:
-                        init_flow_1_to_0_np = approx_bmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
-                        init_flow_1_to_2_np = approx_fmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                    if init_bmv is not None and init_fmv is not None:
+                        init_flow_1_to_0_np = init_bmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                        init_flow_1_to_2_np = init_fmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
                         final_flow_1_to_0_np = up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
                         final_flow_1_to_2_np = up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
                         diff_mag_1_to_0_np = np.linalg.norm(final_flow_1_to_0_np - init_flow_1_to_0_np, axis=2)
@@ -361,10 +380,10 @@ def main(argv: list[str] | None = None) -> None:
                         fmv = fmv.to(device)
                         embt = embt.to(device)
                         imgt_pred, up_flow0_1, up_flow1_1, up_mask_1 = model.inference(img0, img1, embt, scale_factor)
-                        approx_bmv = None
-                        approx_fmv = None
+                        init_bmv = None
+                        init_fmv = None
                         imgt_merge = None
-                    else:
+                    elif model_name == "IFRNet_Residual_FlowApprox":
                         img0, imgt, img1, bmv, fmv, bmv_30, fmv_30, embt, _info = batch
                         img0 = img0.to(device)
                         imgt = imgt.to(device)
@@ -374,14 +393,31 @@ def main(argv: list[str] | None = None) -> None:
                         bmv_30 = bmv_30.to(device)
                         fmv_30 = fmv_30.to(device)
                         embt = embt.to(device)
-                        approx_bmv, approx_fmv = build_flow_init(fmv_30, bmv_30, embt, flow_approx_method)
+                        # calculate flow approximation
+                        init_bmv, init_fmv = build_flow_init(fmv_30, bmv_30, embt, flow_approx_method) 
                         imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
                             img0,
                             img1,
                             embt,
                             scale_factor,
-                            init_flow0=approx_bmv,
-                            init_flow1=approx_fmv,
+                            init_flow0=init_bmv,
+                            init_flow1=init_fmv,
+                        )
+                    else: # expect is IFRNet Residual w/o Flow Approx
+                        img0, imgt, img1, bmv, fmv, _, _, embt, _info = batch
+                        img0 = img0.to(device)
+                        imgt = imgt.to(device)
+                        img1 = img1.to(device)
+                        init_bmv = bmv = bmv.to(device)
+                        init_fmv = fmv = fmv.to(device)
+                        embt = embt.to(device)
+                        imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
+                            img0,
+                            img1,
+                            embt,
+                            scale_factor,
+                            init_flow0=init_bmv,
+                            init_flow1=init_fmv,
                         )
 
                     img0_warped = warp(img0, up_flow0_1)
@@ -435,9 +471,9 @@ def main(argv: list[str] | None = None) -> None:
                     save_image(image_0_bmv_warped_path, img0_bmv_warped_np)
                     save_image(image_1_fmv_warped_path, img1_fmv_warped_np)
 
-                    if approx_bmv is not None and approx_fmv is not None:
-                        init_flow_1_to_0_np = approx_bmv[0].detach().cpu().permute(1, 2, 0).numpy()
-                        init_flow_1_to_2_np = approx_fmv[0].detach().cpu().permute(1, 2, 0).numpy()
+                    if init_bmv is not None and init_fmv is not None:
+                        init_flow_1_to_0_np = init_bmv[0].detach().cpu().permute(1, 2, 0).numpy()
+                        init_flow_1_to_2_np = init_fmv[0].detach().cpu().permute(1, 2, 0).numpy()
                         final_flow_1_to_0_np = up_flow0_1[0].detach().cpu().permute(1, 2, 0).numpy()
                         final_flow_1_to_2_np = up_flow1_1[0].detach().cpu().permute(1, 2, 0).numpy()
                         save_flow_diff_visuals(

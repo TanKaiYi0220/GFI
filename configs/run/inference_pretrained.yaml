@@ -1,0 +1,20 @@
+{
+  "mode": "infer",
+  "model_name": "IFRNet",
+  "root_dir": "data/",
+  "dataset_root_dir": "/workspace/datasets/",
+  "inference_preset": "test_vfx_0416",
+  "checkpoint_path": "outputs/IFRNet_FineTuning_0416/checkpoints/best.pth",
+  "output_dir": "inference_outputs/IFRNet_PreTrained",
+  "seed": 1234,
+  "batch_size": 1,
+  "only_fps": 60,
+  "input_fps": 30,
+  "scale_factor": 1.0,
+  "flow_approx_method": "combination",
+  "flow_diff_threshold": 1.0,
+  "flow_diff_percentile": 99.0,
+  "save_topk_worst_psnr": 10,
+  "save_topk_best_psnr": 5,
+  "save_topk_largest_flow_diff": 10
+}

@@ -25,6 +25,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def make_even_size(width: int, height: int) -> tuple[int, int]:
+    even_width = width if width % 2 == 0 else width + 1
+    even_height = height if height % 2 == 0 else height + 1
+    return even_width, even_height
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     config_path = Path(args.config)
@@ -112,6 +118,39 @@ def main(argv: list[str] | None = None) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("device=%s model=%s", device, model_name)
 
+    def open_video_writer(base_path: Path, width: int, height: int) -> tuple[Any, Path, tuple[int, int]]:
+        even_width, even_height = make_even_size(width, height)
+        candidates = [
+            (base_path, "mp4v"),
+            (base_path, "avc1"),
+            (base_path.with_suffix(".avi"), "XVID"),
+            (base_path.with_suffix(".avi"), "MJPG"),
+        ]
+
+        for output_path, codec in candidates:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            writer = cv2.VideoWriter(
+                str(output_path),
+                cv2.VideoWriter_fourcc(*codec),
+                fps,
+                (even_width, even_height),
+            )
+            if writer.isOpened():
+                logger.info("video_writer path=%s codec=%s size=%sx%s", output_path, codec, even_width, even_height)
+                return writer, output_path, (even_width, even_height)
+
+        raise RuntimeError(f"Failed to open VideoWriter for base path: {base_path}")
+
+    def prepare_video_frame(frame: Any, target_size: tuple[int, int], is_rgb: bool) -> Any:
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if is_rgb else frame
+        target_width, target_height = target_size
+        if frame_bgr.shape[1] == target_width and frame_bgr.shape[0] == target_height:
+            return frame_bgr
+
+        canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+        canvas[: frame_bgr.shape[0], : frame_bgr.shape[1]] = frame_bgr
+        return canvas
+
     dataframe = build_merged_dataframe(root_dir, out_dir, inference_preset, only_fps, logger)
     if not ignore_valid and "valid" in dataframe.columns:
         dataframe = dataframe[dataframe["valid"] == True].reset_index(drop=True)
@@ -154,8 +193,21 @@ def main(argv: list[str] | None = None) -> None:
             progress = tqdm(loader, desc=f"{record}_{mode_name}", leave=True)
             pred_writer = None
             gt_writer = None
+            mp4_dir = Path(str(config["out_dir"])) / record
+            mp4_dir.mkdir(parents=True, exist_ok=True)
+            pred_video_path = mp4_dir / f"{str(mode_name).replace('/', '_')}_vfi60_pred.mp4"
+            gt_video_path = mp4_dir / f"{str(mode_name).replace('/', '_')}_vfi60_gt.mp4"
+            pred_video_actual_path = pred_video_path
+            gt_video_actual_path = gt_video_path
+            pred_video_size = None
+            gt_video_size = None
             grid_writer = None
+            grid_video_path = mp4_dir / f"{record}_{str(mode_name).replace('/', '_')}_{layout}_grid.mp4"
+            grid_video_actual_path = grid_video_path
+            grid_video_size = None
             single_writers: dict[str, Any] = {}
+            single_writer_paths: dict[str, Path] = {}
+            single_writer_sizes: dict[str, tuple[int, int]] = {}
             sample_count = 0
 
             for batch in progress:
@@ -197,35 +249,34 @@ def main(argv: list[str] | None = None) -> None:
 
                     if pred_writer is None and export_vfi60:
                         height, width = img0_np.shape[:2]
-                        pred_path = out_dir / f"{record}_{str(mode_name).replace('/', '__')}_vfi60_pred.mp4"
-                        gt_path = out_dir / f"{record}_{str(mode_name).replace('/', '__')}_vfi60_gt.mp4"
-                        pred_writer = cv2.VideoWriter(str(pred_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-                        gt_writer = cv2.VideoWriter(str(gt_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-                        if not pred_writer.isOpened() or not gt_writer.isOpened():
-                            raise RuntimeError(f"Failed to open main video writers for {record} {mode_name}")
+                        pred_writer, pred_video_actual_path, pred_video_size = open_video_writer(pred_video_path, width, height)
+                        gt_writer, gt_video_actual_path, gt_video_size = open_video_writer(gt_video_path, width, height)
 
                     if sample_count == 0 and pred_writer is not None:
-                        pred_writer.write(cv2.cvtColor(img0_np, cv2.COLOR_RGB2BGR))
-                        gt_writer.write(cv2.cvtColor(img0_np, cv2.COLOR_RGB2BGR))
+                        pred_writer.write(prepare_video_frame(img0_np, pred_video_size, False))
+                        gt_writer.write(prepare_video_frame(img0_np, gt_video_size, False))
                     if pred_writer is not None:
-                        pred_writer.write(cv2.cvtColor(img_pred_np, cv2.COLOR_RGB2BGR))
-                        pred_writer.write(cv2.cvtColor(img1_np, cv2.COLOR_RGB2BGR))
-                        gt_writer.write(cv2.cvtColor(imgt_np, cv2.COLOR_RGB2BGR))
-                        gt_writer.write(cv2.cvtColor(img1_np, cv2.COLOR_RGB2BGR))
+                        pred_writer.write(prepare_video_frame(img_pred_np, pred_video_size, False))
+                        pred_writer.write(prepare_video_frame(img1_np, pred_video_size, False))
+                        gt_writer.write(prepare_video_frame(imgt_np, gt_video_size, False))
+                        gt_writer.write(prepare_video_frame(img1_np, gt_video_size, False))
 
                     if export_all:
                         stream_frames = {
-                            "image_0.png": img0_np,
-                            "image_pred.png": img_pred_np,
-                            "image_1.png": img1_np,
-                            "image_gt.png": imgt_np,
-                            "image_merge.png": image_merge_np,
-                            "flow_1_to_0.png": flow_1_to_0_np,
-                            "flow_1_to_2.png": flow_1_to_2_np,
-                            "flow_mask.png": cv2.cvtColor(flow_mask_np, cv2.COLOR_GRAY2BGR),
+                            "image_0.png": (img0_np, False),
+                            "image_pred.png": (img_pred_np, False),
+                            "image_1.png": (img1_np, False),
+                            "image_gt.png": (imgt_np, False),
+                            "image_merge.png": (image_merge_np, False),
+                            "flow_1_to_0.png": (flow_1_to_0_np, True),
+                            "flow_1_to_2.png": (flow_1_to_2_np, True),
+                            "flow_mask.png": (cv2.cvtColor(flow_mask_np, cv2.COLOR_GRAY2BGR), False),
                         }
                         for filename in single_files:
-                            frame = stream_frames.get(filename)
+                            stream_entry = stream_frames.get(filename)
+                            if stream_entry is None:
+                                continue
+                            frame, is_rgb = stream_entry
                             if frame is None:
                                 continue
                             if filename == "image_0.png" and sample_count > 0:
@@ -234,42 +285,44 @@ def main(argv: list[str] | None = None) -> None:
                                 stream_dir = out_dir / "single"
                                 stream_dir.mkdir(parents=True, exist_ok=True)
                                 writer_path = stream_dir / f"{record}_{str(mode_name).replace('/', '__')}_{filename.replace('.png', '')}.mp4"
-                                single_writers[filename] = cv2.VideoWriter(
-                                    str(writer_path),
-                                    cv2.VideoWriter_fourcc(*"mp4v"),
-                                    fps,
-                                    (frame.shape[1], frame.shape[0]),
+                                single_writers[filename], single_writer_paths[filename], single_writer_sizes[filename] = open_video_writer(
+                                    writer_path,
+                                    frame.shape[1],
+                                    frame.shape[0],
                                 )
-                                if not single_writers[filename].isOpened():
-                                    raise RuntimeError(f"Failed to open single stream writer: {writer_path}")
                             if frame.ndim == 2:
                                 frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                            else:
+                            elif is_rgb:
                                 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                            target_width, target_height = single_writer_sizes[filename]
+                            if frame.shape[1] != target_width or frame.shape[0] != target_height:
+                                canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+                                canvas[: frame.shape[0], : frame.shape[1]] = frame
+                                frame = canvas
                             single_writers[filename].write(frame)
 
                     if export_grid:
                         if layout == "debug":
                             entries = [
-                                ("img0", img0_np),
-                                ("img1", img1_np),
-                                ("gt", imgt_np),
-                                ("pred", img_pred_np),
-                                ("merge", image_merge_np if image_merge_np is not None else np.zeros_like(img0_np)),
-                                ("mask", cv2.cvtColor(flow_mask_np, cv2.COLOR_GRAY2BGR)),
-                                ("flow 1->0", flow_1_to_0_np),
-                                ("flow 1->2", flow_1_to_2_np),
-                                ("blank", np.zeros_like(img0_np)),
+                                ("img0", img0_np, False),
+                                ("img1", img1_np, False),
+                                ("gt", imgt_np, False),
+                                ("pred", img_pred_np, False),
+                                ("merge", image_merge_np if image_merge_np is not None else np.zeros_like(img0_np), False),
+                                ("mask", cv2.cvtColor(flow_mask_np, cv2.COLOR_GRAY2BGR), False),
+                                ("flow 1->0", flow_1_to_0_np, True),
+                                ("flow 1->2", flow_1_to_2_np, True),
+                                ("blank", np.zeros_like(img0_np), False),
                             ]
                             rows_count, cols_count = 3, 3
                         else:
                             entries = [
-                                ("img0", img0_np),
-                                ("img1", img1_np),
-                                ("gt", imgt_np),
-                                ("pred", img_pred_np),
-                                ("merge", image_merge_np if image_merge_np is not None else np.zeros_like(img0_np)),
-                                ("mask", cv2.cvtColor(flow_mask_np, cv2.COLOR_GRAY2BGR)),
+                                ("img0", img0_np, False),
+                                ("img1", img1_np, False),
+                                ("gt", imgt_np, False),
+                                ("pred", img_pred_np, False),
+                                ("merge", image_merge_np if image_merge_np is not None else np.zeros_like(img0_np), False),
+                                ("mask", cv2.cvtColor(flow_mask_np, cv2.COLOR_GRAY2BGR), False),
                             ]
                             rows_count, cols_count = 2, 3
 
@@ -283,8 +336,12 @@ def main(argv: list[str] | None = None) -> None:
                             ),
                             dtype=np.uint8,
                         )
-                        for entry_index, (label, frame) in enumerate(entries):
-                            tile = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                        for entry_index, (label, frame, is_rgb) in enumerate(entries):
+                            tile = frame
+                            if tile.ndim == 2:
+                                tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
+                            elif is_rgb:
+                                tile = cv2.cvtColor(tile, cv2.COLOR_RGB2BGR)
                             tile = cv2.resize(tile, (tile_width, tile_height), interpolation=cv2.INTER_AREA)
                             row_index = entry_index // cols_count
                             col_index = entry_index % cols_count
@@ -295,10 +352,11 @@ def main(argv: list[str] | None = None) -> None:
                             cv2.putText(canvas, label, (x0 + 8, y0 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
                         if grid_writer is None:
-                            grid_path = out_dir / f"{record}_{str(mode_name).replace('/', '__')}_{layout}_grid.mp4"
-                            grid_writer = cv2.VideoWriter(str(grid_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (canvas.shape[1], canvas.shape[0]))
-                            if not grid_writer.isOpened():
-                                raise RuntimeError(f"Failed to open grid writer: {grid_path}")
+                            grid_writer, grid_video_actual_path, grid_video_size = open_video_writer(grid_video_path, canvas.shape[1], canvas.shape[0])
+                        if canvas.shape[1] != grid_video_size[0] or canvas.shape[0] != grid_video_size[1]:
+                            grid_canvas = np.zeros((grid_video_size[1], grid_video_size[0], 3), dtype=np.uint8)
+                            grid_canvas[: canvas.shape[0], : canvas.shape[1]] = canvas
+                            canvas = grid_canvas
                         grid_writer.write(canvas)
 
                     sample_count += 1
@@ -317,8 +375,9 @@ def main(argv: list[str] | None = None) -> None:
                     "mode": str(mode_name),
                     "record_name": f"{record}_{mode_name}",
                     "samples": int(len(group_dataframe)),
-                    "pred_video_path": str(out_dir / f"{record}_{str(mode_name).replace('/', '__')}_vfi60_pred.mp4") if export_vfi60 else "",
-                    "gt_video_path": str(out_dir / f"{record}_{str(mode_name).replace('/', '__')}_vfi60_gt.mp4") if export_vfi60 else "",
+                    "pred_video_path": str(pred_video_actual_path) if export_vfi60 else "",
+                    "gt_video_path": str(gt_video_actual_path) if export_vfi60 else "",
+                    "grid_video_path": str(grid_video_actual_path) if export_grid else "",
                 }
             )
             logger.info("record=%s mode=%s samples=%s", record, mode_name, len(group_dataframe))

@@ -23,7 +23,7 @@ from src.engine.evaluation import AverageMeter
 from src.engine.evaluation import calculate_psnr
 from src.utils.config import load_yaml_file
 
-MODEL_NAMES: tuple[str, ...] = ("IFRNet", "IFRNet_Residual")
+MODEL_NAMES: tuple[str, ...] = ("IFRNet", "IFRNet_Residual", "IFRNet_Residual_FlowApprox")
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,10 @@ def resolve_model_class(model_name: str) -> type[Any]:
 
         return IFRNetModel
     if model_name == "IFRNet_Residual":
+        from src.models.IFRNet_Residual import Model as IFRNetResidualModel
+
+        return IFRNetResidualModel
+    if model_name == "IFRNet_Residual_FlowApprox":
         from src.models.IFRNet_Residual import Model as IFRNetResidualModel
 
         return IFRNetResidualModel
