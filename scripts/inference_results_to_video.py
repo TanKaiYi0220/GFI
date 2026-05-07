@@ -10,11 +10,11 @@ PROJECT_ROOT: Path = Path(__file__).parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.inference import BASELINE_MODEL_NAME
+from scripts.inference import run_inference_batch
 from scripts.train import build_merged_dataframe
 from scripts.train import resolve_model_class
 from scripts.train import set_seed
-from scripts.train_flow_approx import build_flow_init
-from scripts.train_flow_approx import FLOW_APPROX_METHODS
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
 
@@ -25,10 +25,141 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def make_even_size(width: int, height: int) -> tuple[int, int]:
-    even_width = width if width % 2 == 0 else width + 1
+def make_even_size(height: int, width: int) -> tuple[int, int]:
     even_height = height if height % 2 == 0 else height + 1
-    return even_width, even_height
+    even_width = width if width % 2 == 0 else width + 1
+    return even_height, even_width
+
+
+def open_video_writer(
+    base_path: Path,
+    fps: int,
+    frame_shape: tuple[int, int],
+    cv2: Any,
+    logger: Any,
+) -> tuple[Any, Path, tuple[int, int]]:
+    height, width = make_even_size(frame_shape[0], frame_shape[1])
+    candidates = [
+        (base_path, "mp4v"),
+        (base_path, "avc1"),
+        (base_path.with_suffix(".avi"), "XVID"),
+        (base_path.with_suffix(".avi"), "MJPG"),
+    ]
+
+    for output_path, codec in candidates:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(
+            str(output_path),
+            cv2.VideoWriter_fourcc(*codec),
+            fps,
+            (width, height),
+        )
+        if writer.isOpened():
+            logger.info("video_writer path=%s codec=%s size=%sx%s", output_path, codec, width, height)
+            return writer, output_path, (height, width)
+
+    raise RuntimeError(f"Failed to open VideoWriter for base path: {base_path}")
+
+
+def prepare_video_frame(frame: Any, target_shape: tuple[int, int], is_rgb: bool, cv2: Any, np: Any) -> Any:
+    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if is_rgb else frame
+    target_height, target_width = target_shape
+    if frame_bgr.shape[0] == target_height and frame_bgr.shape[1] == target_width:
+        return frame_bgr
+
+    canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+    canvas[: frame_bgr.shape[0], : frame_bgr.shape[1]] = frame_bgr
+    return canvas
+
+
+def build_flow_error_vis(bg_img_np: Any, init_flow_np: Any, final_flow_np: Any, cv2: Any, np: Any) -> Any:
+    diff_mag_np = np.linalg.norm(final_flow_np - init_flow_np, axis=2)
+    scale = max(float(np.percentile(diff_mag_np, 99.0)), 1e-6)
+    diff_mag_u8 = np.round(np.clip(diff_mag_np / scale, 0.0, 1.0) * 255.0).astype(np.uint8)
+    heatmap_bgr = cv2.applyColorMap(diff_mag_u8, cv2.COLORMAP_TURBO)
+    return cv2.addWeighted(bg_img_np.astype(np.uint8), 0.2, heatmap_bgr, 0.8, 0.0)
+
+
+def build_grid_frame(
+    batch_index: int,
+    flow_to_image: Any,
+    inference_result: dict[str, Any],
+    model_name: str,
+    pad: int,
+    tile_scale: float,
+    warp: Any,
+    cv2: Any,
+    np: Any,
+) -> Any:
+    img0 = inference_result["img0"]
+    img1 = inference_result["img1"]
+    imgt = inference_result["imgt"]
+    bmv = inference_result["bmv"]
+    fmv = inference_result["fmv"]
+    imgt_pred = inference_result["imgt_pred"]
+    init_bmv = inference_result["init_bmv"]
+    init_fmv = inference_result["init_fmv"]
+    up_flow0_1 = inference_result["up_flow0_1"]
+    up_flow1_1 = inference_result["up_flow1_1"]
+    up_mask_1 = inference_result["up_mask_1"]
+
+    img0_warped = warp(img0, up_flow0_1)
+    img1_warped = warp(img1, up_flow1_1)
+
+    img0_np = np.round(img0[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    img1_np = np.round(img1[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    imgt_np = np.round(imgt[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    img_pred_np = np.round(imgt_pred[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    flow_mask_np = np.round(up_mask_1[batch_index, 0].detach().cpu().numpy() * 255.0).astype(np.uint8)
+    img0_warped_np = np.round(img0_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    img1_warped_np = np.round(img1_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+
+    if model_name == BASELINE_MODEL_NAME:
+        flow_t_to_0_np = flow_to_image(up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
+        flow_t_to_1_np = flow_to_image(up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
+        flow_t_to_0_label = "flow_pred(t->0)"
+        flow_t_to_1_label = "flow_pred(t->1)"
+        flow_t_to_0_is_rgb = True
+        flow_t_to_1_is_rgb = True
+    else:
+        init_flow_1_to_0_np = init_bmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+        init_flow_1_to_2_np = init_fmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+        final_flow_1_to_0_np = up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+        final_flow_1_to_2_np = up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+        flow_t_to_0_np = build_flow_error_vis(img0_np, init_flow_1_to_0_np, final_flow_1_to_0_np, cv2, np)
+        flow_t_to_1_np = build_flow_error_vis(img1_np, init_flow_1_to_2_np, final_flow_1_to_2_np, cv2, np)
+        flow_t_to_0_label = "flow_error_vis(t->0)"
+        flow_t_to_1_label = "flow_error_vis(t->1)"
+        flow_t_to_0_is_rgb = False
+        flow_t_to_1_is_rgb = False
+
+    entries = [
+        ("img0", img0_np, False),
+        ("img1", img1_np, False),
+        ("img_GT", imgt_np, False),
+        (flow_t_to_0_label, flow_t_to_0_np, flow_t_to_0_is_rgb),
+        (flow_t_to_1_label, flow_t_to_1_np, flow_t_to_1_is_rgb),
+        ("blending_mask", cv2.cvtColor(flow_mask_np, cv2.COLOR_GRAY2BGR), False),
+        ("img0_warped", img0_warped_np, False),
+        ("img1_warped", img1_warped_np, False),
+        ("img_pred", img_pred_np, False),
+    ]
+
+    tile_width = max(16, int(img0_np.shape[1] * tile_scale))
+    tile_height = max(16, int(img0_np.shape[0] * tile_scale))
+    canvas = np.zeros((3 * tile_height + 4 * pad, 3 * tile_width + 4 * pad, 3), dtype=np.uint8)
+
+    for entry_index, (label, frame, is_rgb) in enumerate(entries):
+        tile = prepare_video_frame(frame, (tile_height, tile_width), is_rgb, cv2, np)
+        row_index = entry_index // 3
+        col_index = entry_index % 3
+        x0 = pad + col_index * (tile_width + pad)
+        y0 = pad + row_index * (tile_height + pad)
+        canvas[y0 : y0 + tile_height, x0 : x0 + tile_width] = tile
+        cv2.rectangle(canvas, (x0, y0), (x0 + tile_width, y0 + 24), (0, 0, 0), -1)
+        cv2.putText(canvas, label, (x0 + 8, y0 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+    return canvas
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -49,7 +180,6 @@ def main(argv: list[str] | None = None) -> None:
     input_fps = int(config["input_fps"])
     fps = int(config.get("fps", 60))
     export_grid = bool(config.get("export_grid", False))
-    layout = str(config.get("layout", "basic"))
     tile_scale = float(config.get("tile_scale", 0.5))
     pad = int(config.get("pad", 8))
     export_all = bool(config.get("export_all", False))
@@ -75,11 +205,6 @@ def main(argv: list[str] | None = None) -> None:
     if not out_dir.is_absolute():
         out_dir = PROJECT_ROOT / out_dir
 
-    if model_name == "IFRNet_Residual" and flow_approx_method not in FLOW_APPROX_METHODS:
-        raise ValueError(f"Unsupported flow_approx_method: {flow_approx_method}")
-    if layout not in {"basic", "debug"}:
-        raise ValueError(f"Unsupported layout: {layout}")
-
     summary = {
         "mode": mode,
         "model_name": model_name,
@@ -93,7 +218,6 @@ def main(argv: list[str] | None = None) -> None:
         "record": record_filter,
         "target_mode": mode_filter,
         "export_grid": export_grid,
-        "layout": layout,
         "export_all": export_all,
         "export_vfi60": export_vfi60,
     }
@@ -111,45 +235,13 @@ def main(argv: list[str] | None = None) -> None:
     from src.data.dataset_loader import FlowEstimationTrainDataset
     from src.data.dataset_loader import VFITrainDataset
     from src.data.image_ops import flow_to_image
+    from src.models.external.IFRNet.utils import warp
 
     logger = build_logger("scripts.inference_results_to_video")
     set_seed(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("device=%s model=%s", device, model_name)
-
-    def open_video_writer(base_path: Path, width: int, height: int) -> tuple[Any, Path, tuple[int, int]]:
-        even_width, even_height = make_even_size(width, height)
-        candidates = [
-            (base_path, "mp4v"),
-            (base_path, "avc1"),
-            (base_path.with_suffix(".avi"), "XVID"),
-            (base_path.with_suffix(".avi"), "MJPG"),
-        ]
-
-        for output_path, codec in candidates:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            writer = cv2.VideoWriter(
-                str(output_path),
-                cv2.VideoWriter_fourcc(*codec),
-                fps,
-                (even_width, even_height),
-            )
-            if writer.isOpened():
-                logger.info("video_writer path=%s codec=%s size=%sx%s", output_path, codec, even_width, even_height)
-                return writer, output_path, (even_width, even_height)
-
-        raise RuntimeError(f"Failed to open VideoWriter for base path: {base_path}")
-
-    def prepare_video_frame(frame: Any, target_size: tuple[int, int], is_rgb: bool) -> Any:
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if is_rgb else frame
-        target_width, target_height = target_size
-        if frame_bgr.shape[1] == target_width and frame_bgr.shape[0] == target_height:
-            return frame_bgr
-
-        canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
-        canvas[: frame_bgr.shape[0], : frame_bgr.shape[1]] = frame_bgr
-        return canvas
 
     dataframe = build_merged_dataframe(root_dir, out_dir, inference_preset, only_fps, logger)
     if not ignore_valid and "valid" in dataframe.columns:
@@ -173,10 +265,11 @@ def main(argv: list[str] | None = None) -> None:
             "image_pred.png",
             "image_1.png",
             "image_gt.png",
-            "image_merge.png",
-            "flow_1_to_0.png",
-            "flow_1_to_2.png",
+            "flow_t_to_0.png",
+            "flow_t_to_1.png",
             "flow_mask.png",
+            "image_0_warped.png",
+            "image_1_warped.png",
         ]
 
     video_rows: list[dict[str, object]] = []
@@ -184,82 +277,86 @@ def main(argv: list[str] | None = None) -> None:
     with torch.no_grad():
         for (record, mode_name), group_dataframe in dataframe.groupby(["record", "mode"], sort=False):
             group_dataframe = group_dataframe.reset_index(drop=True)
-            if model_name == "IFRNet":
+            if model_name == BASELINE_MODEL_NAME:
                 dataset = VFITrainDataset(group_dataframe, str(dataset_root_dir), False, input_fps)
             else:
                 dataset = FlowEstimationTrainDataset(group_dataframe, str(dataset_root_dir), input_fps, False)
 
             loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
             progress = tqdm(loader, desc=f"{record}_{mode_name}", leave=True)
+            mode_tag = str(mode_name).replace("/", "_")
+            mp4_dir = out_dir / str(record)
+            mp4_dir.mkdir(parents=True, exist_ok=True)
+
             pred_writer = None
             gt_writer = None
-            mp4_dir = Path(str(config["out_dir"])) / record
-            mp4_dir.mkdir(parents=True, exist_ok=True)
-            pred_video_path = mp4_dir / f"{str(mode_name).replace('/', '_')}_vfi60_pred.mp4"
-            gt_video_path = mp4_dir / f"{str(mode_name).replace('/', '_')}_vfi60_gt.mp4"
+            pred_video_path = mp4_dir / f"{mode_tag}_vfi60_pred.mp4"
+            gt_video_path = mp4_dir / f"{mode_tag}_vfi60_gt.mp4"
             pred_video_actual_path = pred_video_path
             gt_video_actual_path = gt_video_path
-            pred_video_size = None
-            gt_video_size = None
+            pred_video_shape = None
+            gt_video_shape = None
+
             grid_writer = None
-            grid_video_path = mp4_dir / f"{record}_{str(mode_name).replace('/', '_')}_{layout}_grid.mp4"
+            grid_video_path = mp4_dir / f"{mode_tag}_grid.mp4"
             grid_video_actual_path = grid_video_path
-            grid_video_size = None
+            grid_video_shape = None
+
             single_writers: dict[str, Any] = {}
-            single_writer_paths: dict[str, Path] = {}
-            single_writer_sizes: dict[str, tuple[int, int]] = {}
+            single_writer_shapes: dict[str, tuple[int, int]] = {}
             sample_count = 0
 
             for batch in progress:
-                if model_name == "IFRNet":
-                    img0, imgt, img1, bmv, fmv, embt, _info = batch
-                    img0 = img0.to(device)
-                    imgt = imgt.to(device)
-                    img1 = img1.to(device)
-                    embt = embt.to(device)
-                    imgt_pred, up_flow0_1, up_flow1_1, up_mask_1 = model.inference(img0, img1, embt, scale_factor)
-                    imgt_merge = None
-                else:
-                    img0, imgt, img1, _bmv, _fmv, bmv_30, fmv_30, embt, _info = batch
-                    img0 = img0.to(device)
-                    imgt = imgt.to(device)
-                    img1 = img1.to(device)
-                    bmv_30 = bmv_30.to(device)
-                    fmv_30 = fmv_30.to(device)
-                    embt = embt.to(device)
-                    approx_bmv, approx_fmv = build_flow_init(fmv_30, bmv_30, embt, flow_approx_method)
-                    imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
-                        img0,
-                        img1,
-                        embt,
-                        scale_factor,
-                        init_flow0=approx_bmv,
-                        init_flow1=approx_fmv,
-                    )
+                inference_result = run_inference_batch(batch, device, flow_approx_method, model, model_name, scale_factor)
+                img0 = inference_result["img0"]
+                img1 = inference_result["img1"]
+                imgt = inference_result["imgt"]
+                imgt_pred = inference_result["imgt_pred"]
+                init_bmv = inference_result["init_bmv"]
+                init_fmv = inference_result["init_fmv"]
+                up_flow0_1 = inference_result["up_flow0_1"]
+                up_flow1_1 = inference_result["up_flow1_1"]
+                up_mask_1 = inference_result["up_mask_1"]
+
+                img0_warped = warp(img0, up_flow0_1)
+                img1_warped = warp(img1, up_flow1_1)
 
                 for batch_index in range(int(imgt_pred.shape[0])):
                     img0_np = np.round(img0[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
                     img1_np = np.round(img1[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
                     imgt_np = np.round(imgt[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
                     img_pred_np = np.round(imgt_pred[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                    image_merge_np = None if imgt_merge is None else np.round(imgt_merge[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                    flow_1_to_0_np = flow_to_image(up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
-                    flow_1_to_2_np = flow_to_image(up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
                     flow_mask_np = np.round(up_mask_1[batch_index, 0].detach().cpu().numpy() * 255.0).astype(np.uint8)
+                    img0_warped_np = np.round(img0_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                    img1_warped_np = np.round(img1_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+
+                    if model_name == BASELINE_MODEL_NAME:
+                        flow_t_to_0_np = flow_to_image(up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
+                        flow_t_to_1_np = flow_to_image(up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
+                        flow_t_to_0_is_rgb = True
+                        flow_t_to_1_is_rgb = True
+                    else:
+                        init_flow_1_to_0_np = init_bmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                        init_flow_1_to_2_np = init_fmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                        final_flow_1_to_0_np = up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                        final_flow_1_to_2_np = up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                        flow_t_to_0_np = build_flow_error_vis(img0_np, init_flow_1_to_0_np, final_flow_1_to_0_np, cv2, np)
+                        flow_t_to_1_np = build_flow_error_vis(img1_np, init_flow_1_to_2_np, final_flow_1_to_2_np, cv2, np)
+                        flow_t_to_0_is_rgb = False
+                        flow_t_to_1_is_rgb = False
 
                     if pred_writer is None and export_vfi60:
-                        height, width = img0_np.shape[:2]
-                        pred_writer, pred_video_actual_path, pred_video_size = open_video_writer(pred_video_path, width, height)
-                        gt_writer, gt_video_actual_path, gt_video_size = open_video_writer(gt_video_path, width, height)
+                        pred_writer, pred_video_actual_path, pred_video_shape = open_video_writer(pred_video_path, fps, img0_np.shape[:2], cv2, logger)
+                        gt_writer, gt_video_actual_path, gt_video_shape = open_video_writer(gt_video_path, fps, img0_np.shape[:2], cv2, logger)
 
                     if sample_count == 0 and pred_writer is not None:
-                        pred_writer.write(prepare_video_frame(img0_np, pred_video_size, False))
-                        gt_writer.write(prepare_video_frame(img0_np, gt_video_size, False))
+                        pred_writer.write(prepare_video_frame(img0_np, pred_video_shape, False, cv2, np))
+                        gt_writer.write(prepare_video_frame(img0_np, gt_video_shape, False, cv2, np))
                     if pred_writer is not None:
-                        pred_writer.write(prepare_video_frame(img_pred_np, pred_video_size, False))
-                        pred_writer.write(prepare_video_frame(img1_np, pred_video_size, False))
-                        gt_writer.write(prepare_video_frame(imgt_np, gt_video_size, False))
-                        gt_writer.write(prepare_video_frame(img1_np, gt_video_size, False))
+                        pred_writer.write(prepare_video_frame(img_pred_np, pred_video_shape, False, cv2, np))
+                        pred_writer.write(prepare_video_frame(img1_np, pred_video_shape, False, cv2, np))
+                        gt_writer.write(prepare_video_frame(imgt_np, gt_video_shape, False, cv2, np))
+                        gt_writer.write(prepare_video_frame(img1_np, gt_video_shape, False, cv2, np))
 
                     if export_all:
                         stream_frames = {
@@ -267,97 +364,53 @@ def main(argv: list[str] | None = None) -> None:
                             "image_pred.png": (img_pred_np, False),
                             "image_1.png": (img1_np, False),
                             "image_gt.png": (imgt_np, False),
-                            "image_merge.png": (image_merge_np, False),
-                            "flow_1_to_0.png": (flow_1_to_0_np, True),
-                            "flow_1_to_2.png": (flow_1_to_2_np, True),
+                            "flow_t_to_0.png": (flow_t_to_0_np, flow_t_to_0_is_rgb),
+                            "flow_t_to_1.png": (flow_t_to_1_np, flow_t_to_1_is_rgb),
                             "flow_mask.png": (cv2.cvtColor(flow_mask_np, cv2.COLOR_GRAY2BGR), False),
+                            "image_0_warped.png": (img0_warped_np, False),
+                            "image_1_warped.png": (img1_warped_np, False),
                         }
                         for filename in single_files:
                             stream_entry = stream_frames.get(filename)
                             if stream_entry is None:
                                 continue
                             frame, is_rgb = stream_entry
-                            if frame is None:
-                                continue
                             if filename == "image_0.png" and sample_count > 0:
                                 continue
                             if filename not in single_writers:
-                                stream_dir = out_dir / "single"
-                                stream_dir.mkdir(parents=True, exist_ok=True)
-                                writer_path = stream_dir / f"{record}_{str(mode_name).replace('/', '__')}_{filename.replace('.png', '')}.mp4"
-                                single_writers[filename], single_writer_paths[filename], single_writer_sizes[filename] = open_video_writer(
+                                writer_path = out_dir / "single" / f"{record}_{str(mode_name).replace('/', '__')}_{filename.replace('.png', '')}.mp4"
+                                single_writers[filename], _single_output_path, single_writer_shapes[filename] = open_video_writer(
                                     writer_path,
-                                    frame.shape[1],
-                                    frame.shape[0],
+                                    fps,
+                                    frame.shape[:2],
+                                    cv2,
+                                    logger,
                                 )
-                            if frame.ndim == 2:
-                                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                            elif is_rgb:
-                                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                            target_width, target_height = single_writer_sizes[filename]
-                            if frame.shape[1] != target_width or frame.shape[0] != target_height:
-                                canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
-                                canvas[: frame.shape[0], : frame.shape[1]] = frame
-                                frame = canvas
-                            single_writers[filename].write(frame)
+                            single_writers[filename].write(
+                                prepare_video_frame(frame, single_writer_shapes[filename], is_rgb, cv2, np),
+                            )
 
                     if export_grid:
-                        if layout == "debug":
-                            entries = [
-                                ("img0", img0_np, False),
-                                ("img1", img1_np, False),
-                                ("gt", imgt_np, False),
-                                ("pred", img_pred_np, False),
-                                ("merge", image_merge_np if image_merge_np is not None else np.zeros_like(img0_np), False),
-                                ("mask", cv2.cvtColor(flow_mask_np, cv2.COLOR_GRAY2BGR), False),
-                                ("flow 1->0", flow_1_to_0_np, True),
-                                ("flow 1->2", flow_1_to_2_np, True),
-                                ("blank", np.zeros_like(img0_np), False),
-                            ]
-                            rows_count, cols_count = 3, 3
-                        else:
-                            entries = [
-                                ("img0", img0_np, False),
-                                ("img1", img1_np, False),
-                                ("gt", imgt_np, False),
-                                ("pred", img_pred_np, False),
-                                ("merge", image_merge_np if image_merge_np is not None else np.zeros_like(img0_np), False),
-                                ("mask", cv2.cvtColor(flow_mask_np, cv2.COLOR_GRAY2BGR), False),
-                            ]
-                            rows_count, cols_count = 2, 3
-
-                        tile_width = max(16, int(img0_np.shape[1] * tile_scale))
-                        tile_height = max(16, int(img0_np.shape[0] * tile_scale))
-                        canvas = np.zeros(
-                            (
-                                rows_count * tile_height + (rows_count + 1) * pad,
-                                cols_count * tile_width + (cols_count + 1) * pad,
-                                3,
-                            ),
-                            dtype=np.uint8,
+                        grid_frame = build_grid_frame(
+                            batch_index,
+                            flow_to_image,
+                            inference_result,
+                            model_name,
+                            pad,
+                            tile_scale,
+                            warp,
+                            cv2,
+                            np,
                         )
-                        for entry_index, (label, frame, is_rgb) in enumerate(entries):
-                            tile = frame
-                            if tile.ndim == 2:
-                                tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
-                            elif is_rgb:
-                                tile = cv2.cvtColor(tile, cv2.COLOR_RGB2BGR)
-                            tile = cv2.resize(tile, (tile_width, tile_height), interpolation=cv2.INTER_AREA)
-                            row_index = entry_index // cols_count
-                            col_index = entry_index % cols_count
-                            x0 = pad + col_index * (tile_width + pad)
-                            y0 = pad + row_index * (tile_height + pad)
-                            canvas[y0 : y0 + tile_height, x0 : x0 + tile_width] = tile
-                            cv2.rectangle(canvas, (x0, y0), (x0 + tile_width, y0 + 24), (0, 0, 0), -1)
-                            cv2.putText(canvas, label, (x0 + 8, y0 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-
                         if grid_writer is None:
-                            grid_writer, grid_video_actual_path, grid_video_size = open_video_writer(grid_video_path, canvas.shape[1], canvas.shape[0])
-                        if canvas.shape[1] != grid_video_size[0] or canvas.shape[0] != grid_video_size[1]:
-                            grid_canvas = np.zeros((grid_video_size[1], grid_video_size[0], 3), dtype=np.uint8)
-                            grid_canvas[: canvas.shape[0], : canvas.shape[1]] = canvas
-                            canvas = grid_canvas
-                        grid_writer.write(canvas)
+                            grid_writer, grid_video_actual_path, grid_video_shape = open_video_writer(
+                                grid_video_path,
+                                fps,
+                                grid_frame.shape[:2],
+                                cv2,
+                                logger,
+                            )
+                        grid_writer.write(prepare_video_frame(grid_frame, grid_video_shape, False, cv2, np))
 
                     sample_count += 1
 
