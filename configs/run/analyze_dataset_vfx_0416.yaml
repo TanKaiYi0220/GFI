@@ -1,0 +1,12 @@
+{
+  "mode": "dry-run",
+  "root_dir": "data/",
+  "dataset_root_dir": "/workspace/datasets/",
+  "analysis_preset": "test_vfx_0416",
+  "output_dir": "analysis_outputs/test_vfx_0416/",
+  "batch_size": 1,
+  "only_fps": 60,
+  "input_fps": 30,
+  "seed": 1234,
+  "filter_valid_only": true
+}

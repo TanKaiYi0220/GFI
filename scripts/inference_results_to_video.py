@@ -67,6 +67,9 @@ def prepare_video_frame(frame: Any, target_shape: tuple[int, int], is_rgb: bool,
     if frame_bgr.shape[0] == target_height and frame_bgr.shape[1] == target_width:
         return frame_bgr
 
+    if frame_bgr.shape[0] > target_height or frame_bgr.shape[1] > target_width:
+        return cv2.resize(frame_bgr, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
     canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
     canvas[: frame_bgr.shape[0], : frame_bgr.shape[1]] = frame_bgr
     return canvas
