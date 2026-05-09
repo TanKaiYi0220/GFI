@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.inference import BASELINE_MODEL_NAME
 from scripts.inference import run_inference_batch
 from scripts.train import build_merged_dataframe
+from scripts.train import read_model_init_args
 from scripts.train import resolve_model_class
 from scripts.train import set_seed
 from src.utils.config import load_yaml_file
@@ -174,6 +175,7 @@ def main(argv: list[str] | None = None) -> None:
     config = load_yaml_file(config_path)
     mode = str(config["mode"])
     model_name = str(config["model_name"])
+    model_init_args = read_model_init_args(config)
     inference_preset = str(config["inference_preset"])
     flow_approx_method = str(config.get("flow_approx_method", "combination"))
     scale_factor = float(config.get("scale_factor", 1.0))
@@ -224,6 +226,8 @@ def main(argv: list[str] | None = None) -> None:
         "export_all": export_all,
         "export_vfi60": export_vfi60,
     }
+    if len(model_init_args) > 0:
+        summary["model_init_args"] = model_init_args
     if mode == "dry-run":
         print(json.dumps(summary, indent=2))
         return
@@ -256,7 +260,8 @@ def main(argv: list[str] | None = None) -> None:
     if len(dataframe) == 0:
         raise RuntimeError("No samples matched the current filters.")
 
-    model = resolve_model_class(model_name)().to(device)
+    model_class = resolve_model_class(model_name)
+    model = model_class(**model_init_args).to(device)
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     model.load_state_dict(state_dict)

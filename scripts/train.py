@@ -51,6 +51,16 @@ def uses_flow_approx_model(model_name: str) -> bool:
     return model_name in FLOW_APPROX_MODEL_NAMES
 
 
+def read_model_init_args(config_values: dict[str, Any]) -> dict[str, Any]:
+    raw_model_init_args = config_values.get("model_init_args", {})
+    if raw_model_init_args is None:
+        return {}
+    if not isinstance(raw_model_init_args, dict):
+        raise TypeError(f"model_init_args must be a mapping, got {type(raw_model_init_args).__name__}")
+
+    return dict(raw_model_init_args)
+
+
 def resolve_model_class(model_name: str) -> type[Any]:
     if model_name == "IFRNet":
         from src.models.IFRNet import Model as IFRNetModel
@@ -475,7 +485,9 @@ def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
     config_path = None if bootstrap_args.config is None else Path(bootstrap_args.config)
     config_defaults = load_train_run_config(config_path)
     parser = build_train_arg_parser(config_defaults)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.model_init_args = read_model_init_args(config_defaults)
+    return args
 
 
 def log_run_summary(
@@ -566,6 +578,9 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
         "dataset_class": resolve_dataset_class_name(args.model_name),
     }
 
+    if len(args.model_init_args) > 0:
+        summary["model_init_args"] = dict(args.model_init_args)
+
     if uses_flow_approx_model(args.model_name):
         summary["flow_approx_method"] = args.flow_approx_method
 
@@ -607,7 +622,8 @@ def run_training(args: argparse.Namespace) -> None:
 
     args.iters_per_epoch = len(train_loader)
     model_class = resolve_model_class(args.model_name)
-    model = model_class().to(device)
+    model_init_args = dict(getattr(args, "model_init_args", {}))
+    model = model_class(**model_init_args).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr_start, weight_decay=0)
     training_state = load_training_state(args, model, optimizer, device, logger)
 

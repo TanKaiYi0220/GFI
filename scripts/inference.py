@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.train import build_merged_dataframe
+from scripts.train import read_model_init_args
 from scripts.train import resolve_model_class
 from scripts.train import set_seed
 from src.engine.flow_approx import build_flow_init
@@ -325,6 +326,7 @@ def main(argv: list[str] | None = None) -> None:
     config: dict[str, Any] = load_yaml_file(config_path)
     mode = str(config["mode"])
     model_name = str(config["model_name"])
+    model_init_args = read_model_init_args(config)
     inference_preset = str(config["inference_preset"])
     flow_approx_method = str(config["flow_approx_method"])
     scale_factor = float(config["scale_factor"])
@@ -376,6 +378,8 @@ def main(argv: list[str] | None = None) -> None:
         "save_topk_best_psnr": save_topk_best_psnr,
         "save_topk_largest_flow_diff": save_topk_largest_flow_diff,
     }
+    if len(model_init_args) > 0:
+        summary["model_init_args"] = model_init_args
     if mode == "dry-run":
         print(json.dumps(summary, indent=2))
         return
@@ -405,7 +409,8 @@ def main(argv: list[str] | None = None) -> None:
     dataframe = build_merged_dataframe(root_dir, output_dir, inference_preset, only_fps, logger)
     if "valid" in dataframe.columns:
         dataframe = dataframe[dataframe["valid"] == True].reset_index(drop=True)
-    model = resolve_model_class(model_name)().to(device)
+    model_class = resolve_model_class(model_name)
+    model = model_class(**model_init_args).to(device)
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     # print("Load Pretrained Weights from IFRNet_Vimeo90K.pth as Baseline")
