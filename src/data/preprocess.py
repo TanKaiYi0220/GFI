@@ -21,6 +21,10 @@ COLOR_EXR_TEMPLATE: str = "colorNoScreenUI_{frame_idx}.exr"
 BACKWARD_VELOCITY_TEMPLATE: str = "backwardVel_Depth_{frame_idx}.exr"
 FORWARD_VELOCITY_TEMPLATE: str = "forwardVel_Depth_{frame_idx}.exr"
 NON_FINITE_REASON_PREFIX: str = "Non-finite EXR values"
+LINEARITY_REASON_COLUMN: str = "linearity_reason"
+LINEARITY_REASON_NO_VALID_RATIO: str = "No valid ratio pixels"
+LINEARITY_REASON_OUT_OF_RANGE: str = "Linearity ratio out of range"
+RATIO_DENOMINATOR_EPSILON: float = 1e-12
 
 
 def rewrite_sample_root(samples: list[DatasetSample], source_root: Path, target_root: Path) -> list[DatasetSample]:
@@ -202,7 +206,15 @@ def cosine_project_ratio(array1: Any, array2: Any) -> Any:
     """Project one flow field onto another and return the normalized ratio."""
     array_inner = array1[..., 0] * array2[..., 0] + array1[..., 1] * array2[..., 1]
     array2_mag = np.linalg.norm(array2, axis=-1)
-    return array_inner / (array2_mag ** 2)
+    denominator = array2_mag ** 2
+    valid_mask = (
+        np.isfinite(array_inner)
+        & np.isfinite(denominator)
+        & (denominator > RATIO_DENOMINATOR_EPSILON)
+    )
+    ratio = np.full(array_inner.shape, np.nan, dtype=np.float32)
+    ratio[valid_mask] = array_inner[valid_mask] / denominator[valid_mask]
+    return ratio
 
 
 def build_valid_clip_windows(dataframe: Any, target_frames_count: int) -> list[dict[str, int]]:
@@ -265,6 +277,7 @@ def apply_linearity_check(raw_seq_df: Any, root_dir: Path, dataset_config: Datas
     """Append linearity statistics to one raw sequence dataframe."""
     raw_seq_df["D_index Mean"] = [-1.0] * len(raw_seq_df)
     raw_seq_df["D_index Median"] = [-1.0] * len(raw_seq_df)
+    raw_seq_df[LINEARITY_REASON_COLUMN] = [""] * len(raw_seq_df)
 
     invalid_count = 0
     progress = tqdm(range(len(raw_seq_df)))
@@ -289,19 +302,35 @@ def apply_linearity_check(raw_seq_df: Any, root_dir: Path, dataset_config: Datas
         )
 
         dis_index = cosine_project_ratio(backward_vel_1_0, backward_vel_2_0)
-        dis_index_mean = float(np.mean(dis_index))
-        dis_index_median = float(np.median(dis_index))
+        finite_dis_index = dis_index[np.isfinite(dis_index)]
+        if finite_dis_index.size == 0:
+            raw_seq_df.at[row_index, "valid"] = False
+            raw_seq_df.at[row_index, LINEARITY_REASON_COLUMN] = LINEARITY_REASON_NO_VALID_RATIO
+            invalid_count += 1
+            progress.set_postfix(
+                {
+                    "valid_ratio_pixels": 0,
+                    "invalid_count": invalid_count,
+                },
+            )
+            continue
+
+        dis_index_mean = float(np.mean(finite_dis_index))
+        dis_index_median = float(np.median(finite_dis_index))
 
         raw_seq_df.at[row_index, "D_index Mean"] = dis_index_mean
         raw_seq_df.at[row_index, "D_index Median"] = dis_index_median
 
         if is_out_of_ratio_range(dis_index_mean) or is_out_of_ratio_range(dis_index_median):
+            raw_seq_df.at[row_index, "valid"] = False
+            raw_seq_df.at[row_index, LINEARITY_REASON_COLUMN] = LINEARITY_REASON_OUT_OF_RANGE
             invalid_count += 1
 
         progress.set_postfix(
             {
                 "D_index Mean": dis_index_mean,
                 "D_index Median": dis_index_median,
+                "valid_ratio_pixels": int(finite_dis_index.size),
                 "invalid_count": invalid_count,
             },
         )

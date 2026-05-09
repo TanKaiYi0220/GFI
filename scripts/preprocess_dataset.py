@@ -40,7 +40,7 @@ ONLY_FPS: int = 60
 
 DRY_RUN: bool = True
 REMOVE_IDENTICAL: bool = False
-CHECK_NON_FINITE_EXR: bool = True
+CHECK_NON_FINITE_EXR: bool = False
 CHECK_IDENTICAL_CROSS_FPS: bool = False
 MANUAL_LABELING: bool = False
 MERGE_DATASETS: bool = True
