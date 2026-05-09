@@ -13,8 +13,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.train import build_merged_dataframe
 from scripts.train import resolve_model_class
 from scripts.train import set_seed
-from scripts.train_flow_approx import build_flow_init
-from scripts.train_flow_approx import FLOW_APPROX_METHODS
+from src.engine.flow_approx import build_flow_init
+from src.engine.flow_approx import FLOW_APPROX_METHODS
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
 

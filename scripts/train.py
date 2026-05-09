@@ -21,9 +21,12 @@ from src.data.dataset_config import iter_dataset_configs
 from src.data.dataset_config import list_dataset_presets
 from src.engine.evaluation import AverageMeter
 from src.engine.evaluation import calculate_psnr
+from src.engine.flow_approx import build_flow_init
+from src.engine.flow_approx import FLOW_APPROX_METHODS
 from src.utils.config import load_yaml_file
 
 MODEL_NAMES: tuple[str, ...] = ("IFRNet", "IFRNet_Residual", "IFRNet_Residual_FlowApprox")
+FLOW_APPROX_MODEL_NAMES: tuple[str, ...] = ("IFRNet_Residual_FlowApprox",)
 
 
 @dataclass(frozen=True)
@@ -32,6 +35,20 @@ class TrainingState:
     global_step: int
     best_psnr: float
     mode: str
+
+
+@dataclass(frozen=True)
+class BatchStepOutput:
+    imgt: Any
+    imgt_pred: Any
+    info: dict[str, Any]
+    loss_rec: Any
+    loss_geo: Any
+    loss_dis: Any
+
+
+def uses_flow_approx_model(model_name: str) -> bool:
+    return model_name in FLOW_APPROX_MODEL_NAMES
 
 
 def resolve_model_class(model_name: str) -> type[Any]:
@@ -135,27 +152,34 @@ def build_merged_dataframe(
 def forward_model(
     model_name: str,
     model: Any,
-    img0: torch.Tensor,
-    img1: torch.Tensor,
-    embt: torch.Tensor,
-    imgt: torch.Tensor,
-    bmv: torch.Tensor,
-    fmv: torch.Tensor,
+    img0: Any,
+    img1: Any,
+    embt: Any,
+    imgt: Any,
+    source_bmv: Any,
+    source_fmv: Any,
+    flow_approx_method: str,
 ) -> Any:
     import torch
 
+    init_bmv = source_bmv
+    init_fmv = source_fmv
+
+    if uses_flow_approx_model(model_name):
+        init_bmv, init_fmv = build_flow_init(source_fmv, source_bmv, embt, flow_approx_method)
+
     if model_name == "IFRNet":
-        flow = torch.cat([bmv, fmv], dim=1).float()
+        flow = torch.cat([init_bmv, init_fmv], dim=1).float()
         return model(img0, img1, embt, imgt, flow)
 
-    return model(img0, img1, embt, imgt, init_flow0=bmv, init_flow1=fmv)
+    return model(img0, img1, embt, imgt, init_flow0=init_bmv, init_flow1=init_fmv)
 
 
 def build_loss_record(
-    loss_rec: torch.Tensor,
-    loss_geo: torch.Tensor,
-    loss_dis: torch.Tensor,
-    total_loss: torch.Tensor,
+    loss_rec: Any,
+    loss_geo: Any,
+    loss_dis: Any,
+    total_loss: Any,
 ) -> dict[str, float]:
     return {
         "loss_rec": float(loss_rec.detach().cpu()),
@@ -163,29 +187,6 @@ def build_loss_record(
         "loss_dis": float(loss_dis.detach().cpu()),
         "loss_total": float(total_loss.detach().cpu()),
     }
-
-
-def append_batch_loss_records(
-    target_records: list[dict[str, float]],
-    loss_record: dict[str, float],
-    batch_size: int,
-) -> None:
-    target_records.extend(loss_record.copy() for _ in range(batch_size))
-
-
-def append_batch_psnr_records(
-    target_records: list[dict[str, float]],
-    psnr_meter: AverageMeter,
-    imgt_pred: torch.Tensor,
-    imgt: torch.Tensor,
-) -> None:
-    batch_size = int(imgt_pred.shape[0])
-    for batch_index in range(batch_size):
-        # pred_np = imgt_pred[batch_index].detach().permute(1, 2, 0).cpu().numpy()
-        # gt_np = imgt[batch_index].detach().permute(1, 2, 0).cpu().numpy()
-        psnr_value = calculate_psnr(imgt[batch_index], imgt_pred[batch_index]).detach().cpu().item()
-        psnr_meter.update(psnr_value, 1)
-        target_records.append({"psnr": psnr_value})
 
 
 def append_batch_metric_records(
@@ -242,8 +243,76 @@ def save_checkpoint(
     )
 
 
-def evaluate(
+def build_training_dataset(
+    dataframe: Any,
+    dataset_root_dir: str,
+    augment: bool,
+    input_fps: int,
     model_name: str,
+) -> Any:
+    normalized_dataframe = dataframe.reset_index(drop=True)
+
+    if uses_flow_approx_model(model_name):
+        from src.data.dataset_loader import FlowEstimationTrainDataset
+
+        return FlowEstimationTrainDataset(normalized_dataframe, dataset_root_dir, input_fps, augment)
+
+    from src.data.dataset_loader import VFITrainDataset
+
+    return VFITrainDataset(normalized_dataframe, dataset_root_dir, augment, input_fps)
+
+
+def resolve_dataset_class_name(model_name: str) -> str:
+    if uses_flow_approx_model(model_name):
+        return "FlowEstimationTrainDataset"
+
+    return "VFITrainDataset"
+
+
+def run_training_batch(
+    args: argparse.Namespace,
+    model: Any,
+    batch: Any,
+    device: Any,
+) -> BatchStepOutput:
+    if uses_flow_approx_model(args.model_name):
+        img0, imgt, img1, _bmv_60, _fmv_60, bmv_30, fmv_30, embt, info = batch
+        source_bmv = bmv_30.to(device)
+        source_fmv = fmv_30.to(device)
+    else:
+        img0, imgt, img1, bmv, fmv, embt, info = batch
+        source_bmv = bmv.to(device)
+        source_fmv = fmv.to(device)
+
+    img0 = img0.to(device)
+    img1 = img1.to(device)
+    imgt = imgt.to(device)
+    embt = embt.to(device)
+
+    model_output = forward_model(
+        args.model_name,
+        model,
+        img0,
+        img1,
+        embt,
+        imgt,
+        source_bmv,
+        source_fmv,
+        args.flow_approx_method,
+    )
+    imgt_pred, loss_rec, loss_geo, loss_dis, _up_flow0_1, _up_flow1_1, _up_mask_1 = model_output
+    return BatchStepOutput(
+        imgt=imgt,
+        imgt_pred=imgt_pred,
+        info=info,
+        loss_rec=loss_rec,
+        loss_geo=loss_geo,
+        loss_dis=loss_dis,
+    )
+
+
+def evaluate(
+    args: argparse.Namespace,
     model: Any,
     loader: Any,
     device: Any,
@@ -259,28 +328,22 @@ def evaluate(
     with torch.no_grad():
         pbar = tqdm(loader, desc="Evaluating")
         for batch in pbar:
-            img0, imgt, img1, bmv, fmv, embt, info = batch
-            img0 = img0.to(device)
-            img1 = img1.to(device)
-            imgt = imgt.to(device)
-            bmv = bmv.to(device)
-            fmv = fmv.to(device)
-            embt = embt.to(device)
-
-            imgt_pred, loss_rec, loss_geo, loss_dis, _up_flow0_1, _up_flow1_1, _up_mask_1 = forward_model(
-                model_name,
-                model,
-                img0,
-                img1,
-                embt,
-                imgt,
-                bmv,
-                fmv,
+            batch_output = run_training_batch(args, model, batch, device)
+            total_loss = batch_output.loss_rec + batch_output.loss_geo + batch_output.loss_dis
+            loss_record = build_loss_record(
+                batch_output.loss_rec,
+                batch_output.loss_geo,
+                batch_output.loss_dis,
+                total_loss,
             )
-
-            total_loss = loss_rec + loss_geo + loss_dis
-            loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
-            append_batch_metric_records(eval_records, psnr_meter, info, imgt_pred, imgt, loss_record)
+            append_batch_metric_records(
+                eval_records,
+                psnr_meter,
+                batch_output.info,
+                batch_output.imgt_pred,
+                batch_output.imgt,
+                loss_record,
+            )
             pbar.set_postfix({"eval_psnr": f"{psnr_meter.avg:.6f}"})
 
     eval_df = pd.DataFrame(eval_records)
@@ -309,34 +372,15 @@ def train(
         model.train()
         train_psnr_meter = AverageMeter()
         train_records: list[dict[str, object]] = []
-
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
 
         for batch in pbar:
-            img0, imgt, img1, bmv, fmv, embt, info = batch
-            img0 = img0.to(device)
-            img1 = img1.to(device)
-            imgt = imgt.to(device)
-            bmv = bmv.to(device)
-            fmv = fmv.to(device)
-            embt = embt.to(device)
-
             lr = get_lr(args, global_step)
             set_lr(optimizer, lr)
             optimizer.zero_grad()
 
-            imgt_pred, loss_rec, loss_geo, loss_dis, _up_flow0_1, _up_flow1_1, _up_mask_1 = forward_model(
-                args.model_name,
-                model,
-                img0,
-                img1,
-                embt,
-                imgt,
-                bmv,
-                fmv,
-            )
-
-            total_loss = loss_rec + loss_geo + loss_dis
+            batch_output = run_training_batch(args, model, batch, device)
+            total_loss = batch_output.loss_rec + batch_output.loss_geo + batch_output.loss_dis
             total_loss.backward()
             optimizer.step()
 
@@ -344,10 +388,21 @@ def train(
             pbar.set_postfix({"train_loss": f"{float(total_loss.detach().cpu()):.6f}", "lr": f"{lr:.6f}"})
             if (epoch + 1) % args.eval_interval != 0:
                 continue
-            
-            # During evaluation epochs, we also record training metrics and losses for analysis.
-            loss_record = build_loss_record(loss_rec, loss_geo, loss_dis, total_loss)
-            append_batch_metric_records(train_records, train_psnr_meter, info, imgt_pred, imgt, loss_record)
+
+            loss_record = build_loss_record(
+                batch_output.loss_rec,
+                batch_output.loss_geo,
+                batch_output.loss_dis,
+                total_loss,
+            )
+            append_batch_metric_records(
+                train_records,
+                train_psnr_meter,
+                batch_output.info,
+                batch_output.imgt_pred,
+                batch_output.imgt,
+                loss_record,
+            )
 
         if (epoch + 1) % args.eval_interval == 0:
             train_df = pd.DataFrame(train_records)
@@ -356,7 +411,7 @@ def train(
             train_record_name_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}_record_name.csv", index=False)
             logger.info("Epoch %s train_psnr=%.6f", epoch + 1, train_psnr_meter.avg)
 
-            test_psnr, test_df, test_record_name_df = evaluate(args.model_name, model, test_loader, device)
+            test_psnr, test_df, test_record_name_df = evaluate(args, model, test_loader, device)
             test_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}.csv", index=False)
             test_record_name_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}_record_name.csv", index=False)
             logger.info("Epoch %s test_psnr=%.6f", epoch + 1, test_psnr)
@@ -365,7 +420,7 @@ def train(
                 best_psnr = test_psnr
                 save_checkpoint(checkpoints_dir / "best.pth", model, optimizer, epoch, best_psnr)
                 logger.info("New Best PSNR - Epoch %s test_psnr=%.6f", epoch + 1, test_psnr)
-                            
+
         save_checkpoint(checkpoints_dir / f"epoch_{epoch + 1}.pth", model, optimizer, epoch, best_psnr)
         save_checkpoint(checkpoints_dir / "latest.pth", model, optimizer, epoch, best_psnr)
 
@@ -403,6 +458,12 @@ def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.Argument
     parser.add_argument("--output-dir", default=config_defaults.get("output_dir"), type=str, help="Output directory for checkpoints and logs.")
     parser.add_argument("--only-fps", default=config_defaults.get("only_fps", 60), type=int, help="Use CSV entries for this FPS only.")
     parser.add_argument("--input-fps", default=config_defaults.get("input_fps", 30), type=int, help="Input frame rate for the dataset loader.")
+    parser.add_argument(
+        "--flow-approx-method",
+        default=config_defaults.get("flow_approx_method", "combination"),
+        choices=FLOW_APPROX_METHODS,
+        help="How to approximate middle-frame flows from 30fps motion vectors.",
+    )
     return parser
 
 
@@ -417,15 +478,35 @@ def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def prepare_args(args: argparse.Namespace) -> argparse.Namespace:
-    return args
+def log_run_summary(
+    args: argparse.Namespace,
+    train_dataset: Any,
+    test_dataset: Any,
+    training_state: TrainingState,
+    device: Any,
+    logger: logging.Logger,
+) -> None:
+    logger.info(
+        "model=%s mode=%s dataset_class=%s device=%s output_dir=%s dataset_root_dir=%s train_samples=%s test_samples=%s start_epoch=%s epochs=%s batch_size=%s",
+        args.model_name,
+        training_state.mode,
+        resolve_dataset_class_name(args.model_name),
+        device,
+        args.output_dir,
+        args.dataset_root_dir,
+        len(train_dataset),
+        len(test_dataset),
+        training_state.start_epoch,
+        args.epochs,
+        args.batch_size,
+    )
 
 
 def load_training_state(
     args: argparse.Namespace,
     model: Any,
     optimizer: Any,
-    device: torch.device,
+    device: Any,
     logger: logging.Logger,
 ) -> TrainingState:
     import torch
@@ -465,31 +546,8 @@ def load_training_state(
     )
 
 
-def log_run_summary(
-    args: argparse.Namespace,
-    train_dataset: Any,
-    test_dataset: Any,
-    training_state: TrainingState,
-    device: Any,
-    logger: logging.Logger,
-) -> None:
-    logger.info(
-        "model=%s mode=%s device=%s output_dir=%s dataset_root_dir=%s train_samples=%s test_samples=%s start_epoch=%s epochs=%s batch_size=%s",
-        args.model_name,
-        training_state.mode,
-        device,
-        args.output_dir,
-        args.dataset_root_dir,
-        len(train_dataset),
-        len(test_dataset),
-        training_state.start_epoch,
-        args.epochs,
-        args.batch_size,
-    )
-
-
 def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
-    return {
+    summary: dict[str, object] = {
         "mode": args.mode,
         "model_name": args.model_name,
         "train_preset": args.train_preset,
@@ -505,15 +563,19 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
         "eval_interval": args.eval_interval,
         "input_fps": args.input_fps,
         "only_fps": args.only_fps,
+        "dataset_class": resolve_dataset_class_name(args.model_name),
     }
+
+    if uses_flow_approx_model(args.model_name):
+        summary["flow_approx_method"] = args.flow_approx_method
+
+    return summary
 
 
 def run_training(args: argparse.Namespace) -> None:
     import torch
     import torch.optim as optim
     from torch.utils.data import DataLoader
-
-    from src.data.dataset_loader import VFITrainDataset
 
     output_dir = Path(args.output_dir)
     checkpoints_dir = output_dir / "checkpoints"
@@ -524,6 +586,8 @@ def run_training(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("device=%s", device)
+    if uses_flow_approx_model(args.model_name):
+        logger.info("flow_approx_method=%s", args.flow_approx_method)
 
     root_dir = Path(args.root_dir)
     train_df = build_merged_dataframe(root_dir, checkpoints_dir, args.train_preset, args.only_fps, logger)
@@ -536,13 +600,8 @@ def run_training(args: argparse.Namespace) -> None:
         logger.info("Valid Count %s in %s", test_df["valid"].value_counts().to_dict(), args.test_preset)
         test_df = test_df[test_df["valid"] == True]
 
-    # temporary code for quick testing
-    # train_df = train_df[:100]
-    # test_df = test_df.sample(frac=1, random_state=args.seed).reset_index(drop=True)  # shuffle test_df for more representative quick tests
-    # test_df = test_df[:10]
-
-    train_dataset = VFITrainDataset(train_df, args.dataset_root_dir, True, args.input_fps)
-    test_dataset = VFITrainDataset(test_df, args.dataset_root_dir, False, args.input_fps)
+    train_dataset = build_training_dataset(train_df, args.dataset_root_dir, True, args.input_fps, args.model_name)
+    test_dataset = build_training_dataset(test_df, args.dataset_root_dir, False, args.input_fps, args.model_name)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
@@ -569,7 +628,6 @@ def run_training(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_train_args(argv)
-    args = prepare_args(args)
 
     if args.mode == "dry-run":
         print(json.dumps(build_dry_run_summary(args), indent=2))

@@ -1,6 +1,6 @@
 {
   "mode": "train",
-  "model_name": "IFRNet_Residual",
+  "model_name": "IFRNet_Residual_FlowApprox",
   "root_dir": "data/",
   "dataset_root_dir": "/workspace/datasets/",
   "train_preset": "train_vfx_0416",
