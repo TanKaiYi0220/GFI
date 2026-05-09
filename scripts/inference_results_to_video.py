@@ -256,7 +256,9 @@ def main(argv: list[str] | None = None) -> None:
     if len(dataframe) == 0:
         raise RuntimeError("No samples matched the current filters.")
 
-    model = resolve_model_class(model_name)().to(device)
+    model_class = resolve_model_class(args.model_name)
+    model_init_args = dict(getattr(args, "model_init_args", {}))
+    model = model_class(**model_init_args).to(device)
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     model.load_state_dict(state_dict)

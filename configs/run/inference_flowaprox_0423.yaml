@@ -1,6 +1,9 @@
 {
   "mode": "infer",
   "model_name": "IFRNet_Residual_FlowApprox",
+    "model_init_args": {
+        "init_flow_layer": 4
+  },
   "root_dir": "data/",
   "dataset_root_dir": "/workspace/datasets/",
   "inference_preset": "test_vfx_0416",

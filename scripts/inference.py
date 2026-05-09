@@ -405,7 +405,9 @@ def main(argv: list[str] | None = None) -> None:
     dataframe = build_merged_dataframe(root_dir, output_dir, inference_preset, only_fps, logger)
     if "valid" in dataframe.columns:
         dataframe = dataframe[dataframe["valid"] == True].reset_index(drop=True)
-    model = resolve_model_class(model_name)().to(device)
+    model_class = resolve_model_class(args.model_name)
+    model_init_args = dict(getattr(args, "model_init_args", {}))
+    model = model_class(**model_init_args).to(device)
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     # print("Load Pretrained Weights from IFRNet_Vimeo90K.pth as Baseline")

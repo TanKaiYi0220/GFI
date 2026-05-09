@@ -1,6 +1,9 @@
 {
   "mode": "train",
-  "model_name": "IFRNet_Residual",
+  "model_name": "IFRNet_Residual_FlowApprox",
+    "model_init_args": {
+        "init_flow_layer": 4
+  },
   "root_dir": "data/",
   "dataset_root_dir": "/workspace/datasets/",
   "train_preset": "train_vfx_0416",
@@ -11,10 +14,9 @@
   "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 16,
-  "output_dir": "outputs/IFRNet_FlowApprox_0416/",
+  "output_dir": "outputs/IFRNet_Residual_FlowApprox_0416/",
   "only_fps": 60,
   "input_fps": 30,
-  "resume_path": "outputs/IFRNet_FlowApprox_0416/checkpoints/epoch_21.pth",
-  "pretrained_checkpoint_path": "src/models/external/IFRNet/checkpoints/IFRNet/IFRNet_Vimeo90K.pth",
+  "resume_path": "outputs/IFRNet_Residual_FlowApprox_0416/checkpoints/epoch_21.pth",
   "flow_approx_method": "combination"
 }

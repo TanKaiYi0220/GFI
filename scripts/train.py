@@ -548,7 +548,8 @@ def run_training(args: argparse.Namespace) -> None:
 
     args.iters_per_epoch = len(train_loader)
     model_class = resolve_model_class(args.model_name)
-    model = model_class().to(device)
+    model_init_args = dict(getattr(args, "model_init_args", {}))
+    model = model_class(**model_init_args).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr_start, weight_decay=0)
     training_state = load_training_state(args, model, optimizer, device, logger)
 
