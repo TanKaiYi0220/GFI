@@ -381,6 +381,10 @@ def train(
     for epoch in range(training_state.start_epoch, args.epochs):
         model.train()
         train_psnr_meter = AverageMeter()
+        train_loss_total_meter = AverageMeter()
+        train_loss_rec_meter = AverageMeter()
+        train_loss_geo_meter = AverageMeter()
+        train_loss_dis_meter = AverageMeter()
         train_records: list[dict[str, object]] = []
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
 
@@ -394,8 +398,20 @@ def train(
             total_loss.backward()
             optimizer.step()
 
+            batch_size = int(batch_output.imgt.shape[0])
+            train_loss_total_meter.update(float(total_loss.detach().cpu()), batch_size)
+            train_loss_rec_meter.update(float(batch_output.loss_rec.detach().cpu()), batch_size)
+            train_loss_geo_meter.update(float(batch_output.loss_geo.detach().cpu()), batch_size)
+            train_loss_dis_meter.update(float(batch_output.loss_dis.detach().cpu()), batch_size)
+
             global_step += 1
-            pbar.set_postfix({"train_loss": f"{float(total_loss.detach().cpu()):.6f}", "lr": f"{lr:.6f}"})
+            pbar.set_postfix(
+                {
+                    "train_loss": f"{float(total_loss.detach().cpu()):.6f}",
+                    "avg_train_loss": f"{train_loss_total_meter.avg:.6f}",
+                    "lr": f"{lr:.6f}",
+                }
+            )
             if (epoch + 1) % args.eval_interval != 0:
                 continue
 
@@ -419,8 +435,26 @@ def train(
             train_record_name_df = build_record_name_summary(train_df)
             train_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}.csv", index=False)
             train_record_name_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}_record_name.csv", index=False)
-            logger.info("Epoch %s train_psnr=%.6f", epoch + 1, train_psnr_meter.avg)
+            logger.info(
+                "Epoch %s train_loss_total=%.6f train_loss_rec=%.6f train_loss_geo=%.6f train_loss_dis=%.6f train_psnr=%.6f",
+                epoch + 1,
+                train_loss_total_meter.avg,
+                train_loss_rec_meter.avg,
+                train_loss_geo_meter.avg,
+                train_loss_dis_meter.avg,
+                train_psnr_meter.avg,
+            )
+        else:
+            logger.info(
+                "Epoch %s train_loss_total=%.6f train_loss_rec=%.6f train_loss_geo=%.6f train_loss_dis=%.6f",
+                epoch + 1,
+                train_loss_total_meter.avg,
+                train_loss_rec_meter.avg,
+                train_loss_geo_meter.avg,
+                train_loss_dis_meter.avg,
+            )
 
+        if (epoch + 1) % args.eval_interval == 0:
             test_psnr, test_df, test_record_name_df = evaluate(args, model, test_loader, device)
             test_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}.csv", index=False)
             test_record_name_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}_record_name.csv", index=False)
