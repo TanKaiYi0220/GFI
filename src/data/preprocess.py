@@ -12,11 +12,15 @@ from src.data.dataset import DatasetSample
 from src.data.dataset_config import DatasetConfig
 from src.data.image_ops import identical_images
 from src.data.image_ops import load_backward_velocity
+from src.data.image_ops import load_exr
 from src.data.image_ops import load_png
 
 FRAME_GLOB_PATTERN: str = "colorNoScreenUI_*.exr"
 IMAGE_NAME_TEMPLATE: str = "colorNoScreenUI_{frame_idx}.png"
+COLOR_EXR_TEMPLATE: str = "colorNoScreenUI_{frame_idx}.exr"
 BACKWARD_VELOCITY_TEMPLATE: str = "backwardVel_Depth_{frame_idx}.exr"
+FORWARD_VELOCITY_TEMPLATE: str = "forwardVel_Depth_{frame_idx}.exr"
+NON_FINITE_REASON_PREFIX: str = "Non-finite EXR values"
 
 
 def rewrite_sample_root(samples: list[DatasetSample], source_root: Path, target_root: Path) -> list[DatasetSample]:
@@ -73,6 +77,74 @@ def build_frame_index_for_mode(root_dir: Path, record: str, mode: str) -> Any:
         dataframe["reason"] = dataframe["reason"].astype(str)
 
     return dataframe
+
+
+def normalize_reason_column(dataframe: Any) -> Any:
+    """Ensure the reason column is always present and string-typed."""
+    if "reason" not in dataframe.columns:
+        dataframe["reason"] = ""
+    else:
+        dataframe["reason"] = dataframe["reason"].fillna("").astype(str)
+
+    return dataframe
+
+
+def append_reason(existing_reason: str, new_reason: str) -> str:
+    """Append one reason without duplicating the same message."""
+    if existing_reason == "":
+        return new_reason
+    if new_reason in existing_reason:
+        return existing_reason
+
+    return f"{existing_reason}; {new_reason}"
+
+
+def build_exr_paths_for_frame(mode_dir: Path, frame_idx: int) -> dict[str, Path]:
+    """Build one EXR path mapping for the frame modalities checked during preprocessing."""
+    return {
+        "colorNoScreenUI": mode_dir / COLOR_EXR_TEMPLATE.format(frame_idx=frame_idx),
+        "backwardVel_Depth": mode_dir / BACKWARD_VELOCITY_TEMPLATE.format(frame_idx=frame_idx),
+        "forwardVel_Depth": mode_dir / FORWARD_VELOCITY_TEMPLATE.format(frame_idx=frame_idx),
+    }
+
+
+def find_non_finite_exr_modalities(mode_dir: Path, frame_idx: int) -> list[str]:
+    """Return modality names whose EXR content contains NaN or Inf values."""
+    invalid_modalities: list[str] = []
+    exr_paths = build_exr_paths_for_frame(mode_dir, frame_idx)
+
+    for modality_name, exr_path in exr_paths.items():
+        exr_data = load_exr(exr_path)
+        if not np.isfinite(exr_data).all():
+            invalid_modalities.append(modality_name)
+
+    return invalid_modalities
+
+
+def mark_non_finite_frames_invalid(raw_df: Any, root_dir: Path) -> Any:
+    """Mark frames invalid when any required EXR modality contains NaN or Inf values."""
+    raw_df = normalize_reason_column(raw_df)
+    invalid_count = 0
+    progress_desc = "check_non_finite_exr"
+    if len(raw_df) > 0:
+        progress_desc = f"{raw_df.iloc[0]['record']}:{raw_df.iloc[0]['mode']}"
+    progress = tqdm(range(len(raw_df)), desc=progress_desc)
+
+    for row_index in progress:
+        row = raw_df.iloc[row_index]
+        frame_idx = int(row["frame_idx"])
+        mode_dir = root_dir / str(row["record"]) / str(row["mode"])
+        invalid_modalities = find_non_finite_exr_modalities(mode_dir, frame_idx)
+
+        if len(invalid_modalities) > 0:
+            reason = f"{NON_FINITE_REASON_PREFIX}: {', '.join(invalid_modalities)}"
+            raw_df.at[row_index, "is_valid"] = False
+            raw_df.at[row_index, "reason"] = append_reason(str(raw_df.at[row_index, "reason"]), reason)
+            invalid_count += 1
+
+        progress.set_postfix({"current_frame": frame_idx, "invalid_count": invalid_count})
+
+    return raw_df
 
 
 def remove_identical_frames(raw_df: Any, root_dir: Path) -> Any:
@@ -198,6 +270,10 @@ def apply_linearity_check(raw_seq_df: Any, root_dir: Path, dataset_config: Datas
     progress = tqdm(range(len(raw_seq_df)))
     for row_index in progress:
         row = raw_seq_df.iloc[row_index]
+        if not bool(row["valid"]):
+            progress.set_postfix({"skipped_invalid": row_index + 1, "invalid_count": invalid_count})
+            continue
+
         img_1_idx = int(row["img1"])
         img_2_idx = int(row["img2"])
 

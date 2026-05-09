@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -19,6 +20,7 @@ MOTION_CSV_PATH: Path = ANALYSIS_OUTPUT_DIR / "motion_by_sample.csv"
 FLOW_CSV_PATH: Path = ANALYSIS_OUTPUT_DIR / "flow_approx_by_sample.csv"
 PLOT_OUTPUT_DIR: Path = ANALYSIS_OUTPUT_DIR / "plots"
 FLOW_METHOD_ORDER: tuple[str, ...] = ("single", "combination")
+TOKEN_SPLIT_PATTERN: re.Pattern[str] = re.compile(r"[/_]+")
 
 
 def require_file(csv_path: Path) -> None:
@@ -31,13 +33,77 @@ def load_dataframe(csv_path: Path) -> pd.DataFrame:
     return pd.read_csv(csv_path)
 
 
+def extract_record_components(record_name: str) -> tuple[str, int, int, int] | None:
+    tokens = [token for token in TOKEN_SPLIT_PATTERN.split(record_name) if token != ""]
+    if len(tokens) < 4:
+        return None
+
+    prefix = tokens[0]
+    numeric_tokens = [int(token) for token in tokens if token.isdigit()]
+    if len(numeric_tokens) < 3:
+        return None
+
+    group_a = numeric_tokens[0]
+    group_b = numeric_tokens[1]
+    sub_index = numeric_tokens[-2] if str(tokens[-2]).isdigit() and tokens[-1].isdigit() else numeric_tokens[-1]
+
+    if tokens[-1].isdigit():
+        sub_index = numeric_tokens[-2] if len(numeric_tokens) >= 2 else numeric_tokens[-1]
+
+    return prefix, group_a, group_b, sub_index
+
+
+def format_record_label(record_name: str) -> str:
+    components = extract_record_components(record_name)
+    if components is not None:
+        prefix, group_a, group_b, sub_index = components
+        return f"{prefix}_{group_a}_{group_b}_{sub_index}"
+
+    return record_name
+
+
+def build_label_sort_key(label: str) -> tuple[int, ...] | tuple[str]:
+    parts = label.split("_")
+    numeric_parts: list[int] = []
+
+    for part in parts:
+        if part.isdigit():
+            numeric_parts.append(int(part))
+            continue
+
+        if len(numeric_parts) == 0:
+            return (label,)
+
+    return tuple(numeric_parts)
+
+
+def build_record_sort_key(record_name: str) -> tuple[object, ...]:
+    components = extract_record_components(record_name)
+    if components is not None:
+        prefix, group_a, group_b, sub_index = components
+        return (prefix, group_a, group_b, sub_index)
+
+    return (format_record_label(record_name),)
+
+
 def build_record_order(motion_dataframe: pd.DataFrame) -> list[str]:
-    ordered = (
-        motion_dataframe.groupby("record_name", as_index=False)["motion_pooled_mean"]
-        .mean()
-        .sort_values("motion_pooled_mean", ascending=False)
-    )
-    return ordered["record_name"].astype(str).tolist()
+    record_names = motion_dataframe["record_name"].astype(str).drop_duplicates().tolist()
+    return sorted(record_names, key=build_record_sort_key)
+
+
+def build_label_dataframe(record_order: list[str]) -> pd.DataFrame:
+    label_rows: list[dict[str, object]] = []
+
+    for index, record_name in enumerate(record_order, start=1):
+        label_rows.append(
+            {
+                "plot_index": index,
+                "record_name": record_name,
+                "plot_label": format_record_label(record_name),
+            }
+        )
+
+    return pd.DataFrame(label_rows)
 
 
 def build_motion_summary(motion_dataframe: pd.DataFrame, record_order: list[str]) -> pd.DataFrame:
@@ -77,11 +143,15 @@ def save_dataframe(dataframe: pd.DataFrame, output_path: Path) -> None:
 
 def plot_motion_by_record(motion_summary: pd.DataFrame, output_dir: Path) -> None:
     figure, axis = plt.subplots(figsize=(12, 5))
-    axis.bar(motion_summary["record_name"].astype(str), motion_summary["motion_pooled_mean"], color="#4C72B0")
+    x_positions = list(range(len(motion_summary)))
+    labels = [format_record_label(record_name) for record_name in motion_summary["record_name"].astype(str).tolist()]
+    axis.bar(x_positions, motion_summary["motion_pooled_mean"], color="#4C72B0")
     axis.set_title("Motion Magnitude by Record")
     axis.set_xlabel("record_name")
     axis.set_ylabel("mean pooled motion magnitude")
-    axis.tick_params(axis="x", rotation=45)
+    axis.set_xticks(x_positions)
+    axis.set_xticklabels(labels, rotation=90, ha="center")
+    axis.tick_params(axis="x", labelsize=8)
     axis.grid(True, axis="y", alpha=0.3)
     figure.tight_layout()
     figure.savefig(output_dir / "motion_by_record.png", dpi=220)
@@ -98,6 +168,7 @@ def plot_grouped_metric_by_method(
 ) -> None:
     figure, axis = plt.subplots(figsize=(12, 5))
     x_positions = list(range(len(record_order)))
+    tick_labels = [format_record_label(record_name) for record_name in record_order]
     total_width = 0.72
     bar_width = total_width / len(FLOW_METHOD_ORDER)
     colors = {"single": "#55A868", "combination": "#C44E52"}
@@ -121,7 +192,8 @@ def plot_grouped_metric_by_method(
     axis.set_xlabel("record_name")
     axis.set_ylabel(y_label)
     axis.set_xticks(x_positions)
-    axis.set_xticklabels(record_order, rotation=45, ha="right")
+    axis.set_xticklabels(tick_labels, rotation=90, ha="center")
+    axis.tick_params(axis="x", labelsize=8)
     axis.grid(True, axis="y", alpha=0.3)
     axis.legend()
     figure.tight_layout()
@@ -167,11 +239,15 @@ def main() -> None:
 
     motion_dataframe = load_dataframe(MOTION_CSV_PATH)
     flow_dataframe = load_dataframe(FLOW_CSV_PATH)
+    flow_dataframe["warp_psnr_delta_mean_vs_gt60_abs"] = flow_dataframe["warp_psnr_delta_mean_vs_gt60"].abs()
 
     record_order = build_record_order(motion_dataframe)
+    label_dataframe = build_label_dataframe(record_order)
     motion_summary = build_motion_summary(motion_dataframe, record_order)
     flow_summary = build_flow_summary(flow_dataframe, record_order)
+    flow_summary["warp_psnr_delta_mean_vs_gt60_abs"] = flow_summary["warp_psnr_delta_mean_vs_gt60"].abs()
 
+    save_dataframe(label_dataframe, PLOT_OUTPUT_DIR / "record_name_label_map.csv")
     save_dataframe(motion_summary, PLOT_OUTPUT_DIR / "motion_summary_for_plot.csv")
     save_dataframe(flow_summary, PLOT_OUTPUT_DIR / "flow_summary_for_plot.csv")
 
@@ -187,10 +263,10 @@ def main() -> None:
     plot_grouped_metric_by_method(
         flow_summary=flow_summary,
         record_order=record_order,
-        metric_name="warp_psnr_delta_mean_vs_gt60",
-        title="Warped PSNR Delta vs 60fps Motion by Record",
-        y_label="mean PSNR delta",
-        output_path=PLOT_OUTPUT_DIR / "warp_psnr_delta_by_record.png",
+        metric_name="warp_psnr_delta_mean_vs_gt60_abs",
+        title="Absolute Warped PSNR Delta vs 60fps Motion by Record",
+        y_label="mean absolute PSNR delta",
+        output_path=PLOT_OUTPUT_DIR / "warp_psnr_delta_abs_by_record.png",
     )
     plot_scatter(
         dataframe=flow_dataframe,
@@ -204,11 +280,11 @@ def main() -> None:
     plot_scatter(
         dataframe=flow_dataframe,
         x_column="motion_pooled_mean",
-        y_column="warp_psnr_delta_mean_vs_gt60",
-        title="Motion Magnitude vs Warped PSNR Delta",
+        y_column="warp_psnr_delta_mean_vs_gt60_abs",
+        title="Motion Magnitude vs Absolute Warped PSNR Delta",
         x_label="pooled motion magnitude",
-        y_label="PSNR delta vs 60fps motion warp",
-        output_path=PLOT_OUTPUT_DIR / "scatter_motion_vs_warp_psnr_delta.png",
+        y_label="absolute PSNR delta vs 60fps motion warp",
+        output_path=PLOT_OUTPUT_DIR / "scatter_motion_vs_warp_psnr_delta_abs.png",
     )
 
 

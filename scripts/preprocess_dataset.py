@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+from typing import Any
 
 import pandas as pd
 
@@ -22,7 +23,9 @@ from src.data.preprocess import build_frame_index_for_mode
 from src.data.preprocess import build_preprocessed_csv_path
 from src.data.preprocess import build_raw_sequence_dataframe
 from src.data.preprocess import check_identical_images_cross_fps
+from src.data.preprocess import mark_non_finite_frames_invalid
 from src.data.preprocess import merge_easy_medium_dataframes
+from src.data.preprocess import normalize_reason_column
 from src.data.preprocess import remove_identical_frames
 from src.utils.io import ensure_directory
 
@@ -37,6 +40,7 @@ ONLY_FPS: int = 60
 
 DRY_RUN: bool = True
 REMOVE_IDENTICAL: bool = False
+CHECK_NON_FINITE_EXR: bool = True
 CHECK_IDENTICAL_CROSS_FPS: bool = False
 MANUAL_LABELING: bool = False
 MERGE_DATASETS: bool = True
@@ -78,12 +82,35 @@ def print_run_summary(
     print(f"only_fps={ONLY_FPS}")
 
 
+def load_or_build_frame_index_dataframe(dataset_root_dir: Path, data_dir: Path, dataset_config: DatasetConfig) -> Any:
+    frame_index_path = build_frame_index_csv_path(data_dir, dataset_config.record_name, dataset_config.mode_name)
+    if frame_index_path.is_file():
+        dataframe = pd.read_csv(frame_index_path, dtype={"reason": "string"})
+        dataframe = normalize_reason_column(dataframe)
+        return dataframe.sort_values(by="frame_idx").reset_index(drop=True)
+
+    dataframe = build_frame_index_for_mode(dataset_root_dir, dataset_config.record, dataset_config.mode_path)
+    dataframe = normalize_reason_column(dataframe)
+    return dataframe.sort_values(by="frame_idx").reset_index(drop=True)
+
+
 def run_remove_identical(dataset_root_dir: Path, data_dir: Path, dataset_configs: list[DatasetConfig]) -> None:
     for dataset_config in dataset_configs:
         print(f"Processing record={dataset_config.record_name} mode={dataset_config.mode_path}")
         raw_df = build_frame_index_for_mode(dataset_root_dir, dataset_config.record, dataset_config.mode_path)
         raw_df = raw_df.sort_values(by="frame_idx").reset_index(drop=True)
         raw_df = remove_identical_frames(raw_df, dataset_root_dir)
+        output_path = build_frame_index_csv_path(data_dir, dataset_config.record_name, dataset_config.mode_name)
+        ensure_directory(output_path.parent)
+        raw_df.to_csv(output_path, index=False)
+        print(output_path)
+
+
+def run_check_non_finite_exr(dataset_root_dir: Path, data_dir: Path, dataset_configs: list[DatasetConfig]) -> None:
+    for dataset_config in dataset_configs:
+        print(f"Checking EXR finite values record={dataset_config.record_name} mode={dataset_config.mode_path}")
+        raw_df = load_or_build_frame_index_dataframe(dataset_root_dir, data_dir, dataset_config)
+        raw_df = mark_non_finite_frames_invalid(raw_df, dataset_root_dir)
         output_path = build_frame_index_csv_path(data_dir, dataset_config.record_name, dataset_config.mode_name)
         ensure_directory(output_path.parent)
         raw_df.to_csv(output_path, index=False)
@@ -213,6 +240,9 @@ def main() -> None:
     if REMOVE_IDENTICAL:
         run_remove_identical(dataset_root_dir, data_dir, dataset_configs)
 
+    if CHECK_NON_FINITE_EXR:
+        run_check_non_finite_exr(dataset_root_dir, data_dir, dataset_configs)
+
     if CHECK_IDENTICAL_CROSS_FPS:
         run_check_cross_fps(dataset_root_dir, data_dir, dataset_configs)
 
@@ -237,6 +267,9 @@ def main() -> None:
 
     if REMOVE_IDENTICAL:
         run_remove_identical(dataset_root_dir, data_dir, dataset_configs)
+
+    if CHECK_NON_FINITE_EXR:
+        run_check_non_finite_exr(dataset_root_dir, data_dir, dataset_configs)
 
     if CHECK_IDENTICAL_CROSS_FPS:
         run_check_cross_fps(dataset_root_dir, data_dir, dataset_configs)

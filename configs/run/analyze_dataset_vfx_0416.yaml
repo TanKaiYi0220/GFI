@@ -1,5 +1,5 @@
 {
-  "mode": "dry-run",
+  "mode": "analyze",
   "root_dir": "data/",
   "dataset_root_dir": "/workspace/datasets/",
   "analysis_preset": "test_vfx_0416",
