@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
@@ -13,6 +14,8 @@ from skimage.metrics import peak_signal_noise_ratio as psnr
 
 IDENTICAL_PSNR_THRESHOLD: float = 48.0
 PNG_DATA_RANGE: float = 255.0
+IMAGE_LOAD_RETRY_COUNT: int = 5
+IMAGE_LOAD_RETRY_DELAY_SECONDS: float = 0.05
 
 
 def identical_images(image_a: np.ndarray, image_b: np.ndarray) -> bool:
@@ -42,11 +45,7 @@ def load_png(image_path: Path) -> np.ndarray:
     if not image_path.exists():
         convert_exr_to_png(image_path.with_suffix(".exr"), image_path)
 
-    image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
-    if image is None:
-        raise ValueError(f"Failed to load image: {image_path}")
-
-    return image
+    return retry_load_image(image_path, cv2.IMREAD_UNCHANGED, "image")
 
 
 def load_backward_velocity(velocity_path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -63,11 +62,7 @@ def load_backward_velocity(velocity_path: Path) -> tuple[np.ndarray, np.ndarray]
 
 def load_exr(image_path: Path) -> np.ndarray:
     """Load one EXR image as a float array."""
-    exr_image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
-    if exr_image is None:
-        raise ValueError(f"Failed to load EXR image: {image_path}")
-
-    return exr_image
+    return retry_load_image(image_path, cv2.IMREAD_UNCHANGED, "EXR image")
 
 
 def convert_exr_to_png(source_path: Path, target_path: Path) -> None:
@@ -83,6 +78,46 @@ def save_image(image_path: Path, image: np.ndarray) -> None:
     is_written = cv2.imwrite(str(image_path), image)
     if not is_written:
         raise ValueError(f"Failed to save image: {image_path}")
+
+
+def retry_load_image(image_path: Path, read_flag: int, image_kind: str) -> np.ndarray:
+    """Load one image with short retries for transient filesystem or decoder failures."""
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Missing {image_kind}: path={image_path}")
+
+    last_error: Exception | None = None
+    for attempt_index in range(IMAGE_LOAD_RETRY_COUNT):
+        try:
+            file_size = image_path.stat().st_size
+            if file_size == 0:
+                raise ValueError(f"Empty {image_kind} file: path={image_path}")
+
+            decoded_image = cv2.imread(str(image_path), read_flag)
+            if decoded_image is not None:
+                if not np.isfinite(decoded_image).all():
+                    nan_count = int(np.count_nonzero(np.isnan(decoded_image)))
+                    inf_count = int(np.count_nonzero(np.isinf(decoded_image)))
+                    last_error = ValueError(
+                        f"Loaded {image_kind} contains non-finite values: path={image_path}, "
+                        f"nan_count={nan_count}, inf_count={inf_count}"
+                    )
+                    continue
+                else:
+                    return decoded_image
+
+            last_error = ValueError(f"OpenCV returned None while loading {image_kind}: path={image_path}")
+        except OSError as error:
+            last_error = error
+
+        if attempt_index + 1 < IMAGE_LOAD_RETRY_COUNT:
+            time.sleep(IMAGE_LOAD_RETRY_DELAY_SECONDS)
+
+    file_size = image_path.stat().st_size if image_path.exists() else -1
+    raise ValueError(
+        f"Failed to load {image_kind}: path={image_path}, exists={image_path.exists()}, "
+        f"size_bytes={file_size}, attempts={IMAGE_LOAD_RETRY_COUNT}, last_error={last_error}"
+    )
+
 
 def make_colorwheel() -> np.ndarray:
     """Generate the classic Middlebury optical-flow color wheel."""
