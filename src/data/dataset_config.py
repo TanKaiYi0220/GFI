@@ -450,6 +450,39 @@ SMOKE_ARPG2_DUAL_PRESET: DatasetPreset = build_dataset_preset(
     },
 )
 
+TRAIN_MINOR_0507_DATASET_PRESET: DatasetPreset = build_dataset_preset(
+    name="Minor_0507_Train",
+    records={
+        "ARPG_3": make_record_config(
+            main_indices=("0", "1", "2"),
+            difficulties=("Easy", "Medium"),
+            sub_indices=("5", "5", "5"),
+            fps_values=(30, 60),
+            max_indices=(400, 800),
+        ),
+        "ARPG_2": make_record_config(
+            main_indices=("4",),
+            difficulties=("Easy", "Medium"),
+            sub_indices=("5",),
+            fps_values=(30, 60),
+            max_indices=(400, 800),
+        ),
+    },
+)
+
+TEST_MINOR_0507_DATASET_PRESET: DatasetPreset = build_dataset_preset(
+    name="Minor_0507_Test",
+    records={
+        "ARPG_3": make_record_config(
+            main_indices=("3"),
+            difficulties=("Easy", "Medium"),
+            sub_indices=("5"),
+            fps_values=(30, 60),
+            max_indices=(400, 800),
+        ),
+    },
+)
+
 DATASET_PRESETS: dict[str, DatasetPreset] = {
     "minor": MINOR_DATASET_PRESET,
     "full": FULL_DATASET_PRESET,
@@ -465,6 +498,8 @@ DATASET_PRESETS: dict[str, DatasetPreset] = {
     "train_vfx_0416": TRAIN_VFX_0416_DATASET_PRESET,
     "test_vfx_0416": TEST_VFX_0416_DATASET_PRESET,
     "smoke_arpg2_dual": SMOKE_ARPG2_DUAL_PRESET,
+    "train_minor_0507": TRAIN_MINOR_0507_DATASET_PRESET,
+    "test_minor_0507": TEST_MINOR_0507_DATASET_PRESET,
 }
 
 TRAIN_VFX_0416_DATASET_CONFIGS: DatasetPreset = TRAIN_VFX_0416_DATASET_PRESET

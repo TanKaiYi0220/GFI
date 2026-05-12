@@ -1,6 +1,9 @@
 {
   "mode": "export",
   "model_name": "IFRNet_Residual",
+    "model_init_args": {
+        "init_flow_layer": 4
+  },
   "inference_preset": "test_vfx_0416",
   "root_dir": "data/",
   "dataset_root_dir": "/workspace/datasets/",
