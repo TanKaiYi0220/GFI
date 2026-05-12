@@ -25,6 +25,9 @@ LINEARITY_REASON_COLUMN: str = "linearity_reason"
 LINEARITY_REASON_NO_VALID_RATIO: str = "No valid ratio pixels"
 LINEARITY_REASON_OUT_OF_RANGE: str = "Linearity ratio out of range"
 RATIO_DENOMINATOR_EPSILON: float = 1e-12
+COLOR_VALID_COLUMN: str = "is_valid_colorNoScreenUI"
+BACKWARD_VALID_COLUMN: str = "is_valid_backwardVel_Depth"
+FORWARD_VALID_COLUMN: str = "is_valid_forwardVel_Depth"
 
 
 def rewrite_sample_root(samples: list[DatasetSample], source_root: Path, target_root: Path) -> list[DatasetSample]:
@@ -73,14 +76,14 @@ def build_frame_index_for_mode(root_dir: Path, record: str, mode: str) -> Any:
                 "frame_idx": frame_idx,
                 "is_valid": True,
                 "reason": "",
+                COLOR_VALID_COLUMN: True,
+                BACKWARD_VALID_COLUMN: True,
+                FORWARD_VALID_COLUMN: True,
             },
         )
 
     dataframe = pd.DataFrame(rows)
-    if "reason" in dataframe.columns:
-        dataframe["reason"] = dataframe["reason"].astype(str)
-
-    return dataframe
+    return ensure_modality_validity_columns(dataframe)
 
 
 def normalize_reason_column(dataframe: Any) -> Any:
@@ -89,6 +92,36 @@ def normalize_reason_column(dataframe: Any) -> Any:
         dataframe["reason"] = ""
     else:
         dataframe["reason"] = dataframe["reason"].fillna("").astype(str)
+
+    return dataframe
+
+
+def ensure_modality_validity_columns(dataframe: Any) -> Any:
+    """Ensure modality-specific validity columns exist and recover legacy invalid reasons when possible."""
+    dataframe = normalize_reason_column(dataframe)
+
+    if COLOR_VALID_COLUMN not in dataframe.columns:
+        dataframe[COLOR_VALID_COLUMN] = True
+    if BACKWARD_VALID_COLUMN not in dataframe.columns:
+        dataframe[BACKWARD_VALID_COLUMN] = True
+    if FORWARD_VALID_COLUMN not in dataframe.columns:
+        dataframe[FORWARD_VALID_COLUMN] = True
+
+    dataframe[COLOR_VALID_COLUMN] = dataframe[COLOR_VALID_COLUMN].fillna(True).astype(bool)
+    dataframe[BACKWARD_VALID_COLUMN] = dataframe[BACKWARD_VALID_COLUMN].fillna(True).astype(bool)
+    dataframe[FORWARD_VALID_COLUMN] = dataframe[FORWARD_VALID_COLUMN].fillna(True).astype(bool)
+
+    for row_index in range(len(dataframe)):
+        reason = str(dataframe.at[row_index, "reason"])
+        if NON_FINITE_REASON_PREFIX in reason:
+            if "colorNoScreenUI" in reason:
+                dataframe.at[row_index, COLOR_VALID_COLUMN] = False
+            if "backwardVel_Depth" in reason:
+                dataframe.at[row_index, BACKWARD_VALID_COLUMN] = False
+            if "forwardVel_Depth" in reason:
+                dataframe.at[row_index, FORWARD_VALID_COLUMN] = False
+        if "Identical to previous frame" in reason:
+            dataframe.at[row_index, COLOR_VALID_COLUMN] = False
 
     return dataframe
 
@@ -106,28 +139,33 @@ def append_reason(existing_reason: str, new_reason: str) -> str:
 def build_exr_paths_for_frame(mode_dir: Path, frame_idx: int) -> dict[str, Path]:
     """Build one EXR path mapping for the frame modalities checked during preprocessing."""
     return {
-        "colorNoScreenUI": mode_dir / COLOR_EXR_TEMPLATE.format(frame_idx=frame_idx),
-        "backwardVel_Depth": mode_dir / BACKWARD_VELOCITY_TEMPLATE.format(frame_idx=frame_idx),
-        "forwardVel_Depth": mode_dir / FORWARD_VELOCITY_TEMPLATE.format(frame_idx=frame_idx),
+        COLOR_VALID_COLUMN: mode_dir / COLOR_EXR_TEMPLATE.format(frame_idx=frame_idx),
+        BACKWARD_VALID_COLUMN: mode_dir / BACKWARD_VELOCITY_TEMPLATE.format(frame_idx=frame_idx),
+        FORWARD_VALID_COLUMN: mode_dir / FORWARD_VELOCITY_TEMPLATE.format(frame_idx=frame_idx),
     }
 
 
-def find_non_finite_exr_modalities(mode_dir: Path, frame_idx: int) -> list[str]:
-    """Return modality names whose EXR content contains NaN or Inf values."""
-    invalid_modalities: list[str] = []
+def find_non_finite_exr_modalities(mode_dir: Path, frame_idx: int) -> list[tuple[str, str]]:
+    """Return modality columns and display names whose EXR content contains NaN or Inf values."""
+    invalid_modalities: list[tuple[str, str]] = []
     exr_paths = build_exr_paths_for_frame(mode_dir, frame_idx)
+    display_names = {
+        COLOR_VALID_COLUMN: "colorNoScreenUI",
+        BACKWARD_VALID_COLUMN: "backwardVel_Depth",
+        FORWARD_VALID_COLUMN: "forwardVel_Depth",
+    }
 
-    for modality_name, exr_path in exr_paths.items():
+    for modality_column, exr_path in exr_paths.items():
         exr_data = load_exr(exr_path)
         if not np.isfinite(exr_data).all():
-            invalid_modalities.append(modality_name)
+            invalid_modalities.append((modality_column, display_names[modality_column]))
 
     return invalid_modalities
 
 
 def mark_non_finite_frames_invalid(raw_df: Any, root_dir: Path) -> Any:
     """Mark frames invalid when any required EXR modality contains NaN or Inf values."""
-    raw_df = normalize_reason_column(raw_df)
+    raw_df = ensure_modality_validity_columns(raw_df)
     invalid_count = 0
     progress_desc = "check_non_finite_exr"
     if len(raw_df) > 0:
@@ -141,7 +179,9 @@ def mark_non_finite_frames_invalid(raw_df: Any, root_dir: Path) -> Any:
         invalid_modalities = find_non_finite_exr_modalities(mode_dir, frame_idx)
 
         if len(invalid_modalities) > 0:
-            reason = f"{NON_FINITE_REASON_PREFIX}: {', '.join(invalid_modalities)}"
+            for modality_column, _display_name in invalid_modalities:
+                raw_df.at[row_index, modality_column] = False
+            reason = f"{NON_FINITE_REASON_PREFIX}: {', '.join(display_name for _, display_name in invalid_modalities)}"
             raw_df.at[row_index, "is_valid"] = False
             raw_df.at[row_index, "reason"] = append_reason(str(raw_df.at[row_index, "reason"]), reason)
             invalid_count += 1
@@ -153,6 +193,7 @@ def mark_non_finite_frames_invalid(raw_df: Any, root_dir: Path) -> Any:
 
 def remove_identical_frames(raw_df: Any, root_dir: Path) -> Any:
     """Mark frames as invalid when they are identical to the previous frame."""
+    raw_df = ensure_modality_validity_columns(raw_df)
     invalid_count = 0
     progress = tqdm(range(1, len(raw_df)))
     for row_index in progress:
@@ -170,6 +211,7 @@ def remove_identical_frames(raw_df: Any, root_dir: Path) -> Any:
 
         if identical_images(img1, img2):
             raw_df.at[row_index, "is_valid"] = False
+            raw_df.at[row_index, COLOR_VALID_COLUMN] = False
             raw_df.at[row_index, "reason"] = "Identical to previous frame"
             invalid_count += 1
 
@@ -254,11 +296,17 @@ def build_difficult_only_dataframe(dataframe: Any) -> Any:
 
 def build_raw_sequence_dataframe(df_30: Any, df_60: Any, dataset_config: DatasetConfig) -> Any:
     """Build one raw sequence dataframe from preprocessed 30fps and 60fps frame flags."""
+    df_30 = ensure_modality_validity_columns(df_30)
+    df_60 = ensure_modality_validity_columns(df_60)
     rows: list[dict[str, object]] = []
     for frame_idx in range(0, dataset_config.max_index - 1, 2):
-        fps_30_img_2_flag = df_30.at[frame_idx // 2 + 1, "global_is_valid"]
-        fps_60_img_1_flag = df_60.at[frame_idx + 1, "global_is_valid"]
-        fps_60_img_2_flag = df_60.at[frame_idx + 2, "global_is_valid"]
+        fps_30_forward_flag = bool(df_30.at[frame_idx // 2, FORWARD_VALID_COLUMN])
+        fps_30_backward_flag = bool(df_30.at[frame_idx // 2 + 1, BACKWARD_VALID_COLUMN])
+        fps_60_img_0_flag = bool(df_60.at[frame_idx, COLOR_VALID_COLUMN])
+        fps_60_img_1_flag = bool(df_60.at[frame_idx + 1, COLOR_VALID_COLUMN])
+        fps_60_img_2_flag = bool(df_60.at[frame_idx + 2, COLOR_VALID_COLUMN])
+        fps_60_backward_flag = bool(df_60.at[frame_idx + 1, BACKWARD_VALID_COLUMN])
+        fps_60_forward_flag = bool(df_60.at[frame_idx + 1, FORWARD_VALID_COLUMN])
         rows.append(
             {
                 "record": dataset_config.record,
@@ -266,7 +314,15 @@ def build_raw_sequence_dataframe(df_30: Any, df_60: Any, dataset_config: Dataset
                 "img0": frame_idx,
                 "img1": frame_idx + 1,
                 "img2": frame_idx + 2,
-                "valid": bool(fps_30_img_2_flag and fps_60_img_1_flag and fps_60_img_2_flag),
+                "valid": bool(
+                    fps_30_forward_flag
+                    and fps_30_backward_flag
+                    and fps_60_img_0_flag
+                    and fps_60_img_1_flag
+                    and fps_60_img_2_flag
+                    and fps_60_backward_flag
+                    and fps_60_forward_flag
+                ),
             },
         )
 

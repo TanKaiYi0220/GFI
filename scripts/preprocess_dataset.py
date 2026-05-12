@@ -23,9 +23,9 @@ from src.data.preprocess import build_frame_index_for_mode
 from src.data.preprocess import build_preprocessed_csv_path
 from src.data.preprocess import build_raw_sequence_dataframe
 from src.data.preprocess import check_identical_images_cross_fps
+from src.data.preprocess import ensure_modality_validity_columns
 from src.data.preprocess import mark_non_finite_frames_invalid
 from src.data.preprocess import merge_easy_medium_dataframes
-from src.data.preprocess import normalize_reason_column
 from src.data.preprocess import remove_identical_frames
 from src.utils.io import ensure_directory
 
@@ -86,11 +86,11 @@ def load_or_build_frame_index_dataframe(dataset_root_dir: Path, data_dir: Path, 
     frame_index_path = build_frame_index_csv_path(data_dir, dataset_config.record_name, dataset_config.mode_name)
     if frame_index_path.is_file():
         dataframe = pd.read_csv(frame_index_path, dtype={"reason": "string"})
-        dataframe = normalize_reason_column(dataframe)
+        dataframe = ensure_modality_validity_columns(dataframe)
         return dataframe.sort_values(by="frame_idx").reset_index(drop=True)
 
     dataframe = build_frame_index_for_mode(dataset_root_dir, dataset_config.record, dataset_config.mode_path)
-    dataframe = normalize_reason_column(dataframe)
+    dataframe = ensure_modality_validity_columns(dataframe)
     return dataframe.sort_values(by="frame_idx").reset_index(drop=True)
 
 
