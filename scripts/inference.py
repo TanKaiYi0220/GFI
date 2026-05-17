@@ -16,6 +16,7 @@ from scripts.train import resolve_model_class
 from scripts.train import set_seed
 from src.engine.flow_approx import build_flow_init
 from src.engine.flow_approx import FLOW_APPROX_METHODS
+from src.models.external.IFRNet.utils import warp
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
 
@@ -399,8 +400,6 @@ def main(argv: list[str] | None = None) -> None:
     from src.data.image_ops import save_image
     from src.engine.evaluation import AverageMeter
     from src.engine.evaluation import calculate_psnr
-    from src.models.external.IFRNet.utils import warp
-
     logger = build_logger("scripts.inference")
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

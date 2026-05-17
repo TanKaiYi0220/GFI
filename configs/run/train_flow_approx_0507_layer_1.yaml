@@ -1,20 +1,21 @@
 {
   "mode": "train",
-  "model_name": "IFRNet_Residual",
-  "model_init_args": {
-    "init_flow_layer": 1
+  "model_name": "IFRNet_Residual_FlowApprox",
+    "model_init_args": {
+        "init_flow_layer": 1
   },
   "root_dir": "data/Minor_0507/",
   "dataset_root_dir": "/workspace/datasets/Minor_0507/",
   "train_preset": "train_minor_0507",
   "test_preset": "test_minor_0507",
   "epochs": 50,
-  "eval_interval": 5,
+  "eval_interval": 1,
   "lr_start": 2e-5,
   "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 16,
-  "output_dir": "outputs/IFRNet_Residual_0507/",
+  "output_dir": "outputs/IFRNet_Residual_FlowApprox_Layer_1_Minor_0507/",
   "only_fps": 60,
-  "input_fps": 30
+  "input_fps": 30,
+  "flow_approx_method": "combination"
 }

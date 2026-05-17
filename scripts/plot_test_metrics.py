@@ -40,7 +40,8 @@ def normalize_metric_series(series: pd.Series, csv_path: Path, metric_name: str)
 
 
 def collect_metric_rows(checkpoints_dir: Path, glob_pattern: str, epoch_pattern: re.Pattern[str]) -> list[dict[str, float]]:
-    csv_paths = sorted(checkpoints_dir.glob(glob_pattern), key=lambda path: extract_epoch(path, epoch_pattern))
+    csv_paths = [path for path in checkpoints_dir.glob(glob_pattern) if epoch_pattern.match(path.name) is not None]
+    csv_paths.sort(key=lambda path: extract_epoch(path, epoch_pattern))
     if len(csv_paths) == 0:
         raise FileNotFoundError(f"No {glob_pattern} found in {checkpoints_dir}")
 
