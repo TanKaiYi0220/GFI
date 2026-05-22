@@ -275,13 +275,25 @@ def build_training_dataset(
 def select_sample_rows(dataframe: Any, frame_keys: list[str]) -> Any:
     indices: list[int] = []
     for frame_key in frame_keys:
-        parts = frame_key.rsplit("_", 3)
-        if len(parts) != 4:
-            raise ValueError(f"sample frame key must look like ARPG_2_4_2_052, got {frame_key}")
-        record, main_index, sub_index, frame_text = parts
-        matches = dataframe[(dataframe["record"] == record) & dataframe["mode"].str.startswith(f"{main_index}_") & dataframe["mode"].str.contains(f"_{sub_index}/fps_", regex=False) & (dataframe["img1"].astype(int) == int(frame_text))]
+        parts = frame_key.split("_")
+        if len(parts) != 6 or parts[0] != "ARPG":
+            raise ValueError(f"sample frame key must look like ARPG_3_0_Medium_5_0404, got {frame_key}")
+        record, main_index, difficulty, sub_index, frame_text = f"{parts[0]}_{parts[1]}", parts[2], parts[3], parts[4], parts[5]
+        if difficulty not in ("Easy", "Medium", "Difficult"):
+            raise ValueError(f"sample frame key difficulty must be Easy, Medium, or Difficult, got {frame_key}")
+        base_matches = dataframe[(dataframe["record"] == record) & dataframe["mode"].str.startswith(f"{main_index}_") & dataframe["mode"].str.contains(f"_{sub_index}/fps_", regex=False)]
+        base_matches = base_matches[base_matches["mode"].str.startswith(f"{main_index}_{difficulty}/")]
+        matches = base_matches[base_matches["img0"].astype(int) == int(frame_text)]
+        matches = matches.drop_duplicates(subset=["record", "mode", "img0", "img1", "img2"])
         if len(matches) != 1:
-            raise RuntimeError(f"Expected exactly one row for sample frame {frame_key}, got {len(matches)}")
+            mode_preview = dataframe[
+                (dataframe["record"] == record)
+                & dataframe["mode"].str.startswith(f"{main_index}_")
+                & dataframe["mode"].str.contains(f"_{sub_index}/fps_", regex=False)
+                & (dataframe["img0"].astype(int) == int(frame_text))
+            ][["record", "mode", "img0", "img1", "img2"]].drop_duplicates().head(10).to_dict("records")
+            preview = matches[["record", "mode", "img0", "img1", "img2"]].head(5).to_dict("records")
+            raise RuntimeError(f"Expected exactly one row for sample frame {frame_key}, got {len(matches)} after matching img0. candidates={preview}, available_without_difficulty={mode_preview}")
         indices.append(int(matches.index[0]))
     return dataframe.loc[indices].reset_index(drop=True)
 
