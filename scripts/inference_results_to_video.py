@@ -19,11 +19,40 @@ from scripts.train import set_seed
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
 
+VIDEO_CONFIG_KEYS: tuple[str, ...] = (
+    "output_dir",
+    "fps",
+    "ignore_valid",
+    "record_filter",
+    "mode_filter",
+    "export_grid",
+    "tile_scale",
+    "pad",
+    "export_all",
+    "export_vfi60",
+    "single_files",
+)
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run inference and export videos directly without saving images.")
-    parser.add_argument("--config", required=True, type=str, help="Path to one inference video config file.")
+    parser.add_argument("--config", required=True, type=str, help="Path to one shared inference config file.")
     return parser.parse_args(argv)
+
+
+def read_video_config(config: dict[str, Any]) -> dict[str, Any]:
+    raw_video_config = config.get("video")
+    if raw_video_config is None:
+        raise KeyError("Missing required config section: video")
+    if not isinstance(raw_video_config, dict):
+        raise TypeError(f"video must be a mapping, got {type(raw_video_config).__name__}")
+
+    missing_keys = [key for key in VIDEO_CONFIG_KEYS if key not in raw_video_config]
+    if len(missing_keys) > 0:
+        missing_key_names = ", ".join(missing_keys)
+        raise KeyError(f"video config missing required keys: {missing_key_names}")
+
+    return dict(raw_video_config)
 
 
 def make_even_size(height: int, width: int) -> tuple[int, int]:
@@ -173,6 +202,7 @@ def main(argv: list[str] | None = None) -> None:
         config_path = PROJECT_ROOT / config_path
 
     config = load_yaml_file(config_path)
+    video_config = read_video_config(config)
     mode = str(config["mode"])
     model_name = str(config["model_name"])
     model_init_args = read_model_init_args(config)
@@ -183,16 +213,16 @@ def main(argv: list[str] | None = None) -> None:
     batch_size = int(config.get("batch_size", 1))
     only_fps = int(config["only_fps"])
     input_fps = int(config["input_fps"])
-    fps = int(config.get("fps", 60))
-    export_grid = bool(config.get("export_grid", False))
-    tile_scale = float(config.get("tile_scale", 0.5))
-    pad = int(config.get("pad", 8))
-    export_all = bool(config.get("export_all", False))
-    export_vfi60 = bool(config.get("export_vfi60", True))
-    ignore_valid = bool(config.get("ignore_valid", True))
-    record_filter = config.get("record")
-    mode_filter = config.get("target_mode")
-    single_files = list(config.get("single_files", []))
+    fps = int(video_config["fps"])
+    export_grid = bool(video_config["export_grid"])
+    tile_scale = float(video_config["tile_scale"])
+    pad = int(video_config["pad"])
+    export_all = bool(video_config["export_all"])
+    export_vfi60 = bool(video_config["export_vfi60"])
+    ignore_valid = bool(video_config["ignore_valid"])
+    record_filter = video_config["record_filter"]
+    mode_filter = video_config["mode_filter"]
+    single_files = list(video_config["single_files"])
 
     root_dir = Path(str(config["root_dir"]))
     if not root_dir.is_absolute():
@@ -206,9 +236,9 @@ def main(argv: list[str] | None = None) -> None:
     if not checkpoint_path.is_absolute():
         checkpoint_path = PROJECT_ROOT / checkpoint_path
 
-    out_dir = Path(str(config["out_dir"]))
-    if not out_dir.is_absolute():
-        out_dir = PROJECT_ROOT / out_dir
+    output_dir = Path(str(video_config["output_dir"]))
+    if not output_dir.is_absolute():
+        output_dir = PROJECT_ROOT / output_dir
 
     summary = {
         "mode": mode,
@@ -217,11 +247,11 @@ def main(argv: list[str] | None = None) -> None:
         "root_dir": str(root_dir),
         "dataset_root_dir": str(dataset_root_dir),
         "checkpoint_path": str(checkpoint_path),
-        "out_dir": str(out_dir),
+        "output_dir": str(output_dir),
         "fps": fps,
         "ignore_valid": ignore_valid,
-        "record": record_filter,
-        "target_mode": mode_filter,
+        "record_filter": record_filter,
+        "mode_filter": mode_filter,
         "export_grid": export_grid,
         "export_all": export_all,
         "export_vfi60": export_vfi60,
@@ -246,11 +276,11 @@ def main(argv: list[str] | None = None) -> None:
 
     logger = build_logger("scripts.inference_results_to_video")
     set_seed(seed)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("device=%s model=%s", device, model_name)
 
-    dataframe = build_merged_dataframe(root_dir, out_dir, inference_preset, only_fps, logger)
+    dataframe = build_merged_dataframe(root_dir, output_dir, inference_preset, only_fps, logger)
     if not ignore_valid and "valid" in dataframe.columns:
         dataframe = dataframe[dataframe["valid"] == True].reset_index(drop=True)
     if record_filter is not None:
@@ -293,7 +323,7 @@ def main(argv: list[str] | None = None) -> None:
             loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
             progress = tqdm(loader, desc=f"{record}_{mode_name}", leave=True)
             mode_tag = str(mode_name).replace("/", "_")
-            mp4_dir = out_dir / str(record)
+            mp4_dir = output_dir / str(record)
             mp4_dir.mkdir(parents=True, exist_ok=True)
 
             pred_writer = None
@@ -386,7 +416,7 @@ def main(argv: list[str] | None = None) -> None:
                             if filename == "image_0.png" and sample_count > 0:
                                 continue
                             if filename not in single_writers:
-                                writer_path = out_dir / "single" / f"{record}_{str(mode_name).replace('/', '__')}_{filename.replace('.png', '')}.mp4"
+                                writer_path = output_dir / "single" / f"{record}_{str(mode_name).replace('/', '__')}_{filename.replace('.png', '')}.mp4"
                                 single_writers[filename], _single_output_path, single_writer_shapes[filename] = open_video_writer(
                                     writer_path,
                                     fps,
@@ -443,7 +473,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             logger.info("record=%s mode=%s samples=%s", record, mode_name, len(group_dataframe))
 
-    pd.DataFrame(video_rows).to_csv(out_dir / "video_metrics.csv", index=False)
+    pd.DataFrame(video_rows).to_csv(output_dir / "video_metrics.csv", index=False)
 
 
 if __name__ == "__main__":

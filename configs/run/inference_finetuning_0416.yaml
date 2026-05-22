@@ -16,5 +16,18 @@
   "flow_diff_percentile": 99.0,
   "save_topk_worst_psnr": 10,
   "save_topk_best_psnr": 5,
-  "save_topk_largest_flow_diff": 10
+  "save_topk_largest_flow_diff": 10,
+  "video": {
+    "output_dir": "inference_outputs/IFRNet_FineTuning_0416/videos",
+    "fps": 60,
+    "ignore_valid": true,
+    "record_filter": null,
+    "mode_filter": null,
+    "export_grid": true,
+    "tile_scale": 0.5,
+    "pad": 8,
+    "export_all": false,
+    "export_vfi60": true,
+    "single_files": []
+  }
 }

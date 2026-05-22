@@ -20,5 +20,18 @@
   "metrics_use_valid_only": true,
   "save_topk_worst_psnr": 3,
   "save_topk_best_psnr": 0,
-  "save_topk_largest_flow_diff": 3
+  "save_topk_largest_flow_diff": 3,
+  "video": {
+    "output_dir": "outputs/train_smoke_dual/videos_ifrnet",
+    "fps": 60,
+    "ignore_valid": true,
+    "record_filter": "ARPG_2",
+    "mode_filter": "4_Difficult/4_Difficult_0/fps_60",
+    "export_grid": false,
+    "tile_scale": 0.5,
+    "pad": 8,
+    "export_all": false,
+    "export_vfi60": true,
+    "single_files": []
+  }
 }
