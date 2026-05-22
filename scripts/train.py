@@ -272,6 +272,50 @@ def build_training_dataset(
     return VFITrainDataset(normalized_dataframe, dataset_root_dir, augment, input_fps)
 
 
+def select_sample_rows(dataframe: Any, frame_keys: list[str]) -> Any:
+    indices: list[int] = []
+    for frame_key in frame_keys:
+        parts = frame_key.rsplit("_", 3)
+        if len(parts) != 4:
+            raise ValueError(f"sample frame key must look like ARPG_2_4_2_052, got {frame_key}")
+        record, main_index, sub_index, frame_text = parts
+        matches = dataframe[(dataframe["record"] == record) & dataframe["mode"].str.startswith(f"{main_index}_") & dataframe["mode"].str.contains(f"_{sub_index}/fps_", regex=False) & (dataframe["img1"].astype(int) == int(frame_text))]
+        if len(matches) != 1:
+            raise RuntimeError(f"Expected exactly one row for sample frame {frame_key}, got {len(matches)}")
+        indices.append(int(matches.index[0]))
+    return dataframe.loc[indices].reset_index(drop=True)
+
+
+def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: dict[str, Any], epoch: int, device: Any, logger: logging.Logger) -> None:
+    import cv2
+    import numpy as np
+    import torch
+    from torch.utils.data import DataLoader
+    from scripts.inference import run_inference_batch, save_selected_sample_artifacts
+    from src.data.image_ops import flow_to_image, save_image
+
+    frame_groups = {"train": args.sample_train_frames, "test": args.sample_test_frames}
+    if sum(len(frame_keys) for frame_keys in frame_groups.values()) == 0:
+        return
+    if args.sample_interval_epoch <= 0:
+        raise ValueError(f"sample_interval_epoch must be positive, got {args.sample_interval_epoch}")
+    if (epoch + 1) % args.sample_interval_epoch != 0:
+        return
+
+    model.eval()
+    with torch.no_grad():
+        for split_name, frame_keys in frame_groups.items():
+            if len(frame_keys) == 0:
+                continue
+            sample_dataframe = select_sample_rows(sample_dataframes[split_name], list(frame_keys))
+            sample_dataset = build_training_dataset(sample_dataframe, args.dataset_root_dir, False, args.input_fps, args.model_name)
+            for frame_key, batch in zip(frame_keys, DataLoader(sample_dataset, batch_size=1, shuffle=False)):
+                save_dir = Path(args.output_dir) / "samples" / split_name / frame_key / f"epoch_{epoch + 1:04d}"
+                inference_result = run_inference_batch(batch, device, args.flow_approx_method, model, args.model_name, 1.0)
+                save_selected_sample_artifacts(cv2, 99.0, 1.0, flow_to_image, inference_result, np, save_dir, save_image)
+                logger.info("Saved sample frame split=%s frame=%s epoch=%s dir=%s", split_name, frame_key, epoch + 1, save_dir)
+
+
 def resolve_dataset_class_name(model_name: str) -> str:
     if uses_flow_approx_model(model_name):
         return "FlowEstimationTrainDataset"
@@ -370,6 +414,7 @@ def train(
     device: Any,
     logger: logging.Logger,
     training_state: TrainingState,
+    sample_dataframes: dict[str, Any],
 ) -> None:
     import pandas as pd
     from tqdm import tqdm
@@ -467,6 +512,7 @@ def train(
 
         save_checkpoint(checkpoints_dir / f"epoch_{epoch + 1}.pth", model, optimizer, epoch, best_psnr)
         save_checkpoint(checkpoints_dir / "latest.pth", model, optimizer, epoch, best_psnr)
+        save_epoch_samples(args, model, sample_dataframes, epoch, device, logger)
 
 
 def load_train_run_config(config_path: Path | None) -> dict[str, Any]:
@@ -502,6 +548,9 @@ def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.Argument
     parser.add_argument("--output-dir", default=config_defaults.get("output_dir"), type=str, help="Output directory for checkpoints and logs.")
     parser.add_argument("--only-fps", default=config_defaults.get("only_fps", 60), type=int, help="Use CSV entries for this FPS only.")
     parser.add_argument("--input-fps", default=config_defaults.get("input_fps", 30), type=int, help="Input frame rate for the dataset loader.")
+    parser.add_argument("--sample-train-frames", default=config_defaults.get("sample_train_frames", []), nargs="*", help="Training sample frame keys such as ARPG_2_4_2_052.")
+    parser.add_argument("--sample-test-frames", default=config_defaults.get("sample_test_frames", []), nargs="*", help="Testing sample frame keys such as ARPG_2_4_2_052.")
+    parser.add_argument("--sample-interval-epoch", default=config_defaults.get("sample_interval_epoch", config_defaults.get("eval_interval", 1)), type=int, help="Save configured sample frames every N epochs.")
     parser.add_argument(
         "--flow-approx-method",
         default=config_defaults.get("flow_approx_method", "combination"),
@@ -673,6 +722,7 @@ def run_training(args: argparse.Namespace) -> None:
         device,
         logger,
         training_state,
+        {"train": train_df, "test": test_df},
     )
 
 
