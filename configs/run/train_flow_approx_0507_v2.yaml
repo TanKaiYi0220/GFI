@@ -8,7 +8,7 @@
   "dataset_root_dir": "/workspace/datasets/Minor_0507/",
   "train_preset": "train_minor_0507",
   "test_preset": "test_minor_0507",
-  "epochs": 100,
+  "epochs": 150,
   "eval_interval": 1,
   "lr_start": 2e-5,
   "lr_end": 1e-5,
@@ -18,5 +18,5 @@
   "only_fps": 60,
   "input_fps": 30,
   "flow_approx_method": "combination",
-  "resume_path": "outputs/IFRNet_Residual_0416/checkpoints/best.pth"
+  "resume_path": "outputs/IFRNet_Residual_FlowApprox_Layer_4_Minor_0507_v2/checkpoints/latest.pth"
 }

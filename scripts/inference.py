@@ -120,7 +120,9 @@ def run_inference_batch(
         bmv = bmv.to(device)
         fmv = fmv.to(device)
         embt = embt.to(device)
+
         imgt_pred, up_flow0_1, up_flow1_1, up_mask_1 = model.inference(img0, img1, embt, scale_factor)
+        
         return {
             "bmv": bmv,
             "embt": embt,

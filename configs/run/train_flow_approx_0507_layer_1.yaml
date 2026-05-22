@@ -10,7 +10,7 @@
   "test_preset": "test_minor_0507",
   "epochs": 50,
   "eval_interval": 1,
-  "lr_start": 2e-5,
+  "lr_start": 1e-4,
   "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 16,

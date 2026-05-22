@@ -14,7 +14,7 @@
   "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 16,
-  "output_dir": "outputs/IFRNet_Residual_0507/",
+  "output_dir": "outputs/IFRNet_Residual_0507_1_Layer/",
   "only_fps": 60,
   "input_fps": 30
 }
