@@ -16,5 +16,13 @@
   "batch_size": 16,
   "output_dir": "outputs/IFRNet_Residual_0507_1_Layer/",
   "only_fps": 60,
-  "input_fps": 30
+  "input_fps": 30,
+  "sample_train_frames": [
+    "ARPG_3_1_5_052",
+    "ARPG_3_0_5_120"
+  ],
+  "sample_test_frames": [
+    "ARPG_3_3_5_0654"
+  ],
+  "sample_interval_epoch": 5
 }
