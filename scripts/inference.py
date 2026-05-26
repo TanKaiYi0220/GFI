@@ -64,16 +64,13 @@ def save_flow_diff_visuals(
     colorbar = cv2.applyColorMap(colorbar_u8, cv2.COLORMAP_TURBO)
     colorbar = cv2.resize(colorbar, (28, height), interpolation=cv2.INTER_NEAREST)
 
-    diff_mag_with_colorbar = np.full((height, width + 126, 3), 255, dtype=np.uint8)
-    diff_mag_with_colorbar[:, :width] = diff_mag_color
-    diff_mag_with_colorbar[:, width + 8 : width + 36] = colorbar
     overlay = cv2.addWeighted(bg_img_np.astype(np.uint8), 0.2, diff_mag_color, 0.8, 0.0)
     overlay_with_colorbar = np.full((height, width + 126, 3), 255, dtype=np.uint8)
     overlay_with_colorbar[:, :width] = overlay
     overlay_with_colorbar[:, width + 8 : width + 36] = colorbar
 
-    for canvas in (diff_mag_with_colorbar, overlay_with_colorbar):
-        cv2.putText(canvas, "|Δflow|", (width + 8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+    for canvas in (overlay_with_colorbar,):
+        cv2.putText(canvas, "|dflow|", (width + 8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
         for tick_index in range(5):
             tick_value = tick_index / 4.0
             tick_y = int((1.0 - tick_value) * (height - 1))
@@ -93,10 +90,7 @@ def save_flow_diff_visuals(
     changed_mask = np.where(diff_mag_np > threshold, 255, 0).astype(np.uint8)
     save_image(save_dir / f"init_flow_{name}.png", flow_to_image(init_flow_np))
     save_image(save_dir / f"diff_flow_{name}.png", flow_to_image(diff_flow_np))
-    save_image(save_dir / f"diff_mag_{name}.png", diff_mag_color)
-    save_image(save_dir / f"diff_mag_cb_{name}.png", diff_mag_with_colorbar)
-    save_image(save_dir / f"diff_mag_overlay_{name}.png", overlay)
-    save_image(save_dir / f"diff_mag_overlay_cb_{name}.png", overlay_with_colorbar)
+    save_image(save_dir / f"diff_mag_cb_overlay_{name}.png", overlay_with_colorbar)
     save_image(save_dir / f"diff_changed_thr_{threshold:.2f}_{name}.png", changed_mask)
     return {
         "diff_mag_mean": float(diff_mag_np.mean()),
@@ -246,6 +240,7 @@ def save_selected_sample_artifacts(
     imgt_merge = inference_result["imgt_merge"]
     init_bmv = inference_result["init_bmv"]
     init_fmv = inference_result["init_fmv"]
+    init_masks = inference_result.get("init_masks")
     up_flow0_1 = inference_result["up_flow0_1"]
     up_flow1_1 = inference_result["up_flow1_1"]
     up_mask_1 = inference_result["up_mask_1"]
@@ -254,6 +249,23 @@ def save_selected_sample_artifacts(
     img1_warped = warp(img1, up_flow1_1)
     img0_bmv_warped = warp(img0, bmv)
     img1_fmv_warped = warp(img1, fmv)
+    init_img0_warped = None
+    init_img1_warped = None
+    init_merge = None
+    if init_bmv is not None and init_fmv is not None:
+        init_img0_warped = warp(img0, init_bmv)
+        init_img1_warped = warp(img1, init_fmv)
+        if init_masks is None:
+            init_merge = 0.5 * init_img0_warped + 0.5 * init_img1_warped
+        else:
+            init_bmv_mask = init_masks[:, 0:1]
+            init_fmv_mask = init_masks[:, 1:2]
+            init_weight_sum = init_bmv_mask + init_fmv_mask
+            init_average = 0.5 * init_img0_warped + 0.5 * init_img1_warped
+            init_weighted = (
+                init_img0_warped * init_bmv_mask + init_img1_warped * init_fmv_mask
+            ) / init_weight_sum.clamp_min(1.0)
+            init_merge = init_average.where(init_weight_sum <= 0, init_weighted)
 
     img0_np = np.round(img0[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
     img1_np = np.round(img1[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
@@ -269,6 +281,9 @@ def save_selected_sample_artifacts(
     img1_warped_np = np.round(img1_warped[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
     img0_bmv_warped_np = np.round(img0_bmv_warped[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
     img1_fmv_warped_np = np.round(img1_fmv_warped[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    init_img0_warped_np = None if init_img0_warped is None else np.round(init_img0_warped[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    init_img1_warped_np = None if init_img1_warped is None else np.round(init_img1_warped[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    init_merge_np = None if init_merge is None else np.round(init_merge[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
 
     image_paths = {
         "image_0_path": str(save_dir / "image_0.png"),
@@ -285,6 +300,9 @@ def save_selected_sample_artifacts(
         "image_1_warped_path": str(save_dir / "image_1_warped.png"),
         "image_0_bmv_warped_path": str(save_dir / "image_0_bmv_warped.png"),
         "image_1_fmv_warped_path": str(save_dir / "image_1_fmv_warped.png"),
+        "image_0_init_warped_path": str(save_dir / "image_0_init_warped.png") if init_img0_warped_np is not None else "",
+        "image_1_init_warped_path": str(save_dir / "image_1_init_warped.png") if init_img1_warped_np is not None else "",
+        "image_init_warped_merge_path": str(save_dir / "image_init_warped_merge.png") if init_merge_np is not None else "",
     }
 
     save_image(Path(image_paths["image_0_path"]), img0_np)
@@ -302,6 +320,10 @@ def save_selected_sample_artifacts(
     save_image(Path(image_paths["image_1_warped_path"]), img1_warped_np)
     save_image(Path(image_paths["image_0_bmv_warped_path"]), img0_bmv_warped_np)
     save_image(Path(image_paths["image_1_fmv_warped_path"]), img1_fmv_warped_np)
+    if init_img0_warped_np is not None and init_img1_warped_np is not None and init_merge_np is not None:
+        save_image(Path(image_paths["image_0_init_warped_path"]), init_img0_warped_np)
+        save_image(Path(image_paths["image_1_init_warped_path"]), init_img1_warped_np)
+        save_image(Path(image_paths["image_init_warped_merge_path"]), init_merge_np)
 
     if init_bmv is not None and init_fmv is not None:
         init_flow_1_to_0_np = init_bmv[0].detach().cpu().permute(1, 2, 0).numpy()
@@ -568,6 +590,9 @@ def main(argv: list[str] | None = None) -> None:
                 "image_1_warped_path",
                 "image_0_bmv_warped_path",
                 "image_1_fmv_warped_path",
+                "image_0_init_warped_path",
+                "image_1_init_warped_path",
+                "image_init_warped_merge_path",
             ):
                 group_metrics_df[column_name] = ""
 
