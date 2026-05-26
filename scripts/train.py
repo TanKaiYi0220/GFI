@@ -614,6 +614,7 @@ def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_train_arg_parser(config_defaults)
     args = parser.parse_args(argv)
     args.model_init_args = read_model_init_args(config_defaults)
+    args.input_config = config_defaults
     return args
 
 
@@ -714,6 +715,12 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
     return summary
 
 
+def save_input_config(target_dir: Path, input_config: dict[str, Any]) -> Path:
+    config_path = target_dir / "input_config.json"
+    config_path.write_text(json.dumps(input_config, indent=2), encoding="utf-8")
+    return config_path
+
+
 def run_training(args: argparse.Namespace) -> None:
     import torch
     import torch.optim as optim
@@ -770,6 +777,8 @@ def run_training(args: argparse.Namespace) -> None:
 
     log_run_summary(args, train_dataset, test_dataset, training_state, device, logger)
     logger.info("run_log_dir=%s", run_dir)
+    input_config_path = save_input_config(target_dir=run_dir, input_config=args.input_config)
+    logger.info("input_config_path=%s", input_config_path)
 
     train(
         args,
