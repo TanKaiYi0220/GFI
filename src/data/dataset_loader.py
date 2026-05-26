@@ -69,6 +69,14 @@ def flow_to_tensor(flow: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(contiguous_flow)
 
 
+def depth_to_tensor(depth: np.ndarray) -> torch.Tensor:
+    if depth.ndim == 2:
+        depth = depth[:, :, None]
+
+    contiguous_depth = np.ascontiguousarray(depth.transpose(2, 0, 1).astype(np.float32))
+    return torch.from_numpy(contiguous_depth)
+
+
 class BaseDataset(Dataset):
     def __init__(
         self,
@@ -112,6 +120,10 @@ class BaseDataset(Dataset):
     def _load_game_motion(self, path: str) -> np.ndarray:
         game_motion, _depth = load_backward_velocity(Path(path))
         return game_motion
+
+    def _load_game_motion_and_depth(self, path: str) -> tuple[np.ndarray, np.ndarray]:
+        game_motion, depth = load_backward_velocity(Path(path))
+        return game_motion, depth[:, :, None]
 
     def __getitem__(self, index: int) -> object:
         raise NotImplementedError("BaseDataset is abstract. Use one concrete dataset class instead.")
@@ -264,11 +276,13 @@ class FlowEstimationTrainDataset(BaseDataset):
         dataset_root_dir: str,
         input_fps: int,
         augment: bool,
+        include_source_depths: bool,
         modality_config: dict[str, dict[str, str]] = DEFAULT_MODALITY_CONFIG,
         transform: Any | None = None,
     ) -> None:
         super().__init__(dataframe, dataset_root_dir, input_fps, modality_config, transform, None, None)
         self.augment = augment
+        self.include_source_depths = include_source_depths
         
     def __len__(self) -> int:
         return len(self.dataframe)
@@ -309,24 +323,37 @@ class FlowEstimationTrainDataset(BaseDataset):
         img1 = self._load_image(img_60_2_path)
         bmv_60 = self._load_game_motion(bmv_60_path)
         fmv_60 = self._load_game_motion(fmv_60_path)
-        bmv_30 = self._load_game_motion(bmv_30_path)
-        fmv_30 = self._load_game_motion(fmv_30_path)
+        if self.include_source_depths:
+            bmv_30, source_depth1 = self._load_game_motion_and_depth(bmv_30_path)
+            fmv_30, source_depth0 = self._load_game_motion_and_depth(fmv_30_path)
+        else:
+            bmv_30 = self._load_game_motion(bmv_30_path)
+            fmv_30 = self._load_game_motion(fmv_30_path)
+            source_depth0 = None
+            source_depth1 = None
         # img0_30 = self._load_image(img_30_0_path)
         # img1_30 = self._load_image(img_30_1_path)
 
         if self.augment:
+            flow_fields = (bmv_60, fmv_60, bmv_30, fmv_30)
+            if self.include_source_depths:
+                flow_fields = (bmv_60, fmv_60, bmv_30, fmv_30, source_depth0, source_depth1)
+
             img0, imgt, img1, flow_fields = shared_random_crop(
                 img0,
                 imgt,
                 img1,
-                (bmv_60, fmv_60, bmv_30, fmv_30),
+                flow_fields,
                 (224, 224),
             )
             img0, imgt, img1 = shared_random_reverse_channel(img0, imgt, img1, 0.5)
             img0, imgt, img1, flow_fields = shared_random_vertical_flip(img0, imgt, img1, flow_fields, 0.3)
             img0, imgt, img1, flow_fields = shared_random_horizontal_flip(img0, imgt, img1, flow_fields, 0.5)
             img0, imgt, img1, flow_fields = shared_random_rotate(img0, imgt, img1, flow_fields, 0.05)
-            bmv_60, fmv_60, bmv_30, fmv_30 = flow_fields
+            if self.include_source_depths:
+                bmv_60, fmv_60, bmv_30, fmv_30, source_depth0, source_depth1 = flow_fields
+            else:
+                bmv_60, fmv_60, bmv_30, fmv_30 = flow_fields
 
         img0_tensor = image_to_tensor(img0)
         imgt_tensor = image_to_tensor(imgt)
@@ -342,6 +369,9 @@ class FlowEstimationTrainDataset(BaseDataset):
         # Add paths to info for debugging purposes
         # info["img_60_2_path"] = img_60_2_path
         # info["img_30_1_path"] = img_30_1_path
+        if self.include_source_depths:
+            info["source_depth0"] = depth_to_tensor(source_depth0)
+            info["source_depth1"] = depth_to_tensor(source_depth1)
 
         return (
             img0_tensor,

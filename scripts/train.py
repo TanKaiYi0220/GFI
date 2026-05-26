@@ -21,8 +21,10 @@ from src.data.dataset_config import iter_dataset_configs
 from src.data.dataset_config import list_dataset_presets
 from src.engine.evaluation import AverageMeter
 from src.engine.evaluation import calculate_psnr
-from src.engine.flow_approx import build_flow_init
+from src.engine.flow_approx import build_flow_init_result
+from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
 from src.engine.flow_approx import FLOW_APPROX_METHODS
+from src.engine.flow_approx import SPLATTING_FLOW_APPROX_METHODS
 from src.utils.config import load_yaml_file
 
 MODEL_NAMES: tuple[str, ...] = ("IFRNet", "IFRNet_Residual", "IFRNet_Residual_FlowApprox")
@@ -169,6 +171,8 @@ def forward_model(
     source_bmv: Any,
     source_fmv: Any,
     flow_approx_method: str,
+    source_depth0: Any | None,
+    source_depth1: Any | None,
 ) -> Any:
     import torch
 
@@ -176,7 +180,16 @@ def forward_model(
     init_fmv = source_fmv
 
     if uses_flow_approx_model(model_name):
-        init_bmv, init_fmv = build_flow_init(source_fmv, source_bmv, embt, flow_approx_method)
+        flow_init = build_flow_init_result(
+            fmv_30=source_fmv,
+            bmv_30=source_bmv,
+            embt=embt,
+            flow_approx_method=flow_approx_method,
+            source_depth0=source_depth0,
+            source_depth1=source_depth1,
+        )
+        init_bmv = flow_init.bmv
+        init_fmv = flow_init.fmv
 
     if model_name == "IFRNet":
         flow = torch.cat([init_bmv, init_fmv], dim=1).float()
@@ -259,13 +272,15 @@ def build_training_dataset(
     augment: bool,
     input_fps: int,
     model_name: str,
+    flow_approx_method: str,
 ) -> Any:
     normalized_dataframe = dataframe.reset_index(drop=True)
 
     if uses_flow_approx_model(model_name):
         from src.data.dataset_loader import FlowEstimationTrainDataset
 
-        return FlowEstimationTrainDataset(normalized_dataframe, dataset_root_dir, input_fps, augment)
+        include_source_depths = flow_approx_method in SPLATTING_FLOW_APPROX_METHODS
+        return FlowEstimationTrainDataset(normalized_dataframe, dataset_root_dir, input_fps, augment, include_source_depths)
 
     from src.data.dataset_loader import VFITrainDataset
 
@@ -275,13 +290,25 @@ def build_training_dataset(
 def select_sample_rows(dataframe: Any, frame_keys: list[str]) -> Any:
     indices: list[int] = []
     for frame_key in frame_keys:
-        parts = frame_key.rsplit("_", 3)
-        if len(parts) != 4:
-            raise ValueError(f"sample frame key must look like ARPG_2_4_2_052, got {frame_key}")
-        record, main_index, sub_index, frame_text = parts
-        matches = dataframe[(dataframe["record"] == record) & dataframe["mode"].str.startswith(f"{main_index}_") & dataframe["mode"].str.contains(f"_{sub_index}/fps_", regex=False) & (dataframe["img1"].astype(int) == int(frame_text))]
+        parts = frame_key.split("_")
+        if len(parts) != 6 or parts[0] != "ARPG":
+            raise ValueError(f"sample frame key must look like ARPG_3_0_Medium_5_0404, got {frame_key}")
+        record, main_index, difficulty, sub_index, frame_text = f"{parts[0]}_{parts[1]}", parts[2], parts[3], parts[4], parts[5]
+        if difficulty not in ("Easy", "Medium", "Difficult"):
+            raise ValueError(f"sample frame key difficulty must be Easy, Medium, or Difficult, got {frame_key}")
+        base_matches = dataframe[(dataframe["record"] == record) & dataframe["mode"].str.startswith(f"{main_index}_") & dataframe["mode"].str.contains(f"_{sub_index}/fps_", regex=False)]
+        base_matches = base_matches[base_matches["mode"].str.startswith(f"{main_index}_{difficulty}/")]
+        matches = base_matches[base_matches["img0"].astype(int) == int(frame_text)]
+        matches = matches.drop_duplicates(subset=["record", "mode", "img0", "img1", "img2"])
         if len(matches) != 1:
-            raise RuntimeError(f"Expected exactly one row for sample frame {frame_key}, got {len(matches)}")
+            mode_preview = dataframe[
+                (dataframe["record"] == record)
+                & dataframe["mode"].str.startswith(f"{main_index}_")
+                & dataframe["mode"].str.contains(f"_{sub_index}/fps_", regex=False)
+                & (dataframe["img0"].astype(int) == int(frame_text))
+            ][["record", "mode", "img0", "img1", "img2"]].drop_duplicates().head(10).to_dict("records")
+            preview = matches[["record", "mode", "img0", "img1", "img2"]].head(5).to_dict("records")
+            raise RuntimeError(f"Expected exactly one row for sample frame {frame_key}, got {len(matches)} after matching img0. candidates={preview}, available_without_difficulty={mode_preview}")
         indices.append(int(matches.index[0]))
     return dataframe.loc[indices].reset_index(drop=True)
 
@@ -308,7 +335,14 @@ def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: 
             if len(frame_keys) == 0:
                 continue
             sample_dataframe = select_sample_rows(sample_dataframes[split_name], list(frame_keys))
-            sample_dataset = build_training_dataset(sample_dataframe, args.dataset_root_dir, False, args.input_fps, args.model_name)
+            sample_dataset = build_training_dataset(
+                sample_dataframe,
+                args.dataset_root_dir,
+                False,
+                args.input_fps,
+                args.model_name,
+                args.flow_approx_method,
+            )
             for frame_key, batch in zip(frame_keys, DataLoader(sample_dataset, batch_size=1, shuffle=False)):
                 save_dir = Path(args.output_dir) / "samples" / split_name / frame_key / f"epoch_{epoch + 1:04d}"
                 inference_result = run_inference_batch(batch, device, args.flow_approx_method, model, args.model_name, 1.0)
@@ -333,10 +367,18 @@ def run_training_batch(
         img0, imgt, img1, _bmv_60, _fmv_60, bmv_30, fmv_30, embt, info = batch
         source_bmv = bmv_30.to(device)
         source_fmv = fmv_30.to(device)
+        if args.flow_approx_method in SPLATTING_FLOW_APPROX_METHODS:
+            source_depth0 = info["source_depth0"].to(device)
+            source_depth1 = info["source_depth1"].to(device)
+        else:
+            source_depth0 = None
+            source_depth1 = None
     else:
         img0, imgt, img1, bmv, fmv, embt, info = batch
         source_bmv = bmv.to(device)
         source_fmv = fmv.to(device)
+        source_depth0 = None
+        source_depth1 = None
 
     img0 = img0.to(device)
     img1 = img1.to(device)
@@ -353,6 +395,8 @@ def run_training_batch(
         source_bmv,
         source_fmv,
         args.flow_approx_method,
+        source_depth0,
+        source_depth1,
     )
     imgt_pred, loss_rec, loss_geo, loss_dis, _up_flow0_1, _up_flow1_1, _up_mask_1 = model_output
     return BatchStepOutput(
@@ -554,7 +598,7 @@ def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.Argument
     parser.add_argument(
         "--flow-approx-method",
         default=config_defaults.get("flow_approx_method", "combination"),
-        choices=FLOW_APPROX_METHODS,
+        choices=FLOW_APPROX_METHOD_CHOICES,
         help="How to approximate middle-frame flows from 30fps motion vectors.",
     )
     return parser
@@ -698,8 +742,22 @@ def run_training(args: argparse.Namespace) -> None:
         logger.info("Valid Count %s in %s", test_df["valid"].value_counts().to_dict(), args.test_preset)
         test_df = test_df[test_df["valid"] == True]
 
-    train_dataset = build_training_dataset(train_df, args.dataset_root_dir, True, args.input_fps, args.model_name)
-    test_dataset = build_training_dataset(test_df, args.dataset_root_dir, False, args.input_fps, args.model_name)
+    train_dataset = build_training_dataset(
+        train_df,
+        args.dataset_root_dir,
+        True,
+        args.input_fps,
+        args.model_name,
+        args.flow_approx_method,
+    )
+    test_dataset = build_training_dataset(
+        test_df,
+        args.dataset_root_dir,
+        False,
+        args.input_fps,
+        args.model_name,
+        args.flow_approx_method,
+    )
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 

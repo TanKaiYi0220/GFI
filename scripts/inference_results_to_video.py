@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.inference import BASELINE_MODEL_NAME
 from scripts.inference import run_inference_batch
+from src.engine.flow_approx import SPLATTING_FLOW_APPROX_METHODS
 from scripts.train import build_merged_dataframe
 from scripts.train import read_model_init_args
 from scripts.train import resolve_model_class
@@ -318,7 +319,14 @@ def main(argv: list[str] | None = None) -> None:
             if model_name == BASELINE_MODEL_NAME:
                 dataset = VFITrainDataset(group_dataframe, str(dataset_root_dir), False, input_fps)
             else:
-                dataset = FlowEstimationTrainDataset(group_dataframe, str(dataset_root_dir), input_fps, False)
+                include_source_depths = flow_approx_method in SPLATTING_FLOW_APPROX_METHODS
+                dataset = FlowEstimationTrainDataset(
+                    group_dataframe,
+                    str(dataset_root_dir),
+                    input_fps,
+                    False,
+                    include_source_depths,
+                )
 
             loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
             progress = tqdm(loader, desc=f"{record}_{mode_name}", leave=True)

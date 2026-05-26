@@ -14,8 +14,10 @@ from scripts.train import build_merged_dataframe
 from scripts.train import read_model_init_args
 from scripts.train import resolve_model_class
 from scripts.train import set_seed
-from src.engine.flow_approx import build_flow_init
+from src.engine.flow_approx import build_flow_init_result
+from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
 from src.engine.flow_approx import FLOW_APPROX_METHODS
+from src.engine.flow_approx import SPLATTING_FLOW_APPROX_METHODS
 from src.models.external.IFRNet.utils import warp
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
@@ -140,7 +142,7 @@ def run_inference_batch(
         }
 
     if model_name == RESIDUAL_FLOW_APPROX_MODEL_NAME:
-        img0, imgt, img1, bmv, fmv, bmv_30, fmv_30, embt, _info = batch
+        img0, imgt, img1, bmv, fmv, bmv_30, fmv_30, embt, info = batch
         img0 = img0.to(device)
         imgt = imgt.to(device)
         img1 = img1.to(device)
@@ -149,7 +151,22 @@ def run_inference_batch(
         bmv_30 = bmv_30.to(device)
         fmv_30 = fmv_30.to(device)
         embt = embt.to(device)
-        init_bmv, init_fmv = build_flow_init(fmv_30, bmv_30, embt, flow_approx_method)
+        source_depth0 = None
+        source_depth1 = None
+        if flow_approx_method in SPLATTING_FLOW_APPROX_METHODS:
+            source_depth0 = info["source_depth0"].to(device)
+            source_depth1 = info["source_depth1"].to(device)
+
+        flow_init = build_flow_init_result(
+            fmv_30=fmv_30,
+            bmv_30=bmv_30,
+            embt=embt,
+            flow_approx_method=flow_approx_method,
+            source_depth0=source_depth0,
+            source_depth1=source_depth1,
+        )
+        init_bmv = flow_init.bmv
+        init_fmv = flow_init.fmv
         imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
             img0,
             img1,
@@ -169,6 +186,7 @@ def run_inference_batch(
             "imgt_pred": imgt_pred,
             "init_bmv": init_bmv,
             "init_fmv": init_fmv,
+            "init_masks": flow_init.masks,
             "up_flow0_1": up_flow0_1,
             "up_flow1_1": up_flow1_1,
             "up_mask_1": up_mask_1,
@@ -359,7 +377,7 @@ def main(argv: list[str] | None = None) -> None:
     if not output_dir.is_absolute():
         output_dir = PROJECT_ROOT / output_dir
 
-    if model_name == RESIDUAL_FLOW_APPROX_MODEL_NAME and flow_approx_method not in FLOW_APPROX_METHODS:
+    if model_name == RESIDUAL_FLOW_APPROX_MODEL_NAME and flow_approx_method not in FLOW_APPROX_METHOD_CHOICES:
         raise ValueError(f"Unsupported flow_approx_method: {flow_approx_method}")
 
     summary = {
@@ -429,7 +447,14 @@ def main(argv: list[str] | None = None) -> None:
             if model_name == BASELINE_MODEL_NAME:
                 dataset = VFITrainDataset(group_dataframe, str(dataset_root_dir), False, input_fps)
             else:
-                dataset = FlowEstimationTrainDataset(group_dataframe, str(dataset_root_dir), input_fps, False)
+                include_source_depths = flow_approx_method in SPLATTING_FLOW_APPROX_METHODS
+                dataset = FlowEstimationTrainDataset(
+                    group_dataframe,
+                    str(dataset_root_dir),
+                    input_fps,
+                    False,
+                    include_source_depths,
+                )
 
             loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
             record_meter = AverageMeter()

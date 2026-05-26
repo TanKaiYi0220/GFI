@@ -54,6 +54,7 @@ def main() -> None:
         dataset_root_dir=str(DATASET_ROOT),
         augment=AUGMENT,
         input_fps=INPUT_FPS,
+        include_source_depths=True,
     )
     sample = dataset[SAMPLE_INDEX]
 

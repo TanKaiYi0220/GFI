@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.train import build_merged_dataframe
 from scripts.train import set_seed
-from src.engine.flow_approx import build_flow_init
+from src.engine.flow_approx import build_flow_init_result
 from src.engine.flow_approx import FLOW_APPROX_METHODS
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
@@ -226,6 +226,7 @@ def analyze_dataset(config: AnalysisConfig) -> None:
         dataset_root_dir=str(config.dataset_root_dir),
         input_fps=config.input_fps,
         augment=False,
+        include_source_depths=True,
     )
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=False)
 
@@ -235,7 +236,7 @@ def analyze_dataset(config: AnalysisConfig) -> None:
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="Analyzing dataset", leave=True):
-            img0, imgt, img1, bmv_60, fmv_60, bmv_30, fmv_30, embt, _info = batch
+            img0, imgt, img1, bmv_60, fmv_60, bmv_30, fmv_30, embt, info = batch
             img0 = img0.to(device)
             imgt = imgt.to(device)
             img1 = img1.to(device)
@@ -256,12 +257,16 @@ def analyze_dataset(config: AnalysisConfig) -> None:
 
             method_metrics: dict[str, dict[str, Any]] = {}
             for flow_approx_method in FLOW_APPROX_METHODS:
-                approx_bmv, approx_fmv = build_flow_init(
+                flow_init = build_flow_init_result(
                     fmv_30=fmv_30,
                     bmv_30=bmv_30,
                     embt=embt,
                     flow_approx_method=flow_approx_method,
+                    source_depth0=info["source_depth0"].to(device),
+                    source_depth1=info["source_depth1"].to(device),
                 )
+                approx_bmv = flow_init.bmv
+                approx_fmv = flow_init.fmv
                 error_stats = build_bidirectional_error_stats(
                     approx_bmv=approx_bmv,
                     approx_fmv=approx_fmv,
@@ -284,6 +289,7 @@ def analyze_dataset(config: AnalysisConfig) -> None:
                     "error_stats": error_stats,
                     "img0_warp_psnr": approx_img0_warp_psnr,
                     "img1_warp_psnr": approx_img1_warp_psnr,
+                    "masks": flow_init.masks,
                 }
 
             for batch_index in range(batch_size):
@@ -315,6 +321,12 @@ def analyze_dataset(config: AnalysisConfig) -> None:
                     approx_img0_psnr = float(flow_method_metric["img0_warp_psnr"][batch_index])
                     approx_img1_psnr = float(flow_method_metric["img1_warp_psnr"][batch_index])
                     approx_mean_psnr = (approx_img0_psnr + approx_img1_psnr) / 2.0
+                    masks = flow_method_metric["masks"]
+                    coverage_bmv = 1.0
+                    coverage_fmv = 1.0
+                    if masks is not None:
+                        coverage_bmv = float(masks[batch_index, 0].detach().cpu().mean().item())
+                        coverage_fmv = float(masks[batch_index, 1].detach().cpu().mean().item())
 
                     flow_rows.append(
                         {
@@ -337,6 +349,9 @@ def analyze_dataset(config: AnalysisConfig) -> None:
                             "warp_psnr_img0_approx": approx_img0_psnr,
                             "warp_psnr_img1_approx": approx_img1_psnr,
                             "warp_psnr_mean_approx": approx_mean_psnr,
+                            "coverage_bmv": coverage_bmv,
+                            "coverage_fmv": coverage_fmv,
+                            "coverage_mean": (coverage_bmv + coverage_fmv) / 2.0,
                             "warp_psnr_delta_img0_vs_gt60": approx_img0_psnr - gt_img0_warp_psnr[batch_index],
                             "warp_psnr_delta_img1_vs_gt60": approx_img1_psnr - gt_img1_warp_psnr[batch_index],
                             "warp_psnr_delta_mean_vs_gt60": approx_mean_psnr - gt_warp_psnr_mean,

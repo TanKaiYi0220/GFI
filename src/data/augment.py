@@ -21,6 +21,9 @@ def crop_flows(
 
 def flip_vertical_flow(flow: np.ndarray) -> np.ndarray:
     flipped_flow = flow[::-1]
+    if flow.shape[2] == 1:
+        return flipped_flow
+
     return np.concatenate(
         (
             flipped_flow[:, :, 0:1],
@@ -34,6 +37,9 @@ def flip_vertical_flow(flow: np.ndarray) -> np.ndarray:
 
 def flip_horizontal_flow(flow: np.ndarray) -> np.ndarray:
     flipped_flow = flow[:, ::-1]
+    if flow.shape[2] == 1:
+        return flipped_flow
+
     return np.concatenate(
         (
             -flipped_flow[:, :, 0:1],
@@ -47,6 +53,9 @@ def flip_horizontal_flow(flow: np.ndarray) -> np.ndarray:
 
 def rotate_flow(flow: np.ndarray) -> np.ndarray:
     rotated_flow = flow.transpose((1, 0, 2))
+    if flow.shape[2] == 1:
+        return rotated_flow
+
     return np.concatenate(
         (
             rotated_flow[:, :, 1:2],
