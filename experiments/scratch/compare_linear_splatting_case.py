@@ -32,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-0", default=452, type=int)
     parser.add_argument("--frame-t", default=453, type=int)
     parser.add_argument("--frame-1", default=454, type=int)
+    parser.add_argument("--warmup-iters", default=5, type=int)
+    parser.add_argument("--timing-iters", default=30, type=int)
     parser.add_argument("--output-json", default="", type=str)
     return parser.parse_args()
 
@@ -96,9 +98,9 @@ def time_method(
     source_depth1: torch.Tensor,
     embt: torch.Tensor,
     device: torch.device,
+    warmup_iters: int,
+    timing_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, float]:
-    synchronize_if_needed(device)
-    start_time = time.perf_counter()
     flow_init = build_flow_init_result(
         fmv_30=fmv_30,
         bmv_30=bmv_30,
@@ -107,11 +109,40 @@ def time_method(
         source_depth0=source_depth0,
         source_depth1=source_depth1,
     )
-    _img0_warped = warp(img0, flow_init.bmv)
-    _img1_warped = warp(img1, flow_init.fmv)
-    _blend = blend_warps(_img0_warped, _img1_warped, flow_init.masks)
-    synchronize_if_needed(device)
-    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+
+    for _warmup_index in range(warmup_iters):
+        flow_init = build_flow_init_result(
+            fmv_30=fmv_30,
+            bmv_30=bmv_30,
+            embt=embt,
+            flow_approx_method=method_name,
+            source_depth0=source_depth0,
+            source_depth1=source_depth1,
+        )
+        _img0_warped = warp(img0, flow_init.bmv)
+        _img1_warped = warp(img1, flow_init.fmv)
+        _blend = blend_warps(_img0_warped, _img1_warped, flow_init.masks)
+
+    elapsed_values_ms: list[float] = []
+    for _timing_index in range(timing_iters):
+        synchronize_if_needed(device)
+        start_time = time.perf_counter()
+        flow_init = build_flow_init_result(
+            fmv_30=fmv_30,
+            bmv_30=bmv_30,
+            embt=embt,
+            flow_approx_method=method_name,
+            source_depth0=source_depth0,
+            source_depth1=source_depth1,
+        )
+        _img0_warped = warp(img0, flow_init.bmv)
+        _img1_warped = warp(img1, flow_init.fmv)
+        _blend = blend_warps(_img0_warped, _img1_warped, flow_init.masks)
+        synchronize_if_needed(device)
+        elapsed_values_ms.append((time.perf_counter() - start_time) * 1000.0)
+
+    elapsed_values_ms.sort()
+    elapsed_ms = elapsed_values_ms[len(elapsed_values_ms) // 2]
     return flow_init.bmv, flow_init.fmv, flow_init.masks, elapsed_ms
 
 
@@ -196,6 +227,8 @@ def run_comparison(args: argparse.Namespace) -> list[dict[str, object]]:
             source_depth1=source_depth1,
             embt=embt,
             device=device,
+            warmup_iters=int(args.warmup_iters),
+            timing_iters=int(args.timing_iters),
         )
         records.append(
             build_method_record(
@@ -212,13 +245,23 @@ def run_comparison(args: argparse.Namespace) -> list[dict[str, object]]:
             )
         )
 
-    synchronize_if_needed(device)
-    start_time = time.perf_counter()
-    _img0_warped = warp(img0, bmv_60)
-    _img1_warped = warp(img1, fmv_60)
-    _blend = blend_warps(_img0_warped, _img1_warped, None)
-    synchronize_if_needed(device)
-    direct_runtime_ms = (time.perf_counter() - start_time) * 1000.0
+    for _warmup_index in range(int(args.warmup_iters)):
+        _img0_warped = warp(img0, bmv_60)
+        _img1_warped = warp(img1, fmv_60)
+        _blend = blend_warps(_img0_warped, _img1_warped, None)
+
+    direct_elapsed_values_ms: list[float] = []
+    for _timing_index in range(int(args.timing_iters)):
+        synchronize_if_needed(device)
+        start_time = time.perf_counter()
+        _img0_warped = warp(img0, bmv_60)
+        _img1_warped = warp(img1, fmv_60)
+        _blend = blend_warps(_img0_warped, _img1_warped, None)
+        synchronize_if_needed(device)
+        direct_elapsed_values_ms.append((time.perf_counter() - start_time) * 1000.0)
+
+    direct_elapsed_values_ms.sort()
+    direct_runtime_ms = direct_elapsed_values_ms[len(direct_elapsed_values_ms) // 2]
     records.append(
         build_method_record(
             method_name="direct_fps60_target_flow",

@@ -148,8 +148,8 @@ def build_linear_splatting_flow_init(
     partial_fmv = time * fmv_30
     partial_bmv = (1 - time) * bmv_30
 
-    approx_fmv, fmv_mask = nearest_depth_splat_flow(partial_fmv, source_depth0)
-    approx_bmv, bmv_mask = nearest_depth_splat_flow(partial_bmv, source_depth1)
+    approx_bmv, bmv_mask = nearest_depth_splat_flow(partial_fmv, source_depth0)
+    approx_fmv, fmv_mask = nearest_depth_splat_flow(partial_bmv, source_depth1)
 
     fill_fmv = flow_approx_combination(fmv_30, bmv_30, time, True)
     fill_bmv = flow_approx_combination(fmv_30, bmv_30, time, False)
