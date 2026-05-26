@@ -15,5 +15,13 @@
   "only_fps": 60,
   "input_fps": 30,
   "resume_path": "outputs/IFRNet_FineTuning_0507/checkpoints/latest.pth",
-  "pretrained_checkpoint_path": "src/models/external/IFRNet/checkpoints/IFRNet/IFRNet_Vimeo90K.pth"
+  "pretrained_checkpoint_path": "src/models/external/IFRNet/checkpoints/IFRNet/IFRNet_Vimeo90K.pth",
+  "sample_train_frames": [
+    "ARPG_3_0_Medium_5_0404",
+    "ARPG_3_1_Medium_5_0452"
+  ],
+  "sample_test_frames": [
+    "ARPG_3_3_Medium_5_0654"
+  ],
+  "sample_interval_epoch": 1
 }

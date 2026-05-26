@@ -17,5 +17,13 @@
   "output_dir": "outputs/IFRNet_Residual_FlowApprox_Layer_4_Minor_0507/",
   "only_fps": 60,
   "input_fps": 30,
-  "flow_approx_method": "combination"
+  "flow_approx_method": "combination",
+  "sample_train_frames": [
+    "ARPG_3_0_Medium_5_0404",
+    "ARPG_3_1_Medium_5_0452"
+  ],
+  "sample_test_frames": [
+    "ARPG_3_3_Medium_5_0654"
+  ],
+  "sample_interval_epoch": 1
 }
