@@ -82,17 +82,38 @@ def build_video_path(output_dir: Path, split_name: str | None, frame_key: str, d
     return output_dir / split_name / frame_key / f"{data_stem}.mp4"
 
 
-def export_data_type_video(frame_dir: Path, output_path: Path, data_type: str, fps: int) -> None:
+def open_video_writer(output_path: Path, fps: int, frame_shape: tuple[int, int]) -> tuple[Any, Path]:
     import cv2
 
+    height, width = frame_shape
+    ffmpeg_backend = getattr(cv2, "CAP_FFMPEG", -1)
+    gstreamer_backend = getattr(cv2, "CAP_GSTREAMER", -1)
+    mjpeg_backend = getattr(cv2, "CAP_OPENCV_MJPEG", -1)
+    candidates = [
+        (output_path, "mp4v", ffmpeg_backend, "FFMPEG/mp4v"),
+        (output_path, "avc1", ffmpeg_backend, "FFMPEG/avc1"),
+        (output_path, "mp4v", gstreamer_backend, "GSTREAMER/mp4v"),
+        (output_path.with_suffix(".avi"), "MJPG", mjpeg_backend, "OPENCV_MJPEG/MJPG"),
+    ]
+    tried_labels: list[str] = []
+    for candidate_path, codec, backend, label in candidates:
+        if backend < 0:
+            continue
+        candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(str(candidate_path), backend, cv2.VideoWriter_fourcc(*codec), fps, (width, height))
+        tried_labels.append(label)
+        if writer.isOpened():
+            return writer, candidate_path
+        writer.release()
+    raise RuntimeError(f"Failed to open VideoWriter: {output_path}. tried_backends={tried_labels}")
+
+
+def export_data_type_video(frame_dir: Path, output_path: Path, data_type: str, fps: int) -> Path:
     epoch_dirs = list_epoch_dirs(frame_dir)
     first_frame = load_video_frame(epoch_dirs[0] / data_type)
     height = first_frame.shape[0] if first_frame.shape[0] % 2 == 0 else first_frame.shape[0] + 1
     width = first_frame.shape[1] if first_frame.shape[1] % 2 == 0 else first_frame.shape[1] + 1
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-    if not writer.isOpened():
-        raise RuntimeError(f"Failed to open VideoWriter: {output_path}")
+    writer, actual_output_path = open_video_writer(output_path, fps, (height, width))
     for epoch_dir in epoch_dirs:
         image_path = epoch_dir / data_type
         if not image_path.is_file():
@@ -100,6 +121,7 @@ def export_data_type_video(frame_dir: Path, output_path: Path, data_type: str, f
             raise FileNotFoundError(f"Missing sample image for epoch: {image_path}")
         writer.write(make_even_frame(load_video_frame(image_path), (height, width)))
     writer.release()
+    return actual_output_path
 
 
 def validate_data_type_video(frame_dir: Path, output_path: Path, data_type: str) -> None:
@@ -126,8 +148,8 @@ def main(argv: list[str] | None = None) -> None:
                 if args.dry_run:
                     validate_data_type_video(frame_dir, output_path, data_type)
                     continue
-                export_data_type_video(frame_dir, output_path, data_type, args.fps)
-                print(output_path)
+                actual_output_path = export_data_type_video(frame_dir, output_path, data_type, args.fps)
+                print(actual_output_path)
 
 
 if __name__ == "__main__":

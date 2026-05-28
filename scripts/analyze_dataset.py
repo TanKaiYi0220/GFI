@@ -126,6 +126,48 @@ def build_bidirectional_error_stats(
     }
 
 
+def build_flow_init_result_with_runtime(
+    fmv_30: Any,
+    bmv_30: Any,
+    embt: Any,
+    flow_approx_method: str,
+    source_depth0: Any | None,
+    source_depth1: Any | None,
+    device: Any,
+) -> tuple[Any, float]:
+    import time
+    import torch
+
+    if device.type != "cuda":
+        start_time = time.perf_counter()
+        flow_init = build_flow_init_result(
+            fmv_30=fmv_30,
+            bmv_30=bmv_30,
+            embt=embt,
+            flow_approx_method=flow_approx_method,
+            source_depth0=source_depth0,
+            source_depth1=source_depth1,
+        )
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        return flow_init, elapsed_ms
+
+    torch.cuda.synchronize(device)
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    flow_init = build_flow_init_result(
+        fmv_30=fmv_30,
+        bmv_30=bmv_30,
+        embt=embt,
+        flow_approx_method=flow_approx_method,
+        source_depth0=source_depth0,
+        source_depth1=source_depth1,
+    )
+    end_event.record()
+    torch.cuda.synchronize(device)
+    return flow_init, float(start_event.elapsed_time(end_event))
+
+
 def calculate_batch_psnr(target: Any, prediction: Any, calculate_psnr_fn: Any) -> list[float]:
     batch_size = int(target.shape[0])
     psnr_values: list[float] = []
@@ -245,6 +287,8 @@ def analyze_dataset(config: AnalysisConfig) -> None:
             bmv_30 = bmv_30.to(device)
             fmv_30 = fmv_30.to(device)
             embt = embt.to(device)
+            source_depth0 = info["source_depth0"].to(device)
+            source_depth1 = info["source_depth1"].to(device)
 
             batch_size = int(img0.shape[0])
             batch_dataframe = merged_dataframe.iloc[sample_offset : sample_offset + batch_size].reset_index(drop=True)
@@ -257,13 +301,14 @@ def analyze_dataset(config: AnalysisConfig) -> None:
 
             method_metrics: dict[str, dict[str, Any]] = {}
             for flow_approx_method in FLOW_APPROX_METHODS:
-                flow_init = build_flow_init_result(
+                flow_init, flow_init_runtime_ms = build_flow_init_result_with_runtime(
                     fmv_30=fmv_30,
                     bmv_30=bmv_30,
                     embt=embt,
                     flow_approx_method=flow_approx_method,
-                    source_depth0=info["source_depth0"].to(device),
-                    source_depth1=info["source_depth1"].to(device),
+                    source_depth0=source_depth0,
+                    source_depth1=source_depth1,
+                    device=device,
                 )
                 approx_bmv = flow_init.bmv
                 approx_fmv = flow_init.fmv
@@ -290,6 +335,7 @@ def analyze_dataset(config: AnalysisConfig) -> None:
                     "img0_warp_psnr": approx_img0_warp_psnr,
                     "img1_warp_psnr": approx_img1_warp_psnr,
                     "masks": flow_init.masks,
+                    "flow_init_runtime_ms": flow_init_runtime_ms,
                 }
 
             for batch_index in range(batch_size):
@@ -322,6 +368,8 @@ def analyze_dataset(config: AnalysisConfig) -> None:
                     approx_img1_psnr = float(flow_method_metric["img1_warp_psnr"][batch_index])
                     approx_mean_psnr = (approx_img0_psnr + approx_img1_psnr) / 2.0
                     masks = flow_method_metric["masks"]
+                    flow_init_runtime_ms = float(flow_method_metric["flow_init_runtime_ms"])
+                    flow_init_runtime_ms_per_sample = flow_init_runtime_ms / float(batch_size)
                     coverage_bmv = 1.0
                     coverage_fmv = 1.0
                     if masks is not None:
@@ -332,6 +380,8 @@ def analyze_dataset(config: AnalysisConfig) -> None:
                         {
                             **base_record,
                             "method": flow_approx_method,
+                            "flow_init_runtime_ms": flow_init_runtime_ms_per_sample,
+                            "flow_init_batch_runtime_ms": flow_init_runtime_ms,
                             "motion_pooled_mean": float(motion_stats["pooled"]["mean"][batch_index].detach().cpu().item()),
                             "motion_pooled_p95": float(motion_stats["pooled"]["p95"][batch_index].detach().cpu().item()),
                             "approx_error_bmv_mean": float(error_stats["bmv"]["mean"][batch_index].detach().cpu().item()),

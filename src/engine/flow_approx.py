@@ -153,8 +153,8 @@ def build_linear_splatting_flow_init(
 
     fill_fmv = flow_approx_combination(fmv_30, bmv_30, time, True)
     fill_bmv = flow_approx_combination(fmv_30, bmv_30, time, False)
-    approx_fmv = torch.where(fmv_mask.bool(), approx_fmv, fill_fmv)
-    approx_bmv = torch.where(bmv_mask.bool(), approx_bmv, fill_bmv)
+    approx_fmv = torch.where(fmv_mask.bool(), approx_fmv, torch.zeros_like(approx_fmv))
+    approx_bmv = torch.where(bmv_mask.bool(), approx_bmv, torch.zeros_like(approx_bmv))
     return FlowInitResult(bmv=approx_bmv, fmv=approx_fmv, masks=torch.cat((bmv_mask, fmv_mask), dim=1))
 
 
