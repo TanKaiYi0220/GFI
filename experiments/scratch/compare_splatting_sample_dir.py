@@ -230,39 +230,46 @@ def colorize_region_label(label: np.ndarray, hit_count: torch.Tensor) -> np.ndar
     color[label == 0] = np.array([24, 24, 24], dtype=np.uint8)
     color[label == 128] = np.array([220, 220, 220], dtype=np.uint8)
     many_to_one = label == 255
-    scale = 2.0
-    if np.any(many_to_one):
-        scale = max(float(np.percentile(hit_count_np[many_to_one], 99.0)), 2.0)
-        count_u8 = np.round(np.clip(hit_count_np / scale, 0.0, 1.0) * 255.0).astype(np.uint8)
-        count_color = cv2.applyColorMap(count_u8, cv2.COLORMAP_TURBO)
-        color[many_to_one] = count_color[many_to_one]
+    color[many_to_one & (hit_count_np <= 2)] = np.array([80, 210, 255], dtype=np.uint8)
+    color[many_to_one & (hit_count_np == 3)] = np.array([40, 200, 80], dtype=np.uint8)
+    color[many_to_one & (hit_count_np == 4)] = np.array([0, 170, 255], dtype=np.uint8)
+    color[many_to_one & (hit_count_np >= 5)] = np.array([40, 40, 220], dtype=np.uint8)
 
     height, width = label.shape
-    colorbar_width = 28
-    label_width = 102
-    canvas = np.full((height, width + colorbar_width + label_width + 16, 3), 255, dtype=np.uint8)
+    total_pixels = float(label.size)
+    normal_ratio = float(np.count_nonzero(label == 0) / total_pixels * 100.0)
+    hole_ratio = float(np.count_nonzero(label == 128) / total_pixels * 100.0)
+    multi2_ratio = float(np.count_nonzero(many_to_one & (hit_count_np <= 2)) / total_pixels * 100.0)
+    multi3_ratio = float(np.count_nonzero(many_to_one & (hit_count_np == 3)) / total_pixels * 100.0)
+    multi4_ratio = float(np.count_nonzero(many_to_one & (hit_count_np == 4)) / total_pixels * 100.0)
+    multi5_ratio = float(np.count_nonzero(many_to_one & (hit_count_np >= 5)) / total_pixels * 100.0)
+
+    legend_width = 170
+    canvas = np.full((height, width + legend_width, 3), 255, dtype=np.uint8)
     canvas[:, :width] = color
-    colorbar_values = np.linspace(1.0, 0.0, height, dtype=np.float32)[:, None]
-    colorbar_u8 = np.round(colorbar_values * 255.0).astype(np.uint8)
-    colorbar = cv2.applyColorMap(colorbar_u8, cv2.COLORMAP_TURBO)
-    canvas[:, width + 8 : width + 8 + colorbar_width] = colorbar
-    cv2.putText(canvas, "multi", (width + 8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
-    for tick_index in range(5):
-        tick_value = tick_index / 4.0
-        tick_y = int((1.0 - tick_value) * (height - 1))
-        actual_value = tick_value * scale
-        cv2.line(canvas, (width + 8, tick_y), (width + 35, tick_y), (0, 0, 0), 1)
+    legend_items = (
+        (f"normal {normal_ratio:.1f}%", (24, 24, 24)),
+        (f"hole {hole_ratio:.1f}%", (220, 220, 220)),
+        (f"multi=2 {multi2_ratio:.1f}%", (80, 210, 255)),
+        (f"multi=3 {multi3_ratio:.1f}%", (40, 200, 80)),
+        (f"multi=4 {multi4_ratio:.1f}%", (0, 170, 255)),
+        (f"multi>=5 {multi5_ratio:.1f}%", (40, 40, 220)),
+    )
+    cv2.putText(canvas, "legend", (width + 10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    for index, (label_text, bgr_color) in enumerate(legend_items):
+        y = 54 + index * 40
+        cv2.rectangle(canvas, (width + 12, y - 18), (width + 34, y + 4), bgr_color, -1)
+        cv2.rectangle(canvas, (width + 12, y - 18), (width + 34, y + 4), (0, 0, 0), 1)
         cv2.putText(
             canvas,
-            f"{actual_value:.1f}",
-            (width + 42, min(max(tick_y + 4, 12), height - 6)),
+            label_text,
+            (width + 42, y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
+            0.4,
             (0, 0, 0),
             1,
             cv2.LINE_AA,
         )
-    cv2.putText(canvas, "gray=hole", (width + 42, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 80, 80), 1, cv2.LINE_AA)
     return canvas
 
 
