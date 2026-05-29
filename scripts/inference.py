@@ -157,90 +157,6 @@ def build_splatting_region_maps(fmv_30: Any, bmv_30: Any, embt: Any, init_masks:
     }
 
 
-def calculate_masked_psnr(target: Any, prediction: Any, mask: Any) -> float:
-    import torch
-
-    mask_float = mask.to(device=target.device, dtype=target.dtype)
-    if mask_float.ndim == 2:
-        mask_float = mask_float.unsqueeze(0)
-
-    selected_pixels = mask_float.sum()
-    if float(selected_pixels.detach().cpu().item()) <= 0.0:
-        return -1.0
-
-    squared_error = (target - prediction) * (target - prediction)
-    channel_count = int(target.shape[0])
-    mse = (squared_error * mask_float).sum() / (selected_pixels * channel_count)
-    return float((-10 * torch.log10(mse)).detach().cpu().item())
-
-
-def build_default_splatting_region_metrics() -> dict[str, float]:
-    return {
-        "splatting_hit_bmv_ratio": -1.0,
-        "splatting_hit_fmv_ratio": -1.0,
-        "splatting_hit_both_ratio": -1.0,
-        "splatting_hole_any_ratio": -1.0,
-        "splatting_many_to_one_bmv_ratio": -1.0,
-        "splatting_many_to_one_fmv_ratio": -1.0,
-        "splatting_many_to_one_any_ratio": -1.0,
-        "psnr_splatting_hit_both": -1.0,
-        "psnr_splatting_hole_any": -1.0,
-        "psnr_splatting_many_to_one_any": -1.0,
-    }
-
-
-def build_splatting_region_metrics(imgt: Any, imgt_pred: Any, batch_index: int, region_maps: SplattingRegionMaps | None) -> dict[str, float]:
-    metrics = build_default_splatting_region_metrics()
-    if region_maps is None:
-        return metrics
-
-    bmv_hit = region_maps["bmv_hit"][batch_index, 0]
-    fmv_hit = region_maps["fmv_hit"][batch_index, 0]
-    hit_both = region_maps["hit_both"][batch_index, 0]
-    hole_any = region_maps["hole_any"][batch_index, 0]
-    bmv_many_to_one = region_maps["bmv_many_to_one"][batch_index, 0]
-    fmv_many_to_one = region_maps["fmv_many_to_one"][batch_index, 0]
-    many_to_one_any = region_maps["many_to_one_any"][batch_index, 0]
-    metrics.update(
-        {
-            "splatting_hit_bmv_ratio": float(bmv_hit.detach().cpu().float().mean().item()),
-            "splatting_hit_fmv_ratio": float(fmv_hit.detach().cpu().float().mean().item()),
-            "splatting_hit_both_ratio": float(hit_both.detach().cpu().float().mean().item()),
-            "splatting_hole_any_ratio": float(hole_any.detach().cpu().float().mean().item()),
-            "splatting_many_to_one_bmv_ratio": float(bmv_many_to_one.detach().cpu().float().mean().item()),
-            "splatting_many_to_one_fmv_ratio": float(fmv_many_to_one.detach().cpu().float().mean().item()),
-            "splatting_many_to_one_any_ratio": float(many_to_one_any.detach().cpu().float().mean().item()),
-            "psnr_splatting_hit_both": calculate_masked_psnr(imgt[batch_index], imgt_pred[batch_index], hit_both),
-            "psnr_splatting_hole_any": calculate_masked_psnr(imgt[batch_index], imgt_pred[batch_index], hole_any),
-            "psnr_splatting_many_to_one_any": calculate_masked_psnr(
-                imgt[batch_index],
-                imgt_pred[batch_index],
-                many_to_one_any,
-            ),
-        }
-    )
-    return metrics
-
-
-def mean_valid_metric(dataframe: Any, column_name: str) -> float:
-    valid_values = dataframe[dataframe[column_name] >= 0.0][column_name]
-    if len(valid_values) == 0:
-        return -1.0
-
-    return float(valid_values.mean())
-
-
-def splatting_mask_to_image(mask: Any, np: Any) -> Any:
-    return np.round(mask.detach().cpu().numpy().astype(np.float32) * 255.0).astype(np.uint8)
-
-
-def splatting_count_to_image(hit_count: Any, cv2: Any, np: Any) -> Any:
-    count_np = hit_count.detach().cpu().numpy().astype(np.float32)
-    scale = max(float(np.percentile(count_np, 99.0)), 1.0)
-    count_u8 = np.round(np.clip(count_np / scale, 0.0, 1.0) * 255.0).astype(np.uint8)
-    return cv2.applyColorMap(count_u8, cv2.COLORMAP_TURBO)
-
-
 def build_direction_splatting_region_label_image(hit: Any, many_to_one: Any, np: Any) -> Any:
     hit_np = hit[0, 0].detach().cpu().numpy().astype(bool)
     many_to_one_np = many_to_one[0, 0].detach().cpu().numpy().astype(bool)
@@ -251,45 +167,33 @@ def build_direction_splatting_region_label_image(hit: Any, many_to_one: Any, np:
     return label
 
 
-def colorize_splatting_region_label(label: Any, hit_count: Any, cv2: Any, np: Any) -> Any:
-    hit_count_np = hit_count.detach().cpu().numpy().astype(np.float32)
-    color = np.zeros((*label.shape, 3), dtype=np.uint8)
-    color[label == 0] = np.array([24, 24, 24], dtype=np.uint8)
-    color[label == 128] = np.array([220, 220, 220], dtype=np.uint8)
-    many_to_one = label == 255
-    color[many_to_one & (hit_count_np <= 2)] = np.array([80, 210, 255], dtype=np.uint8)
-    color[many_to_one & (hit_count_np == 3)] = np.array([40, 200, 80], dtype=np.uint8)
-    color[many_to_one & (hit_count_np == 4)] = np.array([0, 170, 255], dtype=np.uint8)
-    color[many_to_one & (hit_count_np >= 5)] = np.array([40, 40, 220], dtype=np.uint8)
-
-    height, width = label.shape
-    total_pixels = float(label.size)
-    normal_ratio = float(np.count_nonzero(label == 0) / total_pixels * 100.0)
-    hole_ratio = float(np.count_nonzero(label == 128) / total_pixels * 100.0)
-    multi2_ratio = float(np.count_nonzero(many_to_one & (hit_count_np <= 2)) / total_pixels * 100.0)
-    multi3_ratio = float(np.count_nonzero(many_to_one & (hit_count_np == 3)) / total_pixels * 100.0)
-    multi4_ratio = float(np.count_nonzero(many_to_one & (hit_count_np == 4)) / total_pixels * 100.0)
-    multi5_ratio = float(np.count_nonzero(many_to_one & (hit_count_np >= 5)) / total_pixels * 100.0)
-
-    legend_width = 170
+def build_splatting_legend_canvas(category_map: Any, cv2: Any, np: Any) -> Any:
+    height, width = category_map.shape
+    total_pixels = float(category_map.size)
+    normal_ratio = float(np.count_nonzero(category_map == 1) / total_pixels * 100.0)
+    hole_ratio = float(np.count_nonzero(category_map == 0) / total_pixels * 100.0)
+    multi2_ratio = float(np.count_nonzero(category_map == 2) / total_pixels * 100.0)
+    multi3_ratio = float(np.count_nonzero(category_map == 3) / total_pixels * 100.0)
+    multi4_ratio = float(np.count_nonzero(category_map == 4) / total_pixels * 100.0)
+    multi5_ratio = float(np.count_nonzero(category_map == 5) / total_pixels * 100.0)
+    legend_width = 190
     canvas = np.full((height, width + legend_width, 3), 255, dtype=np.uint8)
-    canvas[:, :width] = color
     legend_items = (
-        (f"normal {normal_ratio:.1f}%", (24, 24, 24)),
-        (f"hole {hole_ratio:.1f}%", (220, 220, 220)),
-        (f"multi=2 {multi2_ratio:.1f}%", (80, 210, 255)),
-        (f"multi=3 {multi3_ratio:.1f}%", (40, 200, 80)),
-        (f"multi=4 {multi4_ratio:.1f}%", (0, 170, 255)),
-        (f"multi>=5 {multi5_ratio:.1f}%", (40, 40, 220)),
+        ("normal", normal_ratio, (24, 24, 24)),
+        ("hole", hole_ratio, (220, 220, 220)),
+        ("multi=2", multi2_ratio, (255, 80, 40)),
+        ("multi=3", multi3_ratio, (70, 190, 70)),
+        ("multi=4", multi4_ratio, (0, 190, 255)),
+        ("multi>=5", multi5_ratio, (40, 40, 220)),
     )
     cv2.putText(canvas, "legend", (width + 10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-    for index, (label_text, bgr_color) in enumerate(legend_items):
+    for index, (label_text, ratio, bgr_color) in enumerate(legend_items):
         y = 54 + index * 40
         cv2.rectangle(canvas, (width + 12, y - 18), (width + 34, y + 4), bgr_color, -1)
         cv2.rectangle(canvas, (width + 12, y - 18), (width + 34, y + 4), (0, 0, 0), 1)
         cv2.putText(
             canvas,
-            label_text,
+            f"{label_text} {ratio:.1f}%",
             (width + 42, y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.4,
@@ -300,6 +204,42 @@ def colorize_splatting_region_label(label: Any, hit_count: Any, cv2: Any, np: An
     return canvas
 
 
+def colorize_splatting_category_map(category_map: Any, cv2: Any, np: Any) -> Any:
+    _height, width = category_map.shape
+    color = np.zeros((*category_map.shape, 3), dtype=np.uint8)
+    color[category_map == 1] = np.array([24, 24, 24], dtype=np.uint8)
+    color[category_map == 0] = np.array([220, 220, 220], dtype=np.uint8)
+    color[category_map == 2] = np.array([255, 80, 40], dtype=np.uint8)
+    color[category_map == 3] = np.array([70, 190, 70], dtype=np.uint8)
+    color[category_map == 4] = np.array([0, 190, 255], dtype=np.uint8)
+    color[category_map == 5] = np.array([40, 40, 220], dtype=np.uint8)
+    canvas = build_splatting_legend_canvas(category_map, cv2, np)
+    canvas[:, :width] = color
+    return canvas
+
+
+def build_splatting_category_map_from_hit_count(hit_count: Any, np: Any) -> Any:
+    hit_count_np = hit_count.detach().cpu().numpy().astype(np.float32)
+    category_map = np.ones(hit_count_np.shape, dtype=np.uint8)
+    category_map[hit_count_np <= 0] = 0
+    category_map[hit_count_np == 2] = 2
+    category_map[hit_count_np == 3] = 3
+    category_map[hit_count_np == 4] = 4
+    category_map[hit_count_np >= 5] = 5
+    return category_map
+
+
+def colorize_splatting_hit_count(hit_count: Any, cv2: Any, np: Any) -> Any:
+    return colorize_splatting_category_map(build_splatting_category_map_from_hit_count(hit_count, np), cv2, np)
+
+
+def colorize_splatting_region_label(label: Any, hit_count: Any, cv2: Any, np: Any) -> Any:
+    category_map = build_splatting_category_map_from_hit_count(hit_count, np)
+    category_map[label == 128] = 0
+    category_map[label == 0] = 1
+    return colorize_splatting_category_map(category_map, cv2, np)
+
+
 def save_splatting_region_visuals(
     cv2: Any,
     np: Any,
@@ -308,16 +248,7 @@ def save_splatting_region_visuals(
     save_image: Any,
 ) -> dict[str, str]:
     image_paths = {
-        "splatting_hit_bmv_path": "",
-        "splatting_hit_fmv_path": "",
-        "splatting_hit_both_path": "",
-        "splatting_hole_any_path": "",
-        "splatting_many_to_one_bmv_path": "",
-        "splatting_many_to_one_fmv_path": "",
-        "splatting_many_to_one_any_path": "",
-        "splatting_region_label_bmv_path": "",
         "splatting_region_label_bmv_color_path": "",
-        "splatting_region_label_fmv_path": "",
         "splatting_region_label_fmv_color_path": "",
         "splatting_hit_count_bmv_path": "",
         "splatting_hit_count_fmv_path": "",
@@ -336,41 +267,23 @@ def save_splatting_region_visuals(
         np,
     )
     outputs = {
-        "splatting_hit_bmv_path": splatting_mask_to_image(region_maps["bmv_hit"][0, 0], np),
-        "splatting_hit_fmv_path": splatting_mask_to_image(region_maps["fmv_hit"][0, 0], np),
-        "splatting_hit_both_path": splatting_mask_to_image(region_maps["hit_both"][0, 0], np),
-        "splatting_hole_any_path": splatting_mask_to_image(region_maps["hole_any"][0, 0], np),
-        "splatting_many_to_one_bmv_path": splatting_mask_to_image(region_maps["bmv_many_to_one"][0, 0], np),
-        "splatting_many_to_one_fmv_path": splatting_mask_to_image(region_maps["fmv_many_to_one"][0, 0], np),
-        "splatting_many_to_one_any_path": splatting_mask_to_image(region_maps["many_to_one_any"][0, 0], np),
-        "splatting_region_label_bmv_path": bmv_region_label,
         "splatting_region_label_bmv_color_path": colorize_splatting_region_label(
             bmv_region_label,
             region_maps["bmv_hit_count"][0, 0],
             cv2,
             np,
         ),
-        "splatting_region_label_fmv_path": fmv_region_label,
         "splatting_region_label_fmv_color_path": colorize_splatting_region_label(
             fmv_region_label,
             region_maps["fmv_hit_count"][0, 0],
             cv2,
             np,
         ),
-        "splatting_hit_count_bmv_path": splatting_count_to_image(region_maps["bmv_hit_count"][0, 0], cv2, np),
-        "splatting_hit_count_fmv_path": splatting_count_to_image(region_maps["fmv_hit_count"][0, 0], cv2, np),
+        "splatting_hit_count_bmv_path": colorize_splatting_hit_count(region_maps["bmv_hit_count"][0, 0], cv2, np),
+        "splatting_hit_count_fmv_path": colorize_splatting_hit_count(region_maps["fmv_hit_count"][0, 0], cv2, np),
     }
     filenames = {
-        "splatting_hit_bmv_path": "splatting_hit_bmv.png",
-        "splatting_hit_fmv_path": "splatting_hit_fmv.png",
-        "splatting_hit_both_path": "splatting_hit_both.png",
-        "splatting_hole_any_path": "splatting_hole_any.png",
-        "splatting_many_to_one_bmv_path": "splatting_many_to_one_bmv.png",
-        "splatting_many_to_one_fmv_path": "splatting_many_to_one_fmv.png",
-        "splatting_many_to_one_any_path": "splatting_many_to_one_any.png",
-        "splatting_region_label_bmv_path": "splatting_region_label_bmv.png",
         "splatting_region_label_bmv_color_path": "splatting_region_label_bmv_color.png",
-        "splatting_region_label_fmv_path": "splatting_region_label_fmv.png",
         "splatting_region_label_fmv_color_path": "splatting_region_label_fmv_color.png",
         "splatting_hit_count_bmv_path": "splatting_hit_count_bmv.png",
         "splatting_hit_count_fmv_path": "splatting_hit_count_fmv.png",
@@ -473,7 +386,7 @@ def run_inference_batch(
         }
 
     if model_name == RESIDUAL_MODEL_NAME:
-        img0, imgt, img1, bmv, fmv, _, _, embt, _info = batch
+        img0, imgt, img1, bmv, fmv, embt, _info = batch
         img0 = img0.to(device)
         imgt = imgt.to(device)
         img1 = img1.to(device)
@@ -755,7 +668,7 @@ def main(argv: list[str] | None = None) -> None:
     with torch.no_grad():
         for (record, mode_name), group_dataframe in dataframe.groupby(["record", "mode"], sort=False):
             group_dataframe = group_dataframe.reset_index(drop=True)
-            if model_name == BASELINE_MODEL_NAME:
+            if model_name in (BASELINE_MODEL_NAME, RESIDUAL_MODEL_NAME):
                 dataset = VFITrainDataset(group_dataframe, str(dataset_root_dir), False, input_fps)
             else:
                 include_source_depths = flow_approx_method in SPLATTING_FLOW_APPROX_METHODS
@@ -787,12 +700,6 @@ def main(argv: list[str] | None = None) -> None:
                     row = group_dataframe.iloc[sample_offset + batch_index]
                     frame_range = f"frame_{int(row['img0']):04d}_{int(row['img2']):04d}"
                     psnr_value = float(calculate_psnr(imgt[batch_index], imgt_pred[batch_index]).detach().cpu().item())
-                    splatting_region_metrics = build_splatting_region_metrics(
-                        imgt=imgt,
-                        imgt_pred=imgt_pred,
-                        batch_index=batch_index,
-                        region_maps=splatting_region_maps,
-                    )
                     psnr_meter.update(psnr_value, 1)
                     record_meter.update(psnr_value, 1)
 
@@ -829,7 +736,6 @@ def main(argv: list[str] | None = None) -> None:
                             "distance_index_mean": float(row["D_index Mean"]) if "D_index Mean" in row.index else -1.0,
                             "distance_index_median": float(row["D_index Median"]) if "D_index Median" in row.index else -1.0,
                             "psnr": psnr_value,
-                            **splatting_region_metrics,
                             "flow_diff_1_to_0_mean": diff_1_to_0["diff_mag_mean"],
                             "flow_diff_1_to_0_max": diff_1_to_0["diff_mag_max"],
                             "flow_diff_1_to_0_changed_ratio": diff_1_to_0["diff_changed_ratio"],
@@ -852,17 +758,6 @@ def main(argv: list[str] | None = None) -> None:
                     "record_name": f"{record}_{mode_name}",
                     "samples": int(len(group_dataframe)),
                     "mean_psnr": float(record_meter.avg),
-                    "mean_psnr_splatting_hit_both": mean_valid_metric(group_metrics_df, "psnr_splatting_hit_both"),
-                    "mean_psnr_splatting_hole_any": mean_valid_metric(group_metrics_df, "psnr_splatting_hole_any"),
-                    "mean_psnr_splatting_many_to_one_any": mean_valid_metric(
-                        group_metrics_df,
-                        "psnr_splatting_many_to_one_any",
-                    ),
-                    "mean_splatting_hole_any_ratio": mean_valid_metric(group_metrics_df, "splatting_hole_any_ratio"),
-                    "mean_splatting_many_to_one_any_ratio": mean_valid_metric(
-                        group_metrics_df,
-                        "splatting_many_to_one_any_ratio",
-                    ),
                 }
             )
             selected_sample_reasons: dict[int, list[str]] = {}
@@ -901,16 +796,7 @@ def main(argv: list[str] | None = None) -> None:
                 "image_0_init_warped_path",
                 "image_1_init_warped_path",
                 "image_init_warped_merge_path",
-                "splatting_hit_bmv_path",
-                "splatting_hit_fmv_path",
-                "splatting_hit_both_path",
-                "splatting_hole_any_path",
-                "splatting_many_to_one_bmv_path",
-                "splatting_many_to_one_fmv_path",
-                "splatting_many_to_one_any_path",
-                "splatting_region_label_bmv_path",
                 "splatting_region_label_bmv_color_path",
-                "splatting_region_label_fmv_path",
                 "splatting_region_label_fmv_color_path",
                 "splatting_hit_count_bmv_path",
                 "splatting_hit_count_fmv_path",
