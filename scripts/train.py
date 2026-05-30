@@ -642,6 +642,27 @@ def log_run_summary(
     )
 
 
+def is_raw_model_state_dict(checkpoint: Any, torch_module: Any) -> bool:
+    if not isinstance(checkpoint, dict) or len(checkpoint) == 0:
+        return False
+
+    return all(isinstance(key, str) and torch_module.is_tensor(value) for key, value in checkpoint.items())
+
+
+def extract_pretrained_state_dict(checkpoint: Any, checkpoint_path: Path, torch_module: Any) -> Any:
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        return checkpoint["model"]
+
+    if is_raw_model_state_dict(checkpoint, torch_module):
+        return checkpoint
+
+    available_keys = sorted(checkpoint.keys()) if isinstance(checkpoint, dict) else []
+    raise KeyError(
+        "pretrained_checkpoint_path must point to either a raw model state_dict or a full training checkpoint "
+        f"containing a 'model' key: path={checkpoint_path}, keys={available_keys}"
+    )
+
+
 def load_training_state(
     args: argparse.Namespace,
     model: Any,
@@ -653,6 +674,8 @@ def load_training_state(
 
     if args.resume_path is not None:
         checkpoint = torch.load(args.resume_path, map_location=device)
+        if "model" not in checkpoint or "optimizer" not in checkpoint or "epoch" not in checkpoint:
+            raise KeyError(f"resume_path must point to a full training checkpoint with model, optimizer, and epoch: {args.resume_path}")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
 
@@ -669,7 +692,8 @@ def load_training_state(
     if pretrained_path is not None:
         pretrained_path = Path(pretrained_path)
         logger.info("Loading pretrained checkpoint from %s", pretrained_path)
-        model.load_state_dict(torch.load(str(pretrained_path), map_location=device))
+        checkpoint = torch.load(str(pretrained_path), map_location=device)
+        model.load_state_dict(extract_pretrained_state_dict(checkpoint, pretrained_path, torch))
         return TrainingState(
             start_epoch=0,
             global_step=0,
