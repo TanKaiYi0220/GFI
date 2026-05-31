@@ -3,9 +3,12 @@
   "model_name": "IFRNet",
   "root_dir": "data/Minor_0507/",
   "dataset_root_dir": "/workspace/datasets/Minor_0507/",
-  "inference_preset": "train_minor_0507",
-  "checkpoint_path": "outputs/IFRNet_FineTuning_0507/checkpoints/best.pth",
-  "output_dir": "inference_outputs/train_smoke_dual/inference_ifrnet",
+  "inference_preset": [
+    "train_minor_0507",
+    "test_minor_0507"
+  ],
+  "checkpoint_path": "outputs/IFRNet_FineTuning_0530/checkpoints/latest.pth",
+  "output_dir": "inference_outputs/IFRNet_FineTuning_0530/",
   "seed": 1234,
   "batch_size": 1,
   "only_fps": 60,
@@ -18,7 +21,7 @@
   "save_topk_best_psnr": 5,
   "save_topk_largest_flow_diff": 10,
   "video": {
-    "output_dir": "inference_outputs/train_smoke_dual/inference_ifrnet/videos",
+    "output_dir": "inference_outputs/IFRNet_FineTuning_0530/videos",
     "fps": 60,
     "ignore_valid": true,
     "record_filter": null,

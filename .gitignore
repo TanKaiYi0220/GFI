@@ -9,6 +9,7 @@ __pycache__/
 outputs/
 analysis_outputs/
 inference_outputs/
+compare_outptus/
 data/
 dataset/
 datasets/

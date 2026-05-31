@@ -11,10 +11,10 @@
   "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 16,
-  "output_dir": "outputs/IFRNet_FineTuning_0507/",
+  "output_dir": "outputs/IFRNet_FineTuning_0530/",
   "only_fps": 60,
   "input_fps": 30,
-  "resume_path": "outputs/IFRNet_FineTuning_0507/checkpoints/latest.pth",
+  "resume_path": null,
   "pretrained_checkpoint_path": "src/models/external/IFRNet/checkpoints/IFRNet/IFRNet_Vimeo90K.pth",
   "sample_train_frames": [
     "ARPG_3_0_Medium_5_0404",
