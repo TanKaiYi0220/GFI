@@ -20,5 +20,7 @@
   "kernel_size": 9,
   "confidence_threshold": 0.08,
   "save_overlay_images": true,
+  "save_selected_cases_only": false,
+  "selected_cases_per_bucket": 12,
   "resolved_data_preset_name": "train_minor_0507"
 }
