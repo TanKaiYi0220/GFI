@@ -19,16 +19,27 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import DataLoader
 
 from src.data.dataset_config import get_dataset_preset
 from src.data.dataset_config import iter_dataset_configs
 from src.data.dataset_config import list_dataset_presets
 from src.data.dataset_loader import depth_to_tensor
+from src.data.dataset_loader import FlowEstimationTrainDataset
 from src.data.dataset_loader import flow_to_tensor
+from src.data.dataset_loader import VFITrainDataset
 from src.data.image_ops import load_backward_velocity
 from src.engine.flow_approx import build_flow_init_result
 from src.engine.flow_approx import flatten_target_index
 from src.engine.flow_approx import make_source_grid
+from src.engine.flow_approx import SPLATTING_FLOW_APPROX_METHODS
+from src.utils.config import load_yaml_file
+from scripts.inference import BASELINE_MODEL_NAME
+from scripts.inference import RESIDUAL_FLOW_APPROX_MODEL_NAME
+from scripts.inference import RESIDUAL_MODEL_NAME
+from scripts.inference import run_inference_batch
+from scripts.train import read_model_init_args
+from scripts.train import resolve_model_class
 
 
 class SamplePreset(TypedDict):
@@ -48,6 +59,15 @@ class DataPreset(TypedDict):
     candidate_name: str
     baseline_name: str
     samples: list[SamplePreset]
+
+
+class InferenceModelSpec(TypedDict):
+    config_path: str
+    model_name: str
+    flow_approx_method: str
+    scale_factor: float
+    input_fps: int
+    model: Any
 
 
 RegionMaps = dict[str, np.ndarray]
@@ -122,6 +142,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset-root-dir", default=config.get("dataset_root_dir"), type=str, help="Root directory containing raw frame and velocity assets.")
     parser.add_argument("--candidate-result-root", default=config.get("candidate_result_root"), type=str, help="Inference/sample result root for the candidate model.")
     parser.add_argument("--baseline-result-root", default=config.get("baseline_result_root"), type=str, help="Inference/sample result root for the baseline model.")
+    parser.add_argument("--candidate-inference-config", default=config.get("candidate_inference_config"), type=str, help="Inference config used to run the candidate model directly.")
+    parser.add_argument("--baseline-inference-config", default=config.get("baseline_inference_config"), type=str, help="Inference config used to run the baseline model directly.")
     parser.add_argument("--candidate-name", default=config_default(config, "candidate_name", "candidate"), type=str)
     parser.add_argument("--baseline-name", default=config_default(config, "baseline_name", "baseline"), type=str)
     parser.add_argument("--only-fps", default=int(config_default(config, "only_fps", 60)), type=int)
@@ -150,6 +172,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("one of --data-preset or --dataset-preset is required, either in CLI or config")
     if args.data_preset is not None and args.dataset_preset is not None:
         parser.error("only one of --data-preset or --dataset-preset can be set")
+    if (args.candidate_inference_config is None) != (args.baseline_inference_config is None):
+        parser.error("--candidate-inference-config and --baseline-inference-config must be set together")
     if int(args.kernel_size) <= 0:
         parser.error("--kernel-size must be positive")
     if int(args.kernel_size) % 2 == 0:
@@ -205,25 +229,58 @@ def load_flow_and_depth_tensors(path: Path, device: torch.device) -> tuple[torch
     return flow_tensor, depth_tensor
 
 
+def load_inference_model(config_path_text: str, device: torch.device) -> InferenceModelSpec:
+    config_path = resolve_input_path(config_path_text)
+    config = load_yaml_file(config_path)
+    model_name = str(config["model_name"])
+    model_init_args = read_model_init_args(config)
+    checkpoint_path = resolve_input_path(str(config["checkpoint_path"]))
+    model_class = resolve_model_class(model_name)
+    model = model_class(**model_init_args).to(device)
+    checkpoint = torch.load(str(checkpoint_path), map_location=device)
+    state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    model.load_state_dict(state_dict)
+    model.eval()
+    return {
+        "config_path": str(config_path),
+        "model_name": model_name,
+        "flow_approx_method": str(config["flow_approx_method"]),
+        "scale_factor": float(config["scale_factor"]),
+        "input_fps": int(config["input_fps"]),
+        "model": model,
+    }
+
+
 def resolve_input_path(path_text: str) -> Path:
     path = Path(path_text)
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
+def has_model_inference_configs(args: argparse.Namespace) -> bool:
+    return args.candidate_inference_config is not None and args.baseline_inference_config is not None
+
+
 def require_dataset_args(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
+    needs_result_roots = not has_model_inference_configs(args)
     missing_names = [
         name
-        for name in ("root_dir", "dataset_root_dir", "candidate_result_root", "baseline_result_root")
+        for name in ("root_dir", "dataset_root_dir")
         if getattr(args, name) is None
     ]
+    if needs_result_roots:
+        missing_names.extend(
+            name
+            for name in ("candidate_result_root", "baseline_result_root")
+            if getattr(args, name) is None
+        )
     if len(missing_names) > 0:
         raise ValueError(f"--dataset-preset requires these arguments: {', '.join('--' + name.replace('_', '-') for name in missing_names)}")
 
     return (
         resolve_input_path(str(args.root_dir)),
         resolve_input_path(str(args.dataset_root_dir)),
-        resolve_input_path(str(args.candidate_result_root)),
-        resolve_input_path(str(args.baseline_result_root)),
+        Path("") if args.candidate_result_root is None else resolve_input_path(str(args.candidate_result_root)),
+        Path("") if args.baseline_result_root is None else resolve_input_path(str(args.baseline_result_root)),
     )
 
 
@@ -395,7 +452,7 @@ def build_samples_from_dataset_preset(args: argparse.Namespace) -> DataPreset:
     missing_previews: list[dict[str, object]] = []
     for _index, row in dataframe.iterrows():
         sample = build_dataset_sample(row, dataset_root_dir, candidate_result_root, baseline_result_root, args)
-        if bool(args.skip_missing_results) and not result_files_exist(sample):
+        if bool(args.skip_missing_results) and not has_model_inference_configs(args) and not result_files_exist(sample):
             if len(missing_previews) < 5:
                 missing_previews.append(build_missing_result_preview(sample))
             continue
@@ -448,6 +505,55 @@ def build_nearest_splat_hit_count(source_motion: torch.Tensor) -> torch.Tensor:
 
 def tensor_mask_to_numpy(mask: torch.Tensor) -> np.ndarray:
     return mask[0, 0].detach().cpu().numpy().astype(bool)
+
+
+def tensor_image_to_numpy(image: torch.Tensor) -> np.ndarray:
+    return image[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy().astype(np.float32)
+
+
+def build_sample_dataframe(sample: SamplePreset) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "img0": int(sample["frame_0"]),
+                "img1": int(sample["frame_t"]),
+                "img2": int(sample["frame_1"]),
+                "record": sample["record"],
+                "mode": sample["mode"],
+                "valid": True,
+            }
+        ]
+    )
+
+
+def build_model_dataset(sample: SamplePreset, model_spec: InferenceModelSpec) -> VFITrainDataset | FlowEstimationTrainDataset:
+    dataframe = build_sample_dataframe(sample)
+    dataset_root_dir = sample["dataset_root_dir"]
+    model_name = model_spec["model_name"]
+    input_fps = int(model_spec["input_fps"])
+    if model_name in (BASELINE_MODEL_NAME, RESIDUAL_MODEL_NAME):
+        return VFITrainDataset(dataframe, dataset_root_dir, False, input_fps)
+
+    if model_name == RESIDUAL_FLOW_APPROX_MODEL_NAME:
+        include_source_depths = model_spec["flow_approx_method"] in SPLATTING_FLOW_APPROX_METHODS
+        return FlowEstimationTrainDataset(dataframe, dataset_root_dir, input_fps, False, include_source_depths)
+
+    raise ValueError(f"Unsupported model_name for direct comparison inference: {model_name}")
+
+
+def run_model_prediction(sample: SamplePreset, model_spec: InferenceModelSpec, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
+    dataset = build_model_dataset(sample=sample, model_spec=model_spec)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+    batch = next(iter(loader))
+    inference_result = run_inference_batch(
+        batch=batch,
+        device=device,
+        flow_approx_method=model_spec["flow_approx_method"],
+        model=model_spec["model"],
+        model_name=model_spec["model_name"],
+        scale_factor=float(model_spec["scale_factor"]),
+    )
+    return tensor_image_to_numpy(inference_result["imgt"]), tensor_image_to_numpy(inference_result["imgt_pred"])
 
 
 def build_region_maps(sample: SamplePreset, device: torch.device) -> RegionMaps:
@@ -775,6 +881,81 @@ def analyze_sample(
     return rows
 
 
+def analyze_sample_with_models(
+    data_preset_name: str,
+    sample: SamplePreset,
+    candidate_name: str,
+    baseline_name: str,
+    output_dir: Path,
+    candidate_model: InferenceModelSpec,
+    baseline_model: InferenceModelSpec,
+    device: torch.device,
+    kernel_size: int,
+    confidence_threshold: float,
+    save_overlay_images: bool,
+) -> list[dict[str, object]]:
+    candidate_target, candidate_prediction = run_model_prediction(sample=sample, model_spec=candidate_model, device=device)
+    baseline_target, baseline_prediction = run_model_prediction(sample=sample, model_spec=baseline_model, device=device)
+    validate_same_shape("candidate_target", baseline_target, candidate_target)
+    validate_same_shape("candidate_prediction", baseline_target, candidate_prediction)
+    validate_same_shape("baseline_prediction", baseline_target, baseline_prediction)
+    if not np.allclose(baseline_target, candidate_target, atol=1.0 / 255.0):
+        raise ValueError(f"Ground-truth mismatch after model inference: sample_id={sample['sample_id']}")
+
+    region_maps = build_region_maps(sample=sample, device=device)
+    candidate_better, baseline_better, neutral = build_local_winner_masks(
+        target=baseline_target,
+        candidate_prediction=candidate_prediction,
+        baseline_prediction=baseline_prediction,
+        kernel_size=kernel_size,
+        confidence_threshold=confidence_threshold,
+    )
+    sample_winner = choose_sample_winner(
+        target=baseline_target,
+        candidate_prediction=candidate_prediction,
+        baseline_prediction=baseline_prediction,
+    )
+    sample_output_dir = build_sample_output_dir(output_dir=output_dir, sample=sample, sample_winner=sample_winner)
+    overlay_path = ""
+    if save_overlay_images:
+        overlay_path = save_sample_overlay(
+            sample=sample,
+            target=baseline_target,
+            candidate_prediction=candidate_prediction,
+            baseline_prediction=baseline_prediction,
+            output_dir=sample_output_dir,
+            candidate_name=candidate_name,
+            baseline_name=baseline_name,
+            kernel_size=kernel_size,
+            confidence_threshold=confidence_threshold,
+        )
+
+    rows: list[dict[str, object]] = []
+    for region_name, region_mask in region_maps.items():
+        rows.append(
+            build_region_row(
+                data_preset_name=data_preset_name,
+                sample=sample,
+                candidate_name=candidate_name,
+                baseline_name=baseline_name,
+                region_name=region_name,
+                region_mask=region_mask,
+                target=baseline_target,
+                candidate_prediction=candidate_prediction,
+                baseline_prediction=baseline_prediction,
+                candidate_better=candidate_better,
+                baseline_better=baseline_better,
+                neutral=neutral,
+                kernel_size=kernel_size,
+                confidence_threshold=confidence_threshold,
+                sample_winner=sample_winner,
+                overlay_path=overlay_path,
+            )
+        )
+
+    return rows
+
+
 def build_effective_config(args: argparse.Namespace, data_preset_name: str, output_dir: Path) -> dict[str, object]:
     return {
         "config": str(args.config) if args.config is not None else "",
@@ -784,6 +965,8 @@ def build_effective_config(args: argparse.Namespace, data_preset_name: str, outp
         "dataset_root_dir": str(args.dataset_root_dir) if args.dataset_root_dir is not None else "",
         "candidate_result_root": str(args.candidate_result_root) if args.candidate_result_root is not None else "",
         "baseline_result_root": str(args.baseline_result_root) if args.baseline_result_root is not None else "",
+        "candidate_inference_config": str(args.candidate_inference_config) if args.candidate_inference_config is not None else "",
+        "baseline_inference_config": str(args.baseline_inference_config) if args.baseline_inference_config is not None else "",
         "candidate_name": str(args.candidate_name),
         "baseline_name": str(args.baseline_name),
         "only_fps": int(args.only_fps),
@@ -912,6 +1095,48 @@ def save_selected_case_overlays(
     return saved_cases
 
 
+def save_selected_case_model_overlays(
+    data_preset: DataPreset,
+    selected_cases: pd.DataFrame,
+    output_dir: Path,
+    candidate_name: str,
+    baseline_name: str,
+    candidate_model: InferenceModelSpec,
+    baseline_model: InferenceModelSpec,
+    device: torch.device,
+    kernel_size: int,
+    confidence_threshold: float,
+) -> pd.DataFrame:
+    sample_by_id = {sample["sample_id"]: sample for sample in data_preset["samples"]}
+    saved_cases = selected_cases.copy()
+    overlay_paths: list[str] = []
+    for selected_case in saved_cases.to_dict("records"):
+        sample_id = str(selected_case["sample_id"])
+        sample = sample_by_id[sample_id]
+        candidate_target, candidate_prediction = run_model_prediction(sample=sample, model_spec=candidate_model, device=device)
+        baseline_target, baseline_prediction = run_model_prediction(sample=sample, model_spec=baseline_model, device=device)
+        if not np.allclose(baseline_target, candidate_target, atol=1.0 / 255.0):
+            raise ValueError(f"Ground-truth mismatch while saving selected overlay: sample_id={sample_id}")
+
+        record_name = sample["record"] if sample["record"] != "" else "scratch"
+        case_output_dir = output_dir / record_name / str(selected_case["psnr_bucket"]) / str(selected_case["sample_winner"])
+        overlay_path = save_sample_overlay(
+            sample=sample,
+            target=baseline_target,
+            candidate_prediction=candidate_prediction,
+            baseline_prediction=baseline_prediction,
+            output_dir=case_output_dir,
+            candidate_name=candidate_name,
+            baseline_name=baseline_name,
+            kernel_size=kernel_size,
+            confidence_threshold=confidence_threshold,
+        )
+        overlay_paths.append(overlay_path)
+
+    saved_cases["selected_overlay_path"] = overlay_paths
+    return saved_cases
+
+
 def run_analysis(data_preset_name: str, data_preset: DataPreset, args: argparse.Namespace) -> Path:
     output_dir = resolve_output_dir(args=args, data_preset_name=data_preset_name)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -919,20 +1144,44 @@ def run_analysis(data_preset_name: str, data_preset: DataPreset, args: argparse.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     rows: list[dict[str, object]] = []
     save_all_overlays = bool(args.save_overlay_images) and not bool(args.save_selected_cases_only)
-    for sample in data_preset["samples"]:
-        rows.extend(
-            analyze_sample(
-                data_preset_name=data_preset_name,
-                sample=sample,
-                candidate_name=data_preset["candidate_name"],
-                baseline_name=data_preset["baseline_name"],
-                output_dir=output_dir,
-                device=device,
-                kernel_size=int(args.kernel_size),
-                confidence_threshold=float(args.confidence_threshold),
-                save_overlay_images=save_all_overlays,
-            )
-        )
+    candidate_model = None
+    baseline_model = None
+    if has_model_inference_configs(args):
+        candidate_model = load_inference_model(str(args.candidate_inference_config), device)
+        baseline_model = load_inference_model(str(args.baseline_inference_config), device)
+
+    with torch.no_grad():
+        for sample in data_preset["samples"]:
+            if candidate_model is not None and baseline_model is not None:
+                rows.extend(
+                    analyze_sample_with_models(
+                        data_preset_name=data_preset_name,
+                        sample=sample,
+                        candidate_name=data_preset["candidate_name"],
+                        baseline_name=data_preset["baseline_name"],
+                        output_dir=output_dir,
+                        candidate_model=candidate_model,
+                        baseline_model=baseline_model,
+                        device=device,
+                        kernel_size=int(args.kernel_size),
+                        confidence_threshold=float(args.confidence_threshold),
+                        save_overlay_images=save_all_overlays,
+                    )
+                )
+            else:
+                rows.extend(
+                    analyze_sample(
+                        data_preset_name=data_preset_name,
+                        sample=sample,
+                        candidate_name=data_preset["candidate_name"],
+                        baseline_name=data_preset["baseline_name"],
+                        output_dir=output_dir,
+                        device=device,
+                        kernel_size=int(args.kernel_size),
+                        confidence_threshold=float(args.confidence_threshold),
+                        save_overlay_images=save_all_overlays,
+                    )
+                )
 
     metrics = pd.DataFrame(rows)
     metrics.to_csv(output_dir / "region_winner_ratios.csv", index=False)
@@ -942,15 +1191,30 @@ def run_analysis(data_preset_name: str, data_preset: DataPreset, args: argparse.
     case_summary = build_case_summary(metrics)
     selected_cases = select_cases_by_quality(case_summary=case_summary, selected_cases_per_bucket=int(args.selected_cases_per_bucket))
     if bool(args.save_overlay_images) and bool(args.save_selected_cases_only) and len(selected_cases) > 0:
-        selected_cases = save_selected_case_overlays(
-            data_preset=data_preset,
-            selected_cases=selected_cases,
-            output_dir=output_dir,
-            candidate_name=data_preset["candidate_name"],
-            baseline_name=data_preset["baseline_name"],
-            kernel_size=int(args.kernel_size),
-            confidence_threshold=float(args.confidence_threshold),
-        )
+        with torch.no_grad():
+            if candidate_model is not None and baseline_model is not None:
+                selected_cases = save_selected_case_model_overlays(
+                    data_preset=data_preset,
+                    selected_cases=selected_cases,
+                    output_dir=output_dir,
+                    candidate_name=data_preset["candidate_name"],
+                    baseline_name=data_preset["baseline_name"],
+                    candidate_model=candidate_model,
+                    baseline_model=baseline_model,
+                    device=device,
+                    kernel_size=int(args.kernel_size),
+                    confidence_threshold=float(args.confidence_threshold),
+                )
+            else:
+                selected_cases = save_selected_case_overlays(
+                    data_preset=data_preset,
+                    selected_cases=selected_cases,
+                    output_dir=output_dir,
+                    candidate_name=data_preset["candidate_name"],
+                    baseline_name=data_preset["baseline_name"],
+                    kernel_size=int(args.kernel_size),
+                    confidence_threshold=float(args.confidence_threshold),
+                )
     write_selected_case_metrics(output_dir=output_dir, selected_cases=selected_cases)
     return output_dir
 
