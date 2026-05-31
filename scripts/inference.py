@@ -42,6 +42,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def read_inference_presets(config: dict[str, Any]) -> list[str]:
+    if "inference_presets" in config:
+        value = config["inference_presets"]
+    elif "inference_preset" in config:
+        value = config["inference_preset"]
+    else:
+        raise KeyError("Config must contain inference_preset or inference_presets.")
+
+    if isinstance(value, str):
+        return [value]
+
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        if len(value) == 0:
+            raise ValueError("inference_presets must contain at least one preset name.")
+        return value
+
+    raise TypeError("inference_preset must be a string, or inference_presets must be a list of strings.")
+
+
 def save_flow_diff_visuals(
     save_dir: Path,
     name: str,
@@ -572,7 +591,7 @@ def main(argv: list[str] | None = None) -> None:
     mode = str(config["mode"])
     model_name = str(config["model_name"])
     model_init_args = read_model_init_args(config)
-    inference_preset = str(config["inference_preset"])
+    inference_presets = read_inference_presets(config)
     flow_approx_method = str(config["flow_approx_method"])
     scale_factor = float(config["scale_factor"])
     flow_diff_threshold = float(config.get("flow_diff_threshold", 1.0))
@@ -607,7 +626,7 @@ def main(argv: list[str] | None = None) -> None:
     summary = {
         "mode": mode,
         "model_name": model_name,
-        "inference_preset": inference_preset,
+        "inference_presets": inference_presets,
         "root_dir": str(root_dir),
         "dataset_root_dir": str(dataset_root_dir),
         "checkpoint_path": str(checkpoint_path),
@@ -649,7 +668,13 @@ def main(argv: list[str] | None = None) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("device=%s model=%s", device, model_name)
 
-    dataframe = build_merged_dataframe(root_dir, output_dir, inference_preset, only_fps, logger)
+    dataframe_list: list[Any] = []
+    for inference_preset in inference_presets:
+        preset_dataframe = build_merged_dataframe(root_dir, output_dir, inference_preset, only_fps, logger)
+        preset_dataframe["inference_preset"] = inference_preset
+        dataframe_list.append(preset_dataframe)
+
+    dataframe = pd.concat(dataframe_list, ignore_index=True)
     if "valid" in dataframe.columns:
         dataframe = dataframe[dataframe["valid"] == True].reset_index(drop=True)
     model_class = resolve_model_class(model_name)
@@ -666,7 +691,7 @@ def main(argv: list[str] | None = None) -> None:
     record_rows: list[dict[str, object]] = []
 
     with torch.no_grad():
-        for (record, mode_name), group_dataframe in dataframe.groupby(["record", "mode"], sort=False):
+        for (inference_preset, record, mode_name), group_dataframe in dataframe.groupby(["inference_preset", "record", "mode"], sort=False):
             group_dataframe = group_dataframe.reset_index(drop=True)
             if model_name in (BASELINE_MODEL_NAME, RESIDUAL_MODEL_NAME):
                 dataset = VFITrainDataset(group_dataframe, str(dataset_root_dir), False, input_fps)
@@ -682,7 +707,7 @@ def main(argv: list[str] | None = None) -> None:
 
             loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
             record_meter = AverageMeter()
-            progress = tqdm(loader, desc=f"{record}_{mode_name}", leave=True)
+            progress = tqdm(loader, desc=f"{inference_preset}_{record}_{mode_name}", leave=True)
             sample_offset = 0
             group_rows: list[dict[str, object]] = []
 
@@ -728,6 +753,7 @@ def main(argv: list[str] | None = None) -> None:
                     group_rows.append(
                         {
                             "sample_index": int(sample_offset + batch_index),
+                            "inference_preset": str(inference_preset),
                             "record": str(record),
                             "mode": str(mode_name),
                             "record_name": f"{record}_{mode_name}",
@@ -754,6 +780,7 @@ def main(argv: list[str] | None = None) -> None:
             record_rows.append(
                 {
                     "record": str(record),
+                    "inference_preset": str(inference_preset),
                     "mode": str(mode_name),
                     "record_name": f"{record}_{mode_name}",
                     "samples": int(len(group_dataframe)),
@@ -807,7 +834,7 @@ def main(argv: list[str] | None = None) -> None:
             if len(selected_indices) > 0:
                 selected_dataset = Subset(dataset, selected_indices)
                 selected_loader = DataLoader(selected_dataset, batch_size=1, shuffle=False)
-                selected_progress = tqdm(selected_loader, desc=f"save_{record}_{mode_name}", leave=True)
+                selected_progress = tqdm(selected_loader, desc=f"save_{inference_preset}_{record}_{mode_name}", leave=True)
 
                 for selected_batch_index, batch in enumerate(selected_progress):
                     selected_row = group_metrics_df[group_metrics_df["sample_index"] == selected_indices[selected_batch_index]].iloc[0]

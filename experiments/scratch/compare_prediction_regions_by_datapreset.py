@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 from typing import TypedDict
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
@@ -87,26 +88,70 @@ DATA_PRESETS: dict[str, DataPreset] = {
 }
 
 
-def parse_args() -> argparse.Namespace:
+def load_config_defaults(argv: list[str] | None) -> dict[str, Any]:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", type=str)
+    config_args, _remaining = config_parser.parse_known_args(argv)
+    if config_args.config is None:
+        return {}
+
+    config_path = resolve_input_path(str(config_args.config))
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    if not isinstance(config, dict):
+        raise TypeError(f"Config must be a JSON object: path={config_path}")
+
+    config["config_path"] = str(config_path)
+    return config
+
+
+def config_default(config: dict[str, Any], key: str, fallback: Any) -> Any:
+    return config[key] if key in config else fallback
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    config = load_config_defaults(argv)
     parser = argparse.ArgumentParser(description="Compare prediction quality by splatting regions.")
-    preset_group = parser.add_mutually_exclusive_group(required=True)
-    preset_group.add_argument("--data-preset", choices=tuple(sorted(DATA_PRESETS.keys())), help="Scratch-local comparison preset.")
-    preset_group.add_argument("--dataset-preset", choices=list_dataset_presets(), help="Project dataset preset, e.g. train_minor_0507.")
-    parser.add_argument("--root-dir", type=str, help="Directory containing preprocessed CSV indexes.")
-    parser.add_argument("--dataset-root-dir", type=str, help="Root directory containing raw frame and velocity assets.")
-    parser.add_argument("--candidate-result-root", type=str, help="Inference/sample result root for the candidate model.")
-    parser.add_argument("--baseline-result-root", type=str, help="Inference/sample result root for the baseline model.")
-    parser.add_argument("--candidate-name", default="candidate", type=str)
-    parser.add_argument("--baseline-name", default="baseline", type=str)
-    parser.add_argument("--only-fps", default=60, type=int)
-    parser.add_argument("--limit", default=0, type=int, help="Optional max sample count after filtering. 0 means no limit.")
-    parser.add_argument("--mode-filter", default="", type=str, help="Optional exact mode path filter.")
-    parser.add_argument("--skip-missing-results", action="store_true", help="Skip rows whose prediction artifacts are not saved.")
-    parser.add_argument("--result-layout", default="auto", choices=("auto", "inference", "training-samples"))
-    parser.add_argument("--sample-split", default="train", choices=("train", "test"))
-    parser.add_argument("--candidate-epoch", default="latest", type=str, help="Training-samples epoch dir, e.g. latest or epoch_0061.")
-    parser.add_argument("--baseline-epoch", default="latest", type=str, help="Training-samples epoch dir, e.g. latest or epoch_0061.")
-    return parser.parse_args()
+    parser.add_argument("--config", default=config.get("config_path"), type=str, help="JSON config path. CLI arguments override matching config values.")
+    preset_group = parser.add_mutually_exclusive_group(required=False)
+    preset_group.add_argument("--data-preset", default=config.get("data_preset"), choices=tuple(sorted(DATA_PRESETS.keys())), help="Scratch-local comparison preset.")
+    preset_group.add_argument("--dataset-preset", default=config.get("dataset_preset"), choices=list_dataset_presets(), help="Project dataset preset, e.g. train_minor_0507.")
+    parser.add_argument("--root-dir", default=config.get("root_dir"), type=str, help="Directory containing preprocessed CSV indexes.")
+    parser.add_argument("--dataset-root-dir", default=config.get("dataset_root_dir"), type=str, help="Root directory containing raw frame and velocity assets.")
+    parser.add_argument("--candidate-result-root", default=config.get("candidate_result_root"), type=str, help="Inference/sample result root for the candidate model.")
+    parser.add_argument("--baseline-result-root", default=config.get("baseline_result_root"), type=str, help="Inference/sample result root for the baseline model.")
+    parser.add_argument("--candidate-name", default=config_default(config, "candidate_name", "candidate"), type=str)
+    parser.add_argument("--baseline-name", default=config_default(config, "baseline_name", "baseline"), type=str)
+    parser.add_argument("--only-fps", default=int(config_default(config, "only_fps", 60)), type=int)
+    parser.add_argument("--limit", default=int(config_default(config, "limit", 0)), type=int, help="Optional max sample count after filtering. 0 means no limit.")
+    parser.add_argument("--mode-filter", default=config_default(config, "mode_filter", ""), type=str, help="Optional exact mode path filter.")
+    parser.add_argument(
+        "--skip-missing-results",
+        default=bool(config_default(config, "skip_missing_results", False)),
+        action="store_true",
+        help="Skip rows whose prediction artifacts are not saved.",
+    )
+    parser.add_argument("--result-layout", default=config_default(config, "result_layout", "auto"), choices=("auto", "inference", "training-samples"))
+    parser.add_argument("--sample-split", default=config_default(config, "sample_split", "train"), choices=("train", "test"))
+    parser.add_argument("--candidate-epoch", default=config_default(config, "candidate_epoch", "latest"), type=str, help="Training-samples epoch dir, e.g. latest or epoch_0061.")
+    parser.add_argument("--baseline-epoch", default=config_default(config, "baseline_epoch", "latest"), type=str, help="Training-samples epoch dir, e.g. latest or epoch_0061.")
+    parser.add_argument("--output-path", default=config.get("output_path"), type=str, help="Final output directory. Defaults to a temp directory grouped by preset name.")
+    parser.add_argument("--kernel-size", default=int(config_default(config, "kernel_size", KERNEL_SIZE)), type=int)
+    parser.add_argument("--confidence-threshold", default=float(config_default(config, "confidence_threshold", CONFIDENCE_THRESHOLD)), type=float)
+    parser.add_argument("--save-overlay-images", default=bool(config_default(config, "save_overlay_images", SAVE_OVERLAY_IMAGES)), action="store_true")
+    parser.add_argument("--no-save-overlay-images", dest="save_overlay_images", action="store_false")
+    args = parser.parse_args(argv)
+    if args.data_preset is None and args.dataset_preset is None:
+        parser.error("one of --data-preset or --dataset-preset is required, either in CLI or config")
+    if args.data_preset is not None and args.dataset_preset is not None:
+        parser.error("only one of --data-preset or --dataset-preset can be set")
+    if int(args.kernel_size) <= 0:
+        parser.error("--kernel-size must be positive")
+    if int(args.kernel_size) % 2 == 0:
+        parser.error("--kernel-size must be odd")
+    if float(args.confidence_threshold) < 0.0:
+        parser.error("--confidence-threshold must be non-negative")
+    return args
 
 
 def require_file(path: Path) -> Path:
@@ -303,6 +348,18 @@ def result_files_exist(sample: SamplePreset) -> bool:
     return result_files_exist_in_dir(candidate_dir) and result_files_exist_in_dir(baseline_dir)
 
 
+def build_missing_result_preview(sample: SamplePreset) -> dict[str, object]:
+    candidate_dir = Path(sample["candidate_result_dir"])
+    baseline_dir = Path(sample["baseline_result_dir"])
+    return {
+        "sample_id": sample["sample_id"],
+        "candidate_result_dir": str(candidate_dir),
+        "candidate_files_exist": result_files_exist_in_dir(candidate_dir),
+        "baseline_result_dir": str(baseline_dir),
+        "baseline_files_exist": result_files_exist_in_dir(baseline_dir),
+    }
+
+
 def build_samples_from_dataset_preset(args: argparse.Namespace) -> DataPreset:
     root_dir, dataset_root_dir, candidate_result_root, baseline_result_root = require_dataset_args(args)
     dataframe = load_dataset_preset_dataframe(root_dir, str(args.dataset_preset), int(args.only_fps))
@@ -312,18 +369,23 @@ def build_samples_from_dataset_preset(args: argparse.Namespace) -> DataPreset:
         dataframe = dataframe[dataframe["mode"] == str(args.mode_filter)].reset_index(drop=True)
 
     samples: list[SamplePreset] = []
+    missing_previews: list[dict[str, object]] = []
     for _index, row in dataframe.iterrows():
         sample = build_dataset_sample(row, dataset_root_dir, candidate_result_root, baseline_result_root, args)
         if bool(args.skip_missing_results) and not result_files_exist(sample):
+            if len(missing_previews) < 5:
+                missing_previews.append(build_missing_result_preview(sample))
             continue
         samples.append(sample)
         if int(args.limit) > 0 and len(samples) >= int(args.limit):
             break
 
     if len(samples) == 0:
+        missing_preview_text = json.dumps(missing_previews, indent=2)
         raise RuntimeError(
             "No comparable samples found. Check result roots, mode_filter, and whether inference artifacts were saved. "
-            f"candidate_result_root={candidate_result_root} baseline_result_root={baseline_result_root}"
+            f"candidate_result_root={candidate_result_root} baseline_result_root={baseline_result_root} "
+            f"missing_preview={missing_preview_text}"
         )
 
     return {
@@ -438,14 +500,16 @@ def build_local_winner_masks(
     target: np.ndarray,
     candidate_prediction: np.ndarray,
     baseline_prediction: np.ndarray,
+    kernel_size: int,
+    confidence_threshold: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     candidate_error = np.mean((candidate_prediction - target) ** 2, axis=2)
     baseline_error = np.mean((baseline_prediction - target) ** 2, axis=2)
-    candidate_local_error = cv2.blur(candidate_error, (KERNEL_SIZE, KERNEL_SIZE))
-    baseline_local_error = cv2.blur(baseline_error, (KERNEL_SIZE, KERNEL_SIZE))
+    candidate_local_error = cv2.blur(candidate_error, (kernel_size, kernel_size))
+    baseline_local_error = cv2.blur(baseline_error, (kernel_size, kernel_size))
     confidence = np.abs(baseline_local_error - candidate_local_error) / (baseline_local_error + candidate_local_error + 1e-12)
-    candidate_better = (candidate_local_error < baseline_local_error) & (confidence >= CONFIDENCE_THRESHOLD)
-    baseline_better = (baseline_local_error < candidate_local_error) & (confidence >= CONFIDENCE_THRESHOLD)
+    candidate_better = (candidate_local_error < baseline_local_error) & (confidence >= confidence_threshold)
+    baseline_better = (baseline_local_error < candidate_local_error) & (confidence >= confidence_threshold)
     neutral = ~(candidate_better | baseline_better)
     return candidate_better, baseline_better, neutral
 
@@ -463,6 +527,10 @@ def build_region_row(
     candidate_better: np.ndarray,
     baseline_better: np.ndarray,
     neutral: np.ndarray,
+    kernel_size: int,
+    confidence_threshold: float,
+    sample_winner: str,
+    overlay_path: str,
 ) -> dict[str, object]:
     total_pixels = int(target.shape[0] * target.shape[1])
     region_pixels = int(region_mask.sum())
@@ -480,9 +548,13 @@ def build_region_row(
     return {
         "data_preset": data_preset_name,
         "sample_id": sample["sample_id"],
+        "record": sample["record"] if sample["record"] != "" else "scratch",
+        "mode": sample["mode"],
+        "sample_winner": sample_winner,
+        "overlay_path": overlay_path,
         "region": region_name,
-        "kernel_size": KERNEL_SIZE,
-        "confidence_threshold": CONFIDENCE_THRESHOLD,
+        "kernel_size": kernel_size,
+        "confidence_threshold": confidence_threshold,
         "candidate_name": candidate_name,
         "baseline_name": baseline_name,
         "pixels": region_pixels,
@@ -505,6 +577,8 @@ def draw_overlay_legend(
     candidate_ratio: float,
     baseline_ratio: float,
     neutral_ratio: float,
+    kernel_size: int,
+    confidence_threshold: float,
 ) -> np.ndarray:
     height, width, _channels = overlay.shape
     panel_width = 330
@@ -524,8 +598,8 @@ def draw_overlay_legend(
         cv2.putText(canvas, text, (x0 + 42, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.47, (0.05, 0.05, 0.05), 1, cv2.LINE_AA)
 
     text_lines = (
-        f"kernel {KERNEL_SIZE}x{KERNEL_SIZE}",
-        f"threshold {CONFIDENCE_THRESHOLD:.2f}",
+        f"kernel {kernel_size}x{kernel_size}",
+        f"threshold {confidence_threshold:.2f}",
         f"candidate {candidate_ratio * 100.0:.1f}%",
         f"baseline {baseline_ratio * 100.0:.1f}%",
         f"neutral {neutral_ratio * 100.0:.1f}%",
@@ -543,6 +617,8 @@ def build_local_winner_overlay(
     neutral: np.ndarray,
     candidate_name: str,
     baseline_name: str,
+    kernel_size: int,
+    confidence_threshold: float,
 ) -> np.ndarray:
     overlay = target.copy()
     blue = np.array([0.02, 0.38, 0.95], dtype=np.float32)
@@ -558,7 +634,25 @@ def build_local_winner_overlay(
         candidate_ratio=float(candidate_better.mean()),
         baseline_ratio=float(baseline_better.mean()),
         neutral_ratio=float(neutral.mean()),
+        kernel_size=kernel_size,
+        confidence_threshold=confidence_threshold,
     )
+
+
+def choose_sample_winner(target: np.ndarray, candidate_prediction: np.ndarray, baseline_prediction: np.ndarray) -> str:
+    full_mask = np.ones(target.shape[:2], dtype=bool)
+    candidate_psnr = mse_to_psnr(masked_mse(candidate_prediction, target, full_mask))
+    baseline_psnr = mse_to_psnr(masked_mse(baseline_prediction, target, full_mask))
+    if np.isclose(candidate_psnr, baseline_psnr, atol=1e-6):
+        return "neutral"
+    if candidate_psnr > baseline_psnr:
+        return "candidate_win"
+    return "baseline_win"
+
+
+def build_sample_output_dir(output_dir: Path, sample: SamplePreset, sample_winner: str) -> Path:
+    record_name = sample["record"] if sample["record"] != "" else "scratch"
+    return output_dir / record_name / sample_winner
 
 
 def analyze_sample(
@@ -568,6 +662,9 @@ def analyze_sample(
     baseline_name: str,
     output_dir: Path,
     device: torch.device,
+    kernel_size: int,
+    confidence_threshold: float,
+    save_overlay_images: bool,
 ) -> list[dict[str, object]]:
     candidate_dir = Path(sample["candidate_result_dir"])
     baseline_dir = Path(sample["baseline_result_dir"])
@@ -586,9 +683,16 @@ def analyze_sample(
         target=target,
         candidate_prediction=candidate_prediction,
         baseline_prediction=baseline_prediction,
+        kernel_size=kernel_size,
+        confidence_threshold=confidence_threshold,
     )
 
-    if SAVE_OVERLAY_IMAGES:
+    sample_winner = choose_sample_winner(target=target, candidate_prediction=candidate_prediction, baseline_prediction=baseline_prediction)
+    sample_output_dir = build_sample_output_dir(output_dir=output_dir, sample=sample, sample_winner=sample_winner)
+    overlay_path = ""
+    if save_overlay_images:
+        sample_output_dir.mkdir(parents=True, exist_ok=True)
+        overlay_path = str(sample_output_dir / f"{sample['sample_id']}_winner_overlay.png")
         overlay = build_local_winner_overlay(
             target=target,
             candidate_better=candidate_better,
@@ -596,8 +700,10 @@ def analyze_sample(
             neutral=neutral,
             candidate_name=candidate_name,
             baseline_name=baseline_name,
+            kernel_size=kernel_size,
+            confidence_threshold=confidence_threshold,
         )
-        save_rgb_image(output_dir / f"{sample['sample_id']}_winner_overlay.png", overlay)
+        save_rgb_image(Path(overlay_path), overlay)
 
     rows: list[dict[str, object]] = []
     for region_name, region_mask in region_maps.items():
@@ -615,30 +721,80 @@ def analyze_sample(
                 candidate_better=candidate_better,
                 baseline_better=baseline_better,
                 neutral=neutral,
+                kernel_size=kernel_size,
+                confidence_threshold=confidence_threshold,
+                sample_winner=sample_winner,
+                overlay_path=overlay_path,
             )
         )
 
     return rows
 
 
-def write_run_config(data_preset_name: str, data_preset: DataPreset, output_dir: Path) -> None:
+def build_effective_config(args: argparse.Namespace, data_preset_name: str, output_dir: Path) -> dict[str, object]:
+    return {
+        "config": str(args.config) if args.config is not None else "",
+        "data_preset": str(args.data_preset) if args.data_preset is not None else "",
+        "dataset_preset": str(args.dataset_preset) if args.dataset_preset is not None else "",
+        "root_dir": str(args.root_dir) if args.root_dir is not None else "",
+        "dataset_root_dir": str(args.dataset_root_dir) if args.dataset_root_dir is not None else "",
+        "candidate_result_root": str(args.candidate_result_root) if args.candidate_result_root is not None else "",
+        "baseline_result_root": str(args.baseline_result_root) if args.baseline_result_root is not None else "",
+        "candidate_name": str(args.candidate_name),
+        "baseline_name": str(args.baseline_name),
+        "only_fps": int(args.only_fps),
+        "limit": int(args.limit),
+        "mode_filter": str(args.mode_filter),
+        "skip_missing_results": bool(args.skip_missing_results),
+        "result_layout": str(args.result_layout),
+        "sample_split": str(args.sample_split),
+        "candidate_epoch": str(args.candidate_epoch),
+        "baseline_epoch": str(args.baseline_epoch),
+        "output_path": str(output_dir),
+        "kernel_size": int(args.kernel_size),
+        "confidence_threshold": float(args.confidence_threshold),
+        "save_overlay_images": bool(args.save_overlay_images),
+        "resolved_data_preset_name": data_preset_name,
+    }
+
+
+def write_run_config(data_preset_name: str, data_preset: DataPreset, output_dir: Path, args: argparse.Namespace) -> None:
+    effective_config = build_effective_config(args=args, data_preset_name=data_preset_name, output_dir=output_dir)
     run_config = {
+        "config": effective_config,
         "data_preset": data_preset_name,
         "candidate_name": data_preset["candidate_name"],
         "baseline_name": data_preset["baseline_name"],
-        "kernel_size": KERNEL_SIZE,
-        "confidence_threshold": CONFIDENCE_THRESHOLD,
-        "save_overlay_images": SAVE_OVERLAY_IMAGES,
+        "kernel_size": int(args.kernel_size),
+        "confidence_threshold": float(args.confidence_threshold),
+        "save_overlay_images": bool(args.save_overlay_images),
         "output_dir": str(output_dir),
         "samples": data_preset["samples"],
     }
+    (output_dir / "analysis_config.json").write_text(json.dumps(effective_config, indent=2), encoding="utf-8")
     (output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
 
 
-def run_analysis(data_preset_name: str, data_preset: DataPreset) -> Path:
-    output_dir = OUTPUT_ROOT / data_preset_name
+def resolve_output_dir(args: argparse.Namespace, data_preset_name: str) -> Path:
+    if args.output_path is None or str(args.output_path) == "":
+        return OUTPUT_ROOT / data_preset_name
+
+    return resolve_input_path(str(args.output_path))
+
+
+def write_record_metrics(output_dir: Path, metrics: pd.DataFrame) -> None:
+    for record_name, record_metrics in metrics.groupby("record", sort=False):
+        record_dir = output_dir / str(record_name)
+        record_dir.mkdir(parents=True, exist_ok=True)
+        record_metrics.to_csv(record_dir / "region_winner_ratios.csv", index=False)
+        record_summary = record_metrics[record_metrics["region"] == "all"].copy()
+        record_summary.to_csv(record_dir / "summary.csv", index=False)
+
+
+def run_analysis(data_preset_name: str, data_preset: DataPreset, args: argparse.Namespace) -> Path:
+    output_dir = resolve_output_dir(args=args, data_preset_name=data_preset_name)
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_run_config(data_preset_name=data_preset_name, data_preset=data_preset, output_dir=output_dir)
+    write_run_config(data_preset_name=data_preset_name, data_preset=data_preset, output_dir=output_dir, args=args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     rows: list[dict[str, object]] = []
     for sample in data_preset["samples"]:
@@ -650,6 +806,9 @@ def run_analysis(data_preset_name: str, data_preset: DataPreset) -> Path:
                 baseline_name=data_preset["baseline_name"],
                 output_dir=output_dir,
                 device=device,
+                kernel_size=int(args.kernel_size),
+                confidence_threshold=float(args.confidence_threshold),
+                save_overlay_images=bool(args.save_overlay_images),
             )
         )
 
@@ -657,6 +816,7 @@ def run_analysis(data_preset_name: str, data_preset: DataPreset) -> Path:
     metrics.to_csv(output_dir / "region_winner_ratios.csv", index=False)
     summary = metrics[metrics["region"] == "all"].copy()
     summary.to_csv(output_dir / "summary.csv", index=False)
+    write_record_metrics(output_dir=output_dir, metrics=metrics)
     return output_dir
 
 
@@ -669,7 +829,7 @@ def main() -> None:
         data_preset_name = str(args.dataset_preset)
         data_preset = build_samples_from_dataset_preset(args)
 
-    output_dir = run_analysis(data_preset_name=data_preset_name, data_preset=data_preset)
+    output_dir = run_analysis(data_preset_name=data_preset_name, data_preset=data_preset, args=args)
     print(json.dumps({"output_dir": str(output_dir)}, indent=2))
 
 

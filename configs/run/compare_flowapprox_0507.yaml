@@ -1,0 +1,15 @@
+{
+  "dataset_preset": "train_minor_0507",
+  "root_dir": "data/Minor_0507/",
+  "dataset_root_dir": "/workspace/datasets/Minor_0507/",
+  "candidate_result_root": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_Zero_Minor_0530/",
+  "baseline_result_root": "inference_outputs/IFRNet_FineTuning_0507/",
+  "candidate_name": "Splat Training",
+  "baseline_name": "FineTuning",
+  "result_layout": "inference",
+  "skip_missing_results": true,
+  "kernel_size": 9,
+  "confidence_threshold": 0.08,
+  "save_overlay_images": true,
+  "output_path": "./compare_outputs/GFI_prediction_region_compare/train_minor_0507_twostage"
+}
