@@ -55,6 +55,8 @@ RegionMaps = dict[str, np.ndarray]
 KERNEL_SIZE: int = 9
 CONFIDENCE_THRESHOLD: float = 0.08
 SAVE_OVERLAY_IMAGES: bool = True
+SAVE_SELECTED_CASES_ONLY: bool = False
+SELECTED_CASES_PER_BUCKET: int = 12
 OUTPUT_ROOT: Path = Path(tempfile.gettempdir()) / "GFI_prediction_region_compare"
 
 DATA_PRESETS: dict[str, DataPreset] = {
@@ -140,6 +142,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--confidence-threshold", default=float(config_default(config, "confidence_threshold", CONFIDENCE_THRESHOLD)), type=float)
     parser.add_argument("--save-overlay-images", default=bool(config_default(config, "save_overlay_images", SAVE_OVERLAY_IMAGES)), action="store_true")
     parser.add_argument("--no-save-overlay-images", dest="save_overlay_images", action="store_false")
+    parser.add_argument("--save-selected-cases-only", default=bool(config_default(config, "save_selected_cases_only", SAVE_SELECTED_CASES_ONLY)), action="store_true")
+    parser.add_argument("--no-save-selected-cases-only", dest="save_selected_cases_only", action="store_false")
+    parser.add_argument("--selected-cases-per-bucket", default=int(config_default(config, "selected_cases_per_bucket", SELECTED_CASES_PER_BUCKET)), type=int)
     args = parser.parse_args(argv)
     if args.data_preset is None and args.dataset_preset is None:
         parser.error("one of --data-preset or --dataset-preset is required, either in CLI or config")
@@ -151,6 +156,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--kernel-size must be odd")
     if float(args.confidence_threshold) < 0.0:
         parser.error("--confidence-threshold must be non-negative")
+    if int(args.selected_cases_per_bucket) < 0:
+        parser.error("--selected-cases-per-bucket must be non-negative")
     return args
 
 
@@ -167,6 +174,22 @@ def read_rgb_image(path: Path) -> np.ndarray:
         raise ValueError(f"Failed to read image: path={path}")
 
     return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+
+def read_sample_images(sample: SamplePreset) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    candidate_dir = Path(sample["candidate_result_dir"])
+    baseline_dir = Path(sample["baseline_result_dir"])
+    target = read_rgb_image(baseline_dir / "image_gt.png")
+    candidate_target = read_rgb_image(candidate_dir / "image_gt.png")
+    candidate_prediction = read_rgb_image(candidate_dir / "image_pred.png")
+    baseline_prediction = read_rgb_image(baseline_dir / "image_pred.png")
+    validate_same_shape("candidate_target", target, candidate_target)
+    validate_same_shape("candidate_prediction", target, candidate_prediction)
+    validate_same_shape("baseline_prediction", target, baseline_prediction)
+    if not np.allclose(target, candidate_target, atol=1.0 / 255.0):
+        raise ValueError(f"Ground-truth mismatch: sample_id={sample['sample_id']}")
+
+    return target, candidate_prediction, baseline_prediction
 
 
 def save_rgb_image(path: Path, image_rgb: np.ndarray) -> None:
@@ -655,6 +678,40 @@ def build_sample_output_dir(output_dir: Path, sample: SamplePreset, sample_winne
     return output_dir / record_name / sample_winner
 
 
+def save_sample_overlay(
+    sample: SamplePreset,
+    target: np.ndarray,
+    candidate_prediction: np.ndarray,
+    baseline_prediction: np.ndarray,
+    output_dir: Path,
+    candidate_name: str,
+    baseline_name: str,
+    kernel_size: int,
+    confidence_threshold: float,
+) -> str:
+    candidate_better, baseline_better, neutral = build_local_winner_masks(
+        target=target,
+        candidate_prediction=candidate_prediction,
+        baseline_prediction=baseline_prediction,
+        kernel_size=kernel_size,
+        confidence_threshold=confidence_threshold,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    overlay_path = output_dir / f"{sample['sample_id']}_winner_overlay.png"
+    overlay = build_local_winner_overlay(
+        target=target,
+        candidate_better=candidate_better,
+        baseline_better=baseline_better,
+        neutral=neutral,
+        candidate_name=candidate_name,
+        baseline_name=baseline_name,
+        kernel_size=kernel_size,
+        confidence_threshold=confidence_threshold,
+    )
+    save_rgb_image(overlay_path, overlay)
+    return str(overlay_path)
+
+
 def analyze_sample(
     data_preset_name: str,
     sample: SamplePreset,
@@ -666,18 +723,7 @@ def analyze_sample(
     confidence_threshold: float,
     save_overlay_images: bool,
 ) -> list[dict[str, object]]:
-    candidate_dir = Path(sample["candidate_result_dir"])
-    baseline_dir = Path(sample["baseline_result_dir"])
-    target = read_rgb_image(baseline_dir / "image_gt.png")
-    candidate_target = read_rgb_image(candidate_dir / "image_gt.png")
-    candidate_prediction = read_rgb_image(candidate_dir / "image_pred.png")
-    baseline_prediction = read_rgb_image(baseline_dir / "image_pred.png")
-    validate_same_shape("candidate_target", target, candidate_target)
-    validate_same_shape("candidate_prediction", target, candidate_prediction)
-    validate_same_shape("baseline_prediction", target, baseline_prediction)
-    if not np.allclose(target, candidate_target, atol=1.0 / 255.0):
-        raise ValueError(f"Ground-truth mismatch: sample_id={sample['sample_id']}")
-
+    target, candidate_prediction, baseline_prediction = read_sample_images(sample)
     region_maps = build_region_maps(sample=sample, device=device)
     candidate_better, baseline_better, neutral = build_local_winner_masks(
         target=target,
@@ -691,19 +737,17 @@ def analyze_sample(
     sample_output_dir = build_sample_output_dir(output_dir=output_dir, sample=sample, sample_winner=sample_winner)
     overlay_path = ""
     if save_overlay_images:
-        sample_output_dir.mkdir(parents=True, exist_ok=True)
-        overlay_path = str(sample_output_dir / f"{sample['sample_id']}_winner_overlay.png")
-        overlay = build_local_winner_overlay(
+        overlay_path = save_sample_overlay(
+            sample=sample,
             target=target,
-            candidate_better=candidate_better,
-            baseline_better=baseline_better,
-            neutral=neutral,
+            candidate_prediction=candidate_prediction,
+            baseline_prediction=baseline_prediction,
+            output_dir=sample_output_dir,
             candidate_name=candidate_name,
             baseline_name=baseline_name,
             kernel_size=kernel_size,
             confidence_threshold=confidence_threshold,
         )
-        save_rgb_image(Path(overlay_path), overlay)
 
     rows: list[dict[str, object]] = []
     for region_name, region_mask in region_maps.items():
@@ -754,6 +798,8 @@ def build_effective_config(args: argparse.Namespace, data_preset_name: str, outp
         "kernel_size": int(args.kernel_size),
         "confidence_threshold": float(args.confidence_threshold),
         "save_overlay_images": bool(args.save_overlay_images),
+        "save_selected_cases_only": bool(args.save_selected_cases_only),
+        "selected_cases_per_bucket": int(args.selected_cases_per_bucket),
         "resolved_data_preset_name": data_preset_name,
     }
 
@@ -768,6 +814,8 @@ def write_run_config(data_preset_name: str, data_preset: DataPreset, output_dir:
         "kernel_size": int(args.kernel_size),
         "confidence_threshold": float(args.confidence_threshold),
         "save_overlay_images": bool(args.save_overlay_images),
+        "save_selected_cases_only": bool(args.save_selected_cases_only),
+        "selected_cases_per_bucket": int(args.selected_cases_per_bucket),
         "output_dir": str(output_dir),
         "samples": data_preset["samples"],
     }
@@ -791,12 +839,86 @@ def write_record_metrics(output_dir: Path, metrics: pd.DataFrame) -> None:
         record_summary.to_csv(record_dir / "summary.csv", index=False)
 
 
+def build_case_summary(metrics: pd.DataFrame) -> pd.DataFrame:
+    case_summary = metrics[metrics["region"] == "all"].copy()
+    case_summary["case_quality_psnr"] = (case_summary["candidate_psnr"] + case_summary["baseline_psnr"]) * 0.5
+    case_summary["psnr_delta_abs"] = (case_summary["candidate_psnr"] - case_summary["baseline_psnr"]).abs()
+    return case_summary
+
+
+def select_cases_by_quality(case_summary: pd.DataFrame, selected_cases_per_bucket: int) -> pd.DataFrame:
+    if selected_cases_per_bucket == 0:
+        return case_summary.iloc[0:0].copy()
+
+    selected_parts: list[pd.DataFrame] = []
+    winner_names = ("candidate_win", "baseline_win")
+    for (record_name, sample_winner), winner_cases in case_summary.groupby(["record", "sample_winner"], sort=False):
+        if sample_winner not in winner_names:
+            continue
+
+        high_cases = winner_cases.nlargest(selected_cases_per_bucket, "case_quality_psnr").copy()
+        high_cases["psnr_bucket"] = "high_psnr"
+        low_cases = winner_cases.nsmallest(selected_cases_per_bucket, "case_quality_psnr").copy()
+        low_cases["psnr_bucket"] = "low_psnr"
+        selected_parts.extend((high_cases, low_cases))
+
+    if len(selected_parts) == 0:
+        return case_summary.iloc[0:0].copy()
+
+    selected_cases = pd.concat(selected_parts, ignore_index=True)
+    return selected_cases.drop_duplicates(subset=["sample_id", "sample_winner", "psnr_bucket"]).reset_index(drop=True)
+
+
+def write_selected_case_metrics(output_dir: Path, selected_cases: pd.DataFrame) -> None:
+    selected_cases.to_csv(output_dir / "selected_cases.csv", index=False)
+    for record_name, record_cases in selected_cases.groupby("record", sort=False):
+        record_dir = output_dir / str(record_name)
+        record_dir.mkdir(parents=True, exist_ok=True)
+        record_cases.to_csv(record_dir / "selected_cases.csv", index=False)
+
+
+def save_selected_case_overlays(
+    data_preset: DataPreset,
+    selected_cases: pd.DataFrame,
+    output_dir: Path,
+    candidate_name: str,
+    baseline_name: str,
+    kernel_size: int,
+    confidence_threshold: float,
+) -> pd.DataFrame:
+    sample_by_id = {sample["sample_id"]: sample for sample in data_preset["samples"]}
+    saved_cases = selected_cases.copy()
+    overlay_paths: list[str] = []
+    for selected_case in saved_cases.to_dict("records"):
+        sample_id = str(selected_case["sample_id"])
+        sample = sample_by_id[sample_id]
+        target, candidate_prediction, baseline_prediction = read_sample_images(sample)
+        record_name = sample["record"] if sample["record"] != "" else "scratch"
+        case_output_dir = output_dir / record_name / str(selected_case["psnr_bucket"]) / str(selected_case["sample_winner"])
+        overlay_path = save_sample_overlay(
+            sample=sample,
+            target=target,
+            candidate_prediction=candidate_prediction,
+            baseline_prediction=baseline_prediction,
+            output_dir=case_output_dir,
+            candidate_name=candidate_name,
+            baseline_name=baseline_name,
+            kernel_size=kernel_size,
+            confidence_threshold=confidence_threshold,
+        )
+        overlay_paths.append(overlay_path)
+
+    saved_cases["selected_overlay_path"] = overlay_paths
+    return saved_cases
+
+
 def run_analysis(data_preset_name: str, data_preset: DataPreset, args: argparse.Namespace) -> Path:
     output_dir = resolve_output_dir(args=args, data_preset_name=data_preset_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_run_config(data_preset_name=data_preset_name, data_preset=data_preset, output_dir=output_dir, args=args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     rows: list[dict[str, object]] = []
+    save_all_overlays = bool(args.save_overlay_images) and not bool(args.save_selected_cases_only)
     for sample in data_preset["samples"]:
         rows.extend(
             analyze_sample(
@@ -808,7 +930,7 @@ def run_analysis(data_preset_name: str, data_preset: DataPreset, args: argparse.
                 device=device,
                 kernel_size=int(args.kernel_size),
                 confidence_threshold=float(args.confidence_threshold),
-                save_overlay_images=bool(args.save_overlay_images),
+                save_overlay_images=save_all_overlays,
             )
         )
 
@@ -817,6 +939,19 @@ def run_analysis(data_preset_name: str, data_preset: DataPreset, args: argparse.
     summary = metrics[metrics["region"] == "all"].copy()
     summary.to_csv(output_dir / "summary.csv", index=False)
     write_record_metrics(output_dir=output_dir, metrics=metrics)
+    case_summary = build_case_summary(metrics)
+    selected_cases = select_cases_by_quality(case_summary=case_summary, selected_cases_per_bucket=int(args.selected_cases_per_bucket))
+    if bool(args.save_overlay_images) and bool(args.save_selected_cases_only) and len(selected_cases) > 0:
+        selected_cases = save_selected_case_overlays(
+            data_preset=data_preset,
+            selected_cases=selected_cases,
+            output_dir=output_dir,
+            candidate_name=data_preset["candidate_name"],
+            baseline_name=data_preset["baseline_name"],
+            kernel_size=int(args.kernel_size),
+            confidence_threshold=float(args.confidence_threshold),
+        )
+    write_selected_case_metrics(output_dir=output_dir, selected_cases=selected_cases)
     return output_dir
 
 
