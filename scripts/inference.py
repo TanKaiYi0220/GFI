@@ -386,7 +386,7 @@ def run_inference_batch(
         }
 
     if model_name == RESIDUAL_MODEL_NAME:
-        img0, imgt, img1, bmv, fmv, _, _, embt, _info = batch
+        img0, imgt, img1, bmv, fmv, embt, _info = batch
         img0 = img0.to(device)
         imgt = imgt.to(device)
         img1 = img1.to(device)
@@ -668,7 +668,7 @@ def main(argv: list[str] | None = None) -> None:
     with torch.no_grad():
         for (record, mode_name), group_dataframe in dataframe.groupby(["record", "mode"], sort=False):
             group_dataframe = group_dataframe.reset_index(drop=True)
-            if model_name == BASELINE_MODEL_NAME:
+            if model_name in (BASELINE_MODEL_NAME, RESIDUAL_MODEL_NAME):
                 dataset = VFITrainDataset(group_dataframe, str(dataset_root_dir), False, input_fps)
             else:
                 include_source_depths = flow_approx_method in SPLATTING_FLOW_APPROX_METHODS
