@@ -19,6 +19,9 @@ import numpy as np
 import pandas as pd
 import torch
 
+from src.data.dataset_config import get_dataset_preset
+from src.data.dataset_config import iter_dataset_configs
+from src.data.dataset_config import list_dataset_presets
 from src.data.dataset_loader import depth_to_tensor
 from src.data.dataset_loader import flow_to_tensor
 from src.data.image_ops import load_backward_velocity
@@ -30,6 +33,9 @@ from src.engine.flow_approx import make_source_grid
 class SamplePreset(TypedDict):
     sample_id: str
     sample_dir: str
+    dataset_root_dir: str
+    record: str
+    mode: str
     candidate_result_dir: str
     baseline_result_dir: str
     frame_0: int
@@ -61,6 +67,9 @@ DATA_PRESETS: dict[str, DataPreset] = {
                     r"C:\Users\User\Desktop\CGVLab\GFI\Meeting-2026\20260527 - Lab Meeting"
                     r"\warping_testing_case\ARPG_3_1_Difficult_5\Medium_frame_0452_0454"
                 ),
+                "dataset_root_dir": "",
+                "record": "",
+                "mode": "",
                 "candidate_result_dir": (
                     r"C:\Users\User\Desktop\CGVLab\GFI\Meeting-2026\20260527 - Lab Meeting"
                     r"\warping_testing_case\ARPG_3_1_Difficult_5_Splat"
@@ -79,8 +88,24 @@ DATA_PRESETS: dict[str, DataPreset] = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compare prediction quality by splatting regions for one data preset.")
-    parser.add_argument("--data-preset", required=True, choices=tuple(sorted(DATA_PRESETS.keys())))
+    parser = argparse.ArgumentParser(description="Compare prediction quality by splatting regions.")
+    preset_group = parser.add_mutually_exclusive_group(required=True)
+    preset_group.add_argument("--data-preset", choices=tuple(sorted(DATA_PRESETS.keys())), help="Scratch-local comparison preset.")
+    preset_group.add_argument("--dataset-preset", choices=list_dataset_presets(), help="Project dataset preset, e.g. train_minor_0507.")
+    parser.add_argument("--root-dir", type=str, help="Directory containing preprocessed CSV indexes.")
+    parser.add_argument("--dataset-root-dir", type=str, help="Root directory containing raw frame and velocity assets.")
+    parser.add_argument("--candidate-result-root", type=str, help="Inference/sample result root for the candidate model.")
+    parser.add_argument("--baseline-result-root", type=str, help="Inference/sample result root for the baseline model.")
+    parser.add_argument("--candidate-name", default="candidate", type=str)
+    parser.add_argument("--baseline-name", default="baseline", type=str)
+    parser.add_argument("--only-fps", default=60, type=int)
+    parser.add_argument("--limit", default=0, type=int, help="Optional max sample count after filtering. 0 means no limit.")
+    parser.add_argument("--mode-filter", default="", type=str, help="Optional exact mode path filter.")
+    parser.add_argument("--skip-missing-results", action="store_true", help="Skip rows whose prediction artifacts are not saved.")
+    parser.add_argument("--result-layout", default="auto", choices=("auto", "inference", "training-samples"))
+    parser.add_argument("--sample-split", default="train", choices=("train", "test"))
+    parser.add_argument("--candidate-epoch", default="latest", type=str, help="Training-samples epoch dir, e.g. latest or epoch_0061.")
+    parser.add_argument("--baseline-epoch", default="latest", type=str, help="Training-samples epoch dir, e.g. latest or epoch_0061.")
     return parser.parse_args()
 
 
@@ -112,6 +137,209 @@ def load_flow_and_depth_tensors(path: Path, device: torch.device) -> tuple[torch
     return flow_tensor, depth_tensor
 
 
+def resolve_input_path(path_text: str) -> Path:
+    path = Path(path_text)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def require_dataset_args(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
+    missing_names = [
+        name
+        for name in ("root_dir", "dataset_root_dir", "candidate_result_root", "baseline_result_root")
+        if getattr(args, name) is None
+    ]
+    if len(missing_names) > 0:
+        raise ValueError(f"--dataset-preset requires these arguments: {', '.join('--' + name.replace('_', '-') for name in missing_names)}")
+
+    return (
+        resolve_input_path(str(args.root_dir)),
+        resolve_input_path(str(args.dataset_root_dir)),
+        resolve_input_path(str(args.candidate_result_root)),
+        resolve_input_path(str(args.baseline_result_root)),
+    )
+
+
+def load_dataset_preset_dataframe(root_dir: Path, dataset_preset_name: str, only_fps: int) -> pd.DataFrame:
+    dataset_preset = get_dataset_preset(dataset_preset_name)
+    dataframe_list: list[pd.DataFrame] = []
+    for dataset_config in iter_dataset_configs(dataset_preset):
+        if dataset_config.fps != only_fps:
+            continue
+
+        csv_path = root_dir / f"{dataset_config.record_name}_preprocessed" / f"{dataset_config.mode_index}_raw_sequence_frame_index.csv"
+        if not csv_path.is_file():
+            continue
+
+        dataframe = pd.read_csv(csv_path)
+        dataframe["record"] = dataset_config.record
+        dataframe["mode"] = dataset_config.mode_path
+        dataframe_list.append(dataframe)
+
+    if len(dataframe_list) == 0:
+        raise RuntimeError(f"No dataset CSV found under root_dir={root_dir} for preset={dataset_preset_name} only_fps={only_fps}")
+
+    return pd.concat(dataframe_list, ignore_index=True)
+
+
+def build_frame_range(frame_0: int, frame_1: int) -> str:
+    return f"frame_{frame_0:04d}_{frame_1:04d}"
+
+
+def build_training_sample_key(record: str, mode: str, frame_0: int) -> str:
+    mode_parts = mode.split("/")
+    if len(mode_parts) < 2:
+        raise ValueError(f"Mode path must contain difficulty and sequence parts: mode={mode}")
+
+    sequence_parts = mode_parts[1].split("_")
+    if len(sequence_parts) < 3:
+        raise ValueError(f"Mode sequence part must look like 1_Medium_5: mode={mode}")
+
+    record_suffix = record.replace("AnimeFantasyRPG_", "ARPG_")
+    return f"{record_suffix}_{sequence_parts[0]}_{sequence_parts[1]}_{sequence_parts[2]}_{frame_0:04d}"
+
+
+def resolve_epoch_dir(frame_dir: Path, epoch_name: str) -> Path:
+    if epoch_name != "latest":
+        return frame_dir / epoch_name
+
+    if not frame_dir.is_dir():
+        return frame_dir / "latest"
+
+    epoch_dirs = sorted(
+        (path for path in frame_dir.iterdir() if path.is_dir() and path.name.startswith("epoch_")),
+        key=lambda path: path.name,
+    )
+    if len(epoch_dirs) == 0:
+        return frame_dir / "latest"
+
+    return epoch_dirs[-1]
+
+
+def build_inference_result_dir(result_root: Path, record: str, mode: str, frame_range: str) -> Path:
+    return result_root / record / mode / frame_range
+
+
+def build_training_sample_result_dir(result_root: Path, split_name: str, frame_key: str, epoch_name: str) -> Path:
+    return resolve_epoch_dir(result_root / "samples" / split_name / frame_key, epoch_name)
+
+
+def choose_result_dir(
+    result_root: Path,
+    record: str,
+    mode: str,
+    frame_range: str,
+    frame_key: str,
+    split_name: str,
+    epoch_name: str,
+    result_layout: str,
+) -> Path:
+    inference_dir = build_inference_result_dir(result_root, record, mode, frame_range)
+    training_dir = build_training_sample_result_dir(result_root, split_name, frame_key, epoch_name)
+    if result_layout == "inference":
+        return inference_dir
+    if result_layout == "training-samples":
+        return training_dir
+    if result_files_exist_in_dir(training_dir):
+        return training_dir
+    return inference_dir
+
+
+def build_dataset_sample(
+    row: pd.Series,
+    dataset_root_dir: Path,
+    candidate_result_root: Path,
+    baseline_result_root: Path,
+    args: argparse.Namespace,
+) -> SamplePreset:
+    record = str(row["record"])
+    mode = str(row["mode"])
+    frame_0 = int(row["img0"])
+    frame_t = int(row["img1"])
+    frame_1 = int(row["img2"])
+    frame_range = build_frame_range(frame_0, frame_1)
+    frame_key = build_training_sample_key(record, mode, frame_0)
+    sample_id = f"{record}_{mode.replace('/', '_')}_{frame_range}"
+    candidate_result_dir = choose_result_dir(
+        result_root=candidate_result_root,
+        record=record,
+        mode=mode,
+        frame_range=frame_range,
+        frame_key=frame_key,
+        split_name=str(args.sample_split),
+        epoch_name=str(args.candidate_epoch),
+        result_layout=str(args.result_layout),
+    )
+    baseline_result_dir = choose_result_dir(
+        result_root=baseline_result_root,
+        record=record,
+        mode=mode,
+        frame_range=frame_range,
+        frame_key=frame_key,
+        split_name=str(args.sample_split),
+        epoch_name=str(args.baseline_epoch),
+        result_layout=str(args.result_layout),
+    )
+    return {
+        "sample_id": sample_id,
+        "sample_dir": "",
+        "dataset_root_dir": str(dataset_root_dir),
+        "record": record,
+        "mode": mode,
+        "candidate_result_dir": str(candidate_result_dir),
+        "baseline_result_dir": str(baseline_result_dir),
+        "frame_0": frame_0,
+        "frame_t": frame_t,
+        "frame_1": frame_1,
+    }
+
+
+def result_files_exist_in_dir(result_dir: Path) -> bool:
+    return (result_dir / "image_gt.png").is_file() and (result_dir / "image_pred.png").is_file()
+
+
+def result_files_exist(sample: SamplePreset) -> bool:
+    candidate_dir = Path(sample["candidate_result_dir"])
+    baseline_dir = Path(sample["baseline_result_dir"])
+    return result_files_exist_in_dir(candidate_dir) and result_files_exist_in_dir(baseline_dir)
+
+
+def build_samples_from_dataset_preset(args: argparse.Namespace) -> DataPreset:
+    root_dir, dataset_root_dir, candidate_result_root, baseline_result_root = require_dataset_args(args)
+    dataframe = load_dataset_preset_dataframe(root_dir, str(args.dataset_preset), int(args.only_fps))
+    if "valid" in dataframe.columns:
+        dataframe = dataframe[dataframe["valid"] == True].reset_index(drop=True)
+    if str(args.mode_filter) != "":
+        dataframe = dataframe[dataframe["mode"] == str(args.mode_filter)].reset_index(drop=True)
+
+    samples: list[SamplePreset] = []
+    for _index, row in dataframe.iterrows():
+        sample = build_dataset_sample(row, dataset_root_dir, candidate_result_root, baseline_result_root, args)
+        if bool(args.skip_missing_results) and not result_files_exist(sample):
+            continue
+        samples.append(sample)
+        if int(args.limit) > 0 and len(samples) >= int(args.limit):
+            break
+
+    if len(samples) == 0:
+        raise RuntimeError(
+            "No comparable samples found. Check result roots, mode_filter, and whether inference artifacts were saved. "
+            f"candidate_result_root={candidate_result_root} baseline_result_root={baseline_result_root}"
+        )
+
+    return {
+        "candidate_name": str(args.candidate_name),
+        "baseline_name": str(args.baseline_name),
+        "samples": samples,
+    }
+
+
+def build_flow_path(sample: SamplePreset, mode: str, prefix: str, frame_index: int) -> Path:
+    if sample["dataset_root_dir"] != "":
+        return Path(sample["dataset_root_dir"]) / sample["record"] / mode / f"{prefix}_{frame_index}.exr"
+
+    return Path(sample["sample_dir"]) / f"{prefix}_{frame_index}_fps30.exr"
+
+
 def build_nearest_splat_hit_count(source_motion: torch.Tensor) -> torch.Tensor:
     batch_size = int(source_motion.shape[0])
     height = int(source_motion.shape[2])
@@ -138,11 +366,11 @@ def tensor_mask_to_numpy(mask: torch.Tensor) -> np.ndarray:
 
 
 def build_region_maps(sample: SamplePreset, device: torch.device) -> RegionMaps:
-    sample_dir = Path(sample["sample_dir"])
     frame_0 = int(sample["frame_0"])
     frame_1 = int(sample["frame_1"])
-    bmv_30, source_depth1 = load_flow_and_depth_tensors(sample_dir / f"backwardVel_Depth_{frame_1 // 2}_fps30.exr", device)
-    fmv_30, source_depth0 = load_flow_and_depth_tensors(sample_dir / f"forwardVel_Depth_{frame_0 // 2}_fps30.exr", device)
+    mode_30 = sample["mode"].replace("fps_60", "fps_30")
+    bmv_30, source_depth1 = load_flow_and_depth_tensors(build_flow_path(sample, mode_30, "backwardVel_Depth", frame_1 // 2), device)
+    fmv_30, source_depth0 = load_flow_and_depth_tensors(build_flow_path(sample, mode_30, "forwardVel_Depth", frame_0 // 2), device)
     embt = torch.tensor([[[0.5]]], dtype=torch.float32, device=device)
     flow_init = build_flow_init_result(fmv_30, bmv_30, embt, "splatting", source_depth0, source_depth1)
     if flow_init.masks is None:
@@ -407,8 +635,7 @@ def write_run_config(data_preset_name: str, data_preset: DataPreset, output_dir:
     (output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
 
 
-def run_analysis(data_preset_name: str) -> Path:
-    data_preset = DATA_PRESETS[data_preset_name]
+def run_analysis(data_preset_name: str, data_preset: DataPreset) -> Path:
     output_dir = OUTPUT_ROOT / data_preset_name
     output_dir.mkdir(parents=True, exist_ok=True)
     write_run_config(data_preset_name=data_preset_name, data_preset=data_preset, output_dir=output_dir)
@@ -435,7 +662,14 @@ def run_analysis(data_preset_name: str) -> Path:
 
 def main() -> None:
     args = parse_args()
-    output_dir = run_analysis(data_preset_name=str(args.data_preset))
+    if args.data_preset is not None:
+        data_preset_name = str(args.data_preset)
+        data_preset = DATA_PRESETS[data_preset_name]
+    else:
+        data_preset_name = str(args.dataset_preset)
+        data_preset = build_samples_from_dataset_preset(args)
+
+    output_dir = run_analysis(data_preset_name=data_preset_name, data_preset=data_preset)
     print(json.dumps({"output_dir": str(output_dir)}, indent=2))
 
 
