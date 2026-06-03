@@ -3,8 +3,8 @@
   "root_dir": "data/Minor_0507/",
   "dataset_root_dir": "/workspace/datasets/Minor_0507/",
 
-  "candidate_inference_config": "configs/run/inference_finetuning_0507.yaml",
-  "baseline_inference_config": "configs/run/train_flow_approx_0507_layer_1.yaml",
+  "candidate_inference_config": "configs/run/inference_flowaprox_layer_1_0507.yaml",
+  "baseline_inference_config": "configs/run/inference_finetuning_0507.yaml",
 
   "candidate_name": "Splat Training",
   "baseline_name": "FineTuning",
@@ -15,5 +15,5 @@
 
   "kernel_size": 9,
   "confidence_threshold": 0.08,
-  "output_path": "compare_outputs/GFI_prediction_region_compare/train_minor_0507_twostage"
+  "output_path": "compare_outputs/GFI_prediction_region_compare/train_minor_0507_twostage_Splat"
 }

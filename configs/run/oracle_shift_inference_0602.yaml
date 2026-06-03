@@ -1,0 +1,14 @@
+{
+  "inference_config": "configs/run/inference_flowaprox_layer_1_0507.yaml",
+  "output_dir": "compare_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_Zero_Minor_0601/oracle_global_shift_train_minor_0507/",
+  "inference_preset": "train_minor_0507",
+  "merged_csv": "",
+  "max_shift": 6,
+  "improvement_threshold_db": 0.5,
+  "save_top_k_improved": 30,
+  "limit": 0,
+  "record_filter": "",
+  "mode_filter": "",
+  "save_heatmap_all_selected": true,
+  "dry_run": false
+}

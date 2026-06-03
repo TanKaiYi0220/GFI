@@ -14,6 +14,13 @@ from scripts.train import build_merged_dataframe
 from scripts.train import read_model_init_args
 from scripts.train import resolve_model_class
 from scripts.train import set_seed
+from src.engine.evaluation import average_metric_values
+from src.engine.evaluation import build_lpips_model
+from src.engine.evaluation import build_metric_meters
+from src.engine.evaluation import calculate_batch_metrics
+from src.engine.evaluation import format_metric_averages
+from src.engine.evaluation import read_metric_config
+from src.engine.evaluation import require_psnr_enabled
 from src.engine.flow_approx import build_flow_init_result
 from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
 from src.engine.flow_approx import FLOW_APPROX_METHODS
@@ -599,6 +606,8 @@ def main(argv: list[str] | None = None) -> None:
     save_topk_worst_psnr = int(config.get("save_topk_worst_psnr", 3))
     save_topk_best_psnr = int(config.get("save_topk_best_psnr", 0))
     save_topk_largest_flow_diff = int(config.get("save_topk_largest_flow_diff", 3))
+    metric_config = read_metric_config(config)
+    require_psnr_enabled(metric_config, "inference")
     seed = int(config["seed"])
     batch_size = int(config["batch_size"])
     only_fps = int(config["only_fps"])
@@ -641,6 +650,7 @@ def main(argv: list[str] | None = None) -> None:
         "save_topk_worst_psnr": save_topk_worst_psnr,
         "save_topk_best_psnr": save_topk_best_psnr,
         "save_topk_largest_flow_diff": save_topk_largest_flow_diff,
+        "metrics": dict(metric_config),
     }
     if len(model_init_args) > 0:
         summary["model_init_args"] = model_init_args
@@ -661,12 +671,12 @@ def main(argv: list[str] | None = None) -> None:
     from src.data.dataset_loader import VFITrainDataset
     from src.data.image_ops import flow_to_image
     from src.data.image_ops import save_image
-    from src.engine.evaluation import AverageMeter
-    from src.engine.evaluation import calculate_psnr
     logger = build_logger("scripts.inference")
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    lpips_model = build_lpips_model(metric_config, device)
     logger.info("device=%s model=%s", device, model_name)
+    logger.info("metrics=%s", metric_config)
 
     dataframe_list: list[Any] = []
     for inference_preset in inference_presets:
@@ -686,7 +696,7 @@ def main(argv: list[str] | None = None) -> None:
     model.load_state_dict(state_dict)
     model.eval()
 
-    psnr_meter = AverageMeter()
+    metric_meters = build_metric_meters(metric_config)
     rows: list[dict[str, object]] = []
     record_rows: list[dict[str, object]] = []
 
@@ -706,7 +716,7 @@ def main(argv: list[str] | None = None) -> None:
                 )
 
             loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-            record_meter = AverageMeter()
+            record_metric_meters = build_metric_meters(metric_config)
             progress = tqdm(loader, desc=f"{inference_preset}_{record}_{mode_name}", leave=True)
             sample_offset = 0
             group_rows: list[dict[str, object]] = []
@@ -720,13 +730,15 @@ def main(argv: list[str] | None = None) -> None:
                 splatting_region_maps = inference_result.get("splatting_region_maps")
                 up_flow0_1 = inference_result["up_flow0_1"]
                 up_flow1_1 = inference_result["up_flow1_1"]
+                batch_metric_values = calculate_batch_metrics(imgt.detach(), imgt_pred.detach(), metric_config, lpips_model)
 
                 for batch_index in range(int(imgt_pred.shape[0])):
                     row = group_dataframe.iloc[sample_offset + batch_index]
                     frame_range = f"frame_{int(row['img0']):04d}_{int(row['img2']):04d}"
-                    psnr_value = float(calculate_psnr(imgt[batch_index], imgt_pred[batch_index]).detach().cpu().item())
-                    psnr_meter.update(psnr_value, 1)
-                    record_meter.update(psnr_value, 1)
+                    sample_metric_values = {metric_name: float(metric_values[batch_index]) for metric_name, metric_values in batch_metric_values.items()}
+                    for metric_name, metric_value in sample_metric_values.items():
+                        metric_meters[metric_name].update(metric_value, 1)
+                        record_metric_meters[metric_name].update(metric_value, 1)
 
                     diff_1_to_0 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
                     diff_1_to_2 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
@@ -761,7 +773,7 @@ def main(argv: list[str] | None = None) -> None:
                             "valid": bool(row["valid"]) if "valid" in row.index else True,
                             "distance_index_mean": float(row["D_index Mean"]) if "D_index Mean" in row.index else -1.0,
                             "distance_index_median": float(row["D_index Median"]) if "D_index Median" in row.index else -1.0,
-                            "psnr": psnr_value,
+                            **sample_metric_values,
                             "flow_diff_1_to_0_mean": diff_1_to_0["diff_mag_mean"],
                             "flow_diff_1_to_0_max": diff_1_to_0["diff_mag_max"],
                             "flow_diff_1_to_0_changed_ratio": diff_1_to_0["diff_changed_ratio"],
@@ -774,9 +786,10 @@ def main(argv: list[str] | None = None) -> None:
                     )
 
                 sample_offset += int(imgt_pred.shape[0])
-                progress.set_postfix({"mean_psnr": f"{record_meter.avg:.6f}"})
+                progress.set_postfix({"mean_psnr": f"{record_metric_meters['psnr'].avg:.6f}"})
 
             group_metrics_df = pd.DataFrame(group_rows)
+            record_metric_values = average_metric_values(record_metric_meters)
             record_rows.append(
                 {
                     "record": str(record),
@@ -784,7 +797,7 @@ def main(argv: list[str] | None = None) -> None:
                     "mode": str(mode_name),
                     "record_name": f"{record}_{mode_name}",
                     "samples": int(len(group_dataframe)),
-                    "mean_psnr": float(record_meter.avg),
+                    **{f"mean_{metric_name}": metric_value for metric_name, metric_value in record_metric_values.items()},
                 }
             )
             selected_sample_reasons: dict[int, list[str]] = {}
@@ -857,11 +870,11 @@ def main(argv: list[str] | None = None) -> None:
                         group_metrics_df.loc[group_metrics_df["sample_index"] == selected_indices[selected_batch_index], column_name] = path_value
 
             rows.extend(group_metrics_df.to_dict("records"))
-            logger.info("record=%s mode=%s samples=%s mean_psnr=%.6f", record, mode_name, len(group_dataframe), record_meter.avg)
+            logger.info("record=%s mode=%s samples=%s metrics=%s", record, mode_name, len(group_dataframe), format_metric_averages(record_metric_meters))
 
     pd.DataFrame(rows).to_csv(output_dir / "metrics.csv", index=False)
     pd.DataFrame(record_rows).to_csv(output_dir / "record_metrics.csv", index=False)
-    logger.info("samples=%s mean_psnr=%.6f output_dir=%s", len(rows), psnr_meter.avg, output_dir)
+    logger.info("samples=%s metrics=%s output_dir=%s", len(rows), format_metric_averages(metric_meters), output_dir)
 
 
 if __name__ == "__main__":

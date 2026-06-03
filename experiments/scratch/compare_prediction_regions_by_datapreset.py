@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -20,6 +21,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from src.data.dataset_config import get_dataset_preset
 from src.data.dataset_config import iter_dataset_configs
@@ -28,16 +30,20 @@ from src.data.dataset_loader import depth_to_tensor
 from src.data.dataset_loader import FlowEstimationTrainDataset
 from src.data.dataset_loader import flow_to_tensor
 from src.data.dataset_loader import VFITrainDataset
+from src.data.image_ops import flow_to_image
 from src.data.image_ops import load_backward_velocity
+from src.data.image_ops import save_image
 from src.engine.flow_approx import build_flow_init_result
 from src.engine.flow_approx import flatten_target_index
 from src.engine.flow_approx import make_source_grid
 from src.engine.flow_approx import SPLATTING_FLOW_APPROX_METHODS
 from src.utils.config import load_yaml_file
 from scripts.inference import BASELINE_MODEL_NAME
+from scripts.inference import InferenceBatchResult
 from scripts.inference import RESIDUAL_FLOW_APPROX_MODEL_NAME
 from scripts.inference import RESIDUAL_MODEL_NAME
 from scripts.inference import run_inference_batch
+from scripts.inference import save_selected_sample_artifacts
 from scripts.train import read_model_init_args
 from scripts.train import resolve_model_class
 
@@ -53,6 +59,7 @@ class SamplePreset(TypedDict):
     frame_0: int
     frame_t: int
     frame_1: int
+    fps: int
 
 
 class DataPreset(TypedDict):
@@ -67,6 +74,8 @@ class InferenceModelSpec(TypedDict):
     flow_approx_method: str
     scale_factor: float
     input_fps: int
+    flow_diff_threshold: float
+    flow_diff_percentile: float
     model: Any
 
 
@@ -104,6 +113,7 @@ DATA_PRESETS: dict[str, DataPreset] = {
                 "frame_0": 452,
                 "frame_t": 453,
                 "frame_1": 454,
+                "fps": 60,
             },
         ],
     },
@@ -229,12 +239,33 @@ def load_flow_and_depth_tensors(path: Path, device: torch.device) -> tuple[torch
     return flow_tensor, depth_tensor
 
 
+def resolve_model_checkpoint_path(config: dict[str, Any], config_path: Path) -> Path:
+    if "checkpoint_path" in config:
+        return resolve_input_path(str(config["checkpoint_path"]))
+
+    if "output_dir" not in config:
+        raise KeyError(f"Config must contain checkpoint_path or output_dir: path={config_path}")
+
+    checkpoints_dir = resolve_input_path(str(config["output_dir"])) / "checkpoints"
+    best_path = checkpoints_dir / "best.pth"
+    latest_path = checkpoints_dir / "latest.pth"
+    if best_path.is_file():
+        return best_path
+    if latest_path.is_file():
+        return latest_path
+
+    raise FileNotFoundError(
+        "Could not resolve model checkpoint from training config: "
+        f"path={config_path} best_path={best_path} latest_path={latest_path}"
+    )
+
+
 def load_inference_model(config_path_text: str, device: torch.device) -> InferenceModelSpec:
     config_path = resolve_input_path(config_path_text)
     config = load_yaml_file(config_path)
     model_name = str(config["model_name"])
     model_init_args = read_model_init_args(config)
-    checkpoint_path = resolve_input_path(str(config["checkpoint_path"]))
+    checkpoint_path = resolve_model_checkpoint_path(config=config, config_path=config_path)
     model_class = resolve_model_class(model_name)
     model = model_class(**model_init_args).to(device)
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
@@ -245,8 +276,10 @@ def load_inference_model(config_path_text: str, device: torch.device) -> Inferen
         "config_path": str(config_path),
         "model_name": model_name,
         "flow_approx_method": str(config["flow_approx_method"]),
-        "scale_factor": float(config["scale_factor"]),
+        "scale_factor": float(config.get("scale_factor", 1.0)),
         "input_fps": int(config["input_fps"]),
+        "flow_diff_threshold": float(config.get("flow_diff_threshold", 1.0)),
+        "flow_diff_percentile": float(config.get("flow_diff_percentile", 99.0)),
         "model": model,
     }
 
@@ -298,6 +331,7 @@ def load_dataset_preset_dataframe(root_dir: Path, dataset_preset_name: str, only
         dataframe = pd.read_csv(csv_path)
         dataframe["record"] = dataset_config.record
         dataframe["mode"] = dataset_config.mode_path
+        dataframe["fps"] = dataset_config.fps
         dataframe_list.append(dataframe)
 
     if len(dataframe_list) == 0:
@@ -321,6 +355,48 @@ def build_training_sample_key(record: str, mode: str, frame_0: int) -> str:
 
     record_suffix = record.replace("AnimeFantasyRPG_", "ARPG_")
     return f"{record_suffix}_{sequence_parts[0]}_{sequence_parts[1]}_{sequence_parts[2]}_{frame_0:04d}"
+
+
+def remove_fps_parts(name_parts: list[str]) -> list[str]:
+    filtered_parts: list[str] = []
+    skip_next = False
+    for index, name_part in enumerate(name_parts):
+        if skip_next:
+            skip_next = False
+            continue
+
+        next_part = name_parts[index + 1] if index + 1 < len(name_parts) else ""
+        if name_part == "fps" and next_part.isdigit():
+            skip_next = True
+            continue
+
+        filtered_parts.append(name_part)
+
+    return filtered_parts
+
+
+def remove_fps_tokens(name_part: str) -> str:
+    return "_".join(remove_fps_parts(name_part.split("_")))
+
+
+def build_case_record_name(sample: SamplePreset) -> str:
+    record_name = sample["record"].replace("AnimeFantasyRPG_", "ARPG_")
+    mode_parts: list[str] = []
+    for mode_part in sample["mode"].split("/"):
+        if mode_part == "":
+            continue
+
+        normalized_mode_part = remove_fps_tokens(mode_part)
+        if normalized_mode_part != "":
+            mode_parts.append(normalized_mode_part)
+
+    if record_name != "" and len(mode_parts) > 0:
+        return "_".join([record_name, *mode_parts])
+
+    frame_range = build_frame_range(int(sample["frame_0"]), int(sample["frame_1"]))
+    sample_id = sample["sample_id"]
+    sample_id_without_frame = sample_id[: -len(f"_{frame_range}")] if sample_id.endswith(f"_{frame_range}") else sample_id
+    return "_".join(remove_fps_parts(sample_id_without_frame.split("_")))
 
 
 def resolve_epoch_dir(frame_dir: Path, epoch_name: str) -> Path:
@@ -381,6 +457,7 @@ def build_dataset_sample(
     frame_0 = int(row["img0"])
     frame_t = int(row["img1"])
     frame_1 = int(row["img2"])
+    fps = int(row["fps"])
     frame_range = build_frame_range(frame_0, frame_1)
     frame_key = build_training_sample_key(record, mode, frame_0)
     sample_id = f"{record}_{mode.replace('/', '_')}_{frame_range}"
@@ -415,6 +492,7 @@ def build_dataset_sample(
         "frame_0": frame_0,
         "frame_t": frame_t,
         "frame_1": frame_1,
+        "fps": fps,
     }
 
 
@@ -520,6 +598,7 @@ def build_sample_dataframe(sample: SamplePreset) -> pd.DataFrame:
                 "img2": int(sample["frame_1"]),
                 "record": sample["record"],
                 "mode": sample["mode"],
+                "fps": int(sample["fps"]),
                 "valid": True,
             }
         ]
@@ -541,11 +620,11 @@ def build_model_dataset(sample: SamplePreset, model_spec: InferenceModelSpec) ->
     raise ValueError(f"Unsupported model_name for direct comparison inference: {model_name}")
 
 
-def run_model_prediction(sample: SamplePreset, model_spec: InferenceModelSpec, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
+def run_model_inference_result(sample: SamplePreset, model_spec: InferenceModelSpec, device: torch.device) -> InferenceBatchResult:
     dataset = build_model_dataset(sample=sample, model_spec=model_spec)
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
     batch = next(iter(loader))
-    inference_result = run_inference_batch(
+    return run_inference_batch(
         batch=batch,
         device=device,
         flow_approx_method=model_spec["flow_approx_method"],
@@ -553,6 +632,10 @@ def run_model_prediction(sample: SamplePreset, model_spec: InferenceModelSpec, d
         model_name=model_spec["model_name"],
         scale_factor=float(model_spec["scale_factor"]),
     )
+
+
+def run_model_prediction(sample: SamplePreset, model_spec: InferenceModelSpec, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
+    inference_result = run_model_inference_result(sample=sample, model_spec=model_spec, device=device)
     return tensor_image_to_numpy(inference_result["imgt"]), tensor_image_to_numpy(inference_result["imgt_pred"])
 
 
@@ -678,6 +761,8 @@ def build_region_row(
         "data_preset": data_preset_name,
         "sample_id": sample["sample_id"],
         "record": sample["record"] if sample["record"] != "" else "scratch",
+        "case_record": build_case_record_name(sample),
+        "frame_range": build_frame_range(int(sample["frame_0"]), int(sample["frame_1"])),
         "mode": sample["mode"],
         "sample_winner": sample_winner,
         "overlay_path": overlay_path,
@@ -795,6 +880,29 @@ def save_sample_overlay(
     kernel_size: int,
     confidence_threshold: float,
 ) -> str:
+    overlay_path = output_dir / f"{sample['sample_id']}_winner_overlay.png"
+    return save_sample_overlay_to_path(
+        target=target,
+        candidate_prediction=candidate_prediction,
+        baseline_prediction=baseline_prediction,
+        overlay_path=overlay_path,
+        candidate_name=candidate_name,
+        baseline_name=baseline_name,
+        kernel_size=kernel_size,
+        confidence_threshold=confidence_threshold,
+    )
+
+
+def save_sample_overlay_to_path(
+    target: np.ndarray,
+    candidate_prediction: np.ndarray,
+    baseline_prediction: np.ndarray,
+    overlay_path: Path,
+    candidate_name: str,
+    baseline_name: str,
+    kernel_size: int,
+    confidence_threshold: float,
+) -> str:
     candidate_better, baseline_better, neutral = build_local_winner_masks(
         target=target,
         candidate_prediction=candidate_prediction,
@@ -802,8 +910,7 @@ def save_sample_overlay(
         kernel_size=kernel_size,
         confidence_threshold=confidence_threshold,
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    overlay_path = output_dir / f"{sample['sample_id']}_winner_overlay.png"
+    overlay_path.parent.mkdir(parents=True, exist_ok=True)
     overlay = build_local_winner_overlay(
         target=target,
         candidate_better=candidate_better,
@@ -816,6 +923,77 @@ def save_sample_overlay(
     )
     save_rgb_image(overlay_path, overlay)
     return str(overlay_path)
+
+
+def build_selected_case_output_dir(output_dir: Path, sample: SamplePreset, selected_case: dict[str, object]) -> Path:
+    case_record = build_case_record_name(sample)
+    frame_range = build_frame_range(int(sample["frame_0"]), int(sample["frame_1"]))
+    return output_dir / case_record / str(selected_case["psnr_bucket"]) / str(selected_case["sample_winner"]) / frame_range
+
+
+def build_selected_case_model_output_dirs(case_output_dir: Path) -> tuple[Path, Path]:
+    return case_output_dir / "candidate", case_output_dir / "baseline"
+
+
+def validate_copy_destination(source_dir: Path, destination_dir: Path) -> None:
+    source_resolved = source_dir.resolve()
+    destination_resolved = destination_dir.resolve()
+    if destination_resolved == source_resolved or source_resolved in destination_resolved.parents:
+        raise ValueError(f"Refusing to copy result artifacts into their own source tree: source={source_dir} destination={destination_dir}")
+
+
+def copy_directory_contents(source_dir: Path, destination_dir: Path) -> None:
+    if not source_dir.is_dir():
+        raise NotADirectoryError(f"Missing result artifact directory: source_dir={source_dir} destination_dir={destination_dir}")
+
+    validate_copy_destination(source_dir=source_dir, destination_dir=destination_dir)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    for source_path in sorted(source_dir.iterdir(), key=lambda path: path.name):
+        destination_path = destination_dir / source_path.name
+        if source_path.is_file():
+            shutil.copy2(source_path, destination_path)
+        elif source_path.is_dir():
+            shutil.copytree(source_path, destination_path, dirs_exist_ok=True)
+        else:
+            raise ValueError(f"Unsupported result artifact path type: source_path={source_path}")
+
+
+def copy_precomputed_case_model_outputs(sample: SamplePreset, case_output_dir: Path) -> tuple[str, str]:
+    candidate_output_dir, baseline_output_dir = build_selected_case_model_output_dirs(case_output_dir=case_output_dir)
+    copy_directory_contents(source_dir=Path(sample["candidate_result_dir"]), destination_dir=candidate_output_dir)
+    copy_directory_contents(source_dir=Path(sample["baseline_result_dir"]), destination_dir=baseline_output_dir)
+    return str(candidate_output_dir), str(baseline_output_dir)
+
+
+def save_inference_case_model_outputs(
+    case_output_dir: Path,
+    candidate_inference_result: InferenceBatchResult,
+    baseline_inference_result: InferenceBatchResult,
+    candidate_model: InferenceModelSpec,
+    baseline_model: InferenceModelSpec,
+) -> tuple[str, str]:
+    candidate_output_dir, baseline_output_dir = build_selected_case_model_output_dirs(case_output_dir=case_output_dir)
+    save_selected_sample_artifacts(
+        cv2=cv2,
+        flow_diff_percentile=float(candidate_model["flow_diff_percentile"]),
+        flow_diff_threshold=float(candidate_model["flow_diff_threshold"]),
+        flow_to_image=flow_to_image,
+        inference_result=candidate_inference_result,
+        np=np,
+        save_dir=candidate_output_dir,
+        save_image=save_image,
+    )
+    save_selected_sample_artifacts(
+        cv2=cv2,
+        flow_diff_percentile=float(baseline_model["flow_diff_percentile"]),
+        flow_diff_threshold=float(baseline_model["flow_diff_threshold"]),
+        flow_to_image=flow_to_image,
+        inference_result=baseline_inference_result,
+        np=np,
+        save_dir=baseline_output_dir,
+        save_image=save_image,
+    )
+    return str(candidate_output_dir), str(baseline_output_dir)
 
 
 def analyze_sample(
@@ -1035,7 +1213,7 @@ def select_cases_by_quality(case_summary: pd.DataFrame, selected_cases_per_bucke
 
     selected_parts: list[pd.DataFrame] = []
     winner_names = ("candidate_win", "baseline_win")
-    for (record_name, sample_winner), winner_cases in case_summary.groupby(["record", "sample_winner"], sort=False):
+    for (_case_record, sample_winner), winner_cases in case_summary.groupby(["case_record", "sample_winner"], sort=False):
         if sample_winner not in winner_names:
             continue
 
@@ -1054,7 +1232,7 @@ def select_cases_by_quality(case_summary: pd.DataFrame, selected_cases_per_bucke
 
 def write_selected_case_metrics(output_dir: Path, selected_cases: pd.DataFrame) -> None:
     selected_cases.to_csv(output_dir / "selected_cases.csv", index=False)
-    for record_name, record_cases in selected_cases.groupby("record", sort=False):
+    for record_name, record_cases in selected_cases.groupby("case_record", sort=False):
         record_dir = output_dir / str(record_name)
         record_dir.mkdir(parents=True, exist_ok=True)
         record_cases.to_csv(record_dir / "selected_cases.csv", index=False)
@@ -1072,26 +1250,35 @@ def save_selected_case_overlays(
     sample_by_id = {sample["sample_id"]: sample for sample in data_preset["samples"]}
     saved_cases = selected_cases.copy()
     overlay_paths: list[str] = []
-    for selected_case in saved_cases.to_dict("records"):
+    selected_case_dirs: list[str] = []
+    candidate_output_dirs: list[str] = []
+    baseline_output_dirs: list[str] = []
+    selected_records = saved_cases.to_dict("records")
+    for selected_case in tqdm(selected_records, desc="save_selected_overlays", leave=True):
         sample_id = str(selected_case["sample_id"])
         sample = sample_by_id[sample_id]
         target, candidate_prediction, baseline_prediction = read_sample_images(sample)
-        record_name = sample["record"] if sample["record"] != "" else "scratch"
-        case_output_dir = output_dir / record_name / str(selected_case["psnr_bucket"]) / str(selected_case["sample_winner"])
-        overlay_path = save_sample_overlay(
-            sample=sample,
+        case_output_dir = build_selected_case_output_dir(output_dir=output_dir, sample=sample, selected_case=selected_case)
+        overlay_path = save_sample_overlay_to_path(
             target=target,
             candidate_prediction=candidate_prediction,
             baseline_prediction=baseline_prediction,
-            output_dir=case_output_dir,
+            overlay_path=case_output_dir / "winner_overlay.png",
             candidate_name=candidate_name,
             baseline_name=baseline_name,
             kernel_size=kernel_size,
             confidence_threshold=confidence_threshold,
         )
+        candidate_output_dir, baseline_output_dir = copy_precomputed_case_model_outputs(sample=sample, case_output_dir=case_output_dir)
         overlay_paths.append(overlay_path)
+        selected_case_dirs.append(str(case_output_dir))
+        candidate_output_dirs.append(candidate_output_dir)
+        baseline_output_dirs.append(baseline_output_dir)
 
     saved_cases["selected_overlay_path"] = overlay_paths
+    saved_cases["selected_case_dir"] = selected_case_dirs
+    saved_cases["selected_candidate_output_dir"] = candidate_output_dirs
+    saved_cases["selected_baseline_output_dir"] = baseline_output_dirs
     return saved_cases
 
 
@@ -1110,30 +1297,49 @@ def save_selected_case_model_overlays(
     sample_by_id = {sample["sample_id"]: sample for sample in data_preset["samples"]}
     saved_cases = selected_cases.copy()
     overlay_paths: list[str] = []
-    for selected_case in saved_cases.to_dict("records"):
+    selected_case_dirs: list[str] = []
+    candidate_output_dirs: list[str] = []
+    baseline_output_dirs: list[str] = []
+    selected_records = saved_cases.to_dict("records")
+    for selected_case in tqdm(selected_records, desc="save_selected_model_overlays", leave=True):
         sample_id = str(selected_case["sample_id"])
         sample = sample_by_id[sample_id]
-        candidate_target, candidate_prediction = run_model_prediction(sample=sample, model_spec=candidate_model, device=device)
-        baseline_target, baseline_prediction = run_model_prediction(sample=sample, model_spec=baseline_model, device=device)
+        candidate_inference_result = run_model_inference_result(sample=sample, model_spec=candidate_model, device=device)
+        baseline_inference_result = run_model_inference_result(sample=sample, model_spec=baseline_model, device=device)
+        candidate_target = tensor_image_to_numpy(candidate_inference_result["imgt"])
+        candidate_prediction = tensor_image_to_numpy(candidate_inference_result["imgt_pred"])
+        baseline_target = tensor_image_to_numpy(baseline_inference_result["imgt"])
+        baseline_prediction = tensor_image_to_numpy(baseline_inference_result["imgt_pred"])
         if not np.allclose(baseline_target, candidate_target, atol=1.0 / 255.0):
             raise ValueError(f"Ground-truth mismatch while saving selected overlay: sample_id={sample_id}")
 
-        record_name = sample["record"] if sample["record"] != "" else "scratch"
-        case_output_dir = output_dir / record_name / str(selected_case["psnr_bucket"]) / str(selected_case["sample_winner"])
-        overlay_path = save_sample_overlay(
-            sample=sample,
+        case_output_dir = build_selected_case_output_dir(output_dir=output_dir, sample=sample, selected_case=selected_case)
+        overlay_path = save_sample_overlay_to_path(
             target=baseline_target,
             candidate_prediction=candidate_prediction,
             baseline_prediction=baseline_prediction,
-            output_dir=case_output_dir,
+            overlay_path=case_output_dir / "winner_overlay.png",
             candidate_name=candidate_name,
             baseline_name=baseline_name,
             kernel_size=kernel_size,
             confidence_threshold=confidence_threshold,
         )
+        candidate_output_dir, baseline_output_dir = save_inference_case_model_outputs(
+            case_output_dir=case_output_dir,
+            candidate_inference_result=candidate_inference_result,
+            baseline_inference_result=baseline_inference_result,
+            candidate_model=candidate_model,
+            baseline_model=baseline_model,
+        )
         overlay_paths.append(overlay_path)
+        selected_case_dirs.append(str(case_output_dir))
+        candidate_output_dirs.append(candidate_output_dir)
+        baseline_output_dirs.append(baseline_output_dir)
 
     saved_cases["selected_overlay_path"] = overlay_paths
+    saved_cases["selected_case_dir"] = selected_case_dirs
+    saved_cases["selected_candidate_output_dir"] = candidate_output_dirs
+    saved_cases["selected_baseline_output_dir"] = baseline_output_dirs
     return saved_cases
 
 
@@ -1151,7 +1357,7 @@ def run_analysis(data_preset_name: str, data_preset: DataPreset, args: argparse.
         baseline_model = load_inference_model(str(args.baseline_inference_config), device)
 
     with torch.no_grad():
-        for sample in data_preset["samples"]:
+        for sample in tqdm(data_preset["samples"], desc=f"compare_{data_preset_name}", leave=True):
             if candidate_model is not None and baseline_model is not None:
                 rows.extend(
                     analyze_sample_with_models(

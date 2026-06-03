@@ -11,7 +11,8 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 
-METRIC_NAMES: tuple[str, ...] = ("psnr", "loss_rec", "loss_geo", "loss_dis", "loss_total")
+REQUIRED_METRIC_NAMES: tuple[str, ...] = ("psnr", "loss_rec", "loss_geo", "loss_dis", "loss_total")
+PREFERRED_METRIC_NAMES: tuple[str, ...] = ("psnr", "ssim", "lpips", "loss_rec", "loss_geo", "loss_dis", "loss_total")
 NUMERIC_PATTERN: re.Pattern[str] = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 TRAIN_EPOCH_PATTERN: re.Pattern[str] = re.compile(r"train_epoch_(\d+)\.csv$")
 TEST_EPOCH_PATTERN: re.Pattern[str] = re.compile(r"test_epoch_(\d+)\.csv$")
@@ -48,25 +49,19 @@ def collect_metric_rows(checkpoints_dir: Path, glob_pattern: str, epoch_pattern:
     metric_rows: list[dict[str, float]] = []
     for csv_path in csv_paths:
         dataframe = pd.read_csv(csv_path)
-        missing_columns = [metric_name for metric_name in METRIC_NAMES if metric_name not in dataframe.columns]
+        missing_columns = [metric_name for metric_name in REQUIRED_METRIC_NAMES if metric_name not in dataframe.columns]
         if len(missing_columns) > 0:
             raise KeyError(f"Missing columns in {csv_path}: {missing_columns}")
 
+        available_metric_names = [metric_name for metric_name in PREFERRED_METRIC_NAMES if metric_name in dataframe.columns]
         metric_series_map = {
             metric_name: normalize_metric_series(dataframe[metric_name], csv_path, metric_name)
-            for metric_name in METRIC_NAMES
+            for metric_name in available_metric_names
         }
 
-        metric_rows.append(
-            {
-                "epoch": float(extract_epoch(csv_path, epoch_pattern)),
-                "psnr": float(metric_series_map["psnr"].mean()),
-                "loss_rec": float(metric_series_map["loss_rec"].mean()),
-                "loss_geo": float(metric_series_map["loss_geo"].mean()),
-                "loss_dis": float(metric_series_map["loss_dis"].mean()),
-                "loss_total": float(metric_series_map["loss_total"].mean()),
-            }
-        )
+        metric_row = {"epoch": float(extract_epoch(csv_path, epoch_pattern))}
+        metric_row.update({metric_name: float(metric_series.mean()) for metric_name, metric_series in metric_series_map.items()})
+        metric_rows.append(metric_row)
 
     return metric_rows
 
@@ -100,8 +95,13 @@ def main() -> None:
     args = parse_args()
     train_dataframe = build_metrics_dataframe(args.checkpoints_dir, "train_epoch_*.csv", TRAIN_EPOCH_PATTERN)
     test_dataframe = build_metrics_dataframe(args.checkpoints_dir, "test_epoch_*.csv", TEST_EPOCH_PATTERN)
+    metric_names = [
+        metric_name
+        for metric_name in PREFERRED_METRIC_NAMES
+        if metric_name in train_dataframe.columns and metric_name in test_dataframe.columns
+    ]
 
-    for metric_name in METRIC_NAMES:
+    for metric_name in metric_names:
         plot_metric(train_dataframe, test_dataframe, metric_name, args.output_dir)
 
 
