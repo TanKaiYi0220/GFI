@@ -21,12 +21,14 @@ from src.engine.evaluation import calculate_batch_metrics
 from src.engine.evaluation import format_metric_averages
 from src.engine.evaluation import read_metric_config
 from src.engine.evaluation import require_psnr_enabled
-from src.engine.flow_approx import build_flow_init_result
+from src.engine.flow_approx import build_flow_init_result_with_fill_strategy
+from src.engine.flow_approx import DEFAULT_SPLATTING_FILL_STRATEGY
 from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
 from src.engine.flow_approx import FLOW_APPROX_METHODS
 from src.engine.flow_approx import flatten_target_index
+from src.engine.flow_approx import is_splatting_flow_approx_method
 from src.engine.flow_approx import make_source_grid
-from src.engine.flow_approx import SPLATTING_FLOW_APPROX_METHODS
+from src.engine.flow_approx import SPLATTING_FILL_STRATEGIES
 from src.models.external.IFRNet.utils import warp
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
@@ -322,10 +324,11 @@ def save_splatting_region_visuals(
     return image_paths
 
 
-def run_inference_batch(
+def run_inference_batch_with_fill_strategy(
     batch: Any,
     device: Any,
     flow_approx_method: str,
+    splatting_fill_strategy: str,
     model: Any,
     model_name: str,
     scale_factor: float,
@@ -370,17 +373,18 @@ def run_inference_batch(
         embt = embt.to(device)
         source_depth0 = None
         source_depth1 = None
-        if flow_approx_method in SPLATTING_FLOW_APPROX_METHODS:
+        if is_splatting_flow_approx_method(flow_approx_method=flow_approx_method):
             source_depth0 = info["source_depth0"].to(device)
             source_depth1 = info["source_depth1"].to(device)
 
-        flow_init = build_flow_init_result(
+        flow_init = build_flow_init_result_with_fill_strategy(
             fmv_30=fmv_30,
             bmv_30=bmv_30,
             embt=embt,
             flow_approx_method=flow_approx_method,
             source_depth0=source_depth0,
             source_depth1=source_depth1,
+            splatting_fill_strategy=splatting_fill_strategy,
         )
         init_bmv = flow_init.bmv
         init_fmv = flow_init.fmv
@@ -445,6 +449,25 @@ def run_inference_batch(
         }
 
     raise ValueError(f"Unsupported model_name: {model_name}")
+
+
+def run_inference_batch(
+    batch: Any,
+    device: Any,
+    flow_approx_method: str,
+    model: Any,
+    model_name: str,
+    scale_factor: float,
+) -> InferenceBatchResult:
+    return run_inference_batch_with_fill_strategy(
+        batch=batch,
+        device=device,
+        flow_approx_method=flow_approx_method,
+        splatting_fill_strategy=DEFAULT_SPLATTING_FILL_STRATEGY,
+        model=model,
+        model_name=model_name,
+        scale_factor=scale_factor,
+    )
 
 
 def save_selected_sample_artifacts(
@@ -600,6 +623,7 @@ def main(argv: list[str] | None = None) -> None:
     model_init_args = read_model_init_args(config)
     inference_presets = read_inference_presets(config)
     flow_approx_method = str(config["flow_approx_method"])
+    splatting_fill_strategy = str(config.get("splatting_fill_strategy", DEFAULT_SPLATTING_FILL_STRATEGY))
     scale_factor = float(config["scale_factor"])
     flow_diff_threshold = float(config.get("flow_diff_threshold", 1.0))
     flow_diff_percentile = float(config.get("flow_diff_percentile", 99.0))
@@ -631,6 +655,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if model_name == RESIDUAL_FLOW_APPROX_MODEL_NAME and flow_approx_method not in FLOW_APPROX_METHOD_CHOICES:
         raise ValueError(f"Unsupported flow_approx_method: {flow_approx_method}")
+    if splatting_fill_strategy not in SPLATTING_FILL_STRATEGIES:
+        available_strategies = ", ".join(SPLATTING_FILL_STRATEGIES)
+        raise ValueError(f"Unsupported splatting_fill_strategy: {splatting_fill_strategy}. Available strategies: {available_strategies}")
 
     summary = {
         "mode": mode,
@@ -645,6 +672,7 @@ def main(argv: list[str] | None = None) -> None:
         "input_fps": input_fps,
         "scale_factor": scale_factor,
         "flow_approx_method": flow_approx_method,
+        "splatting_fill_strategy": splatting_fill_strategy,
         "flow_diff_threshold": flow_diff_threshold,
         "flow_diff_percentile": flow_diff_percentile,
         "save_topk_worst_psnr": save_topk_worst_psnr,
@@ -706,7 +734,7 @@ def main(argv: list[str] | None = None) -> None:
             if model_name in (BASELINE_MODEL_NAME, RESIDUAL_MODEL_NAME):
                 dataset = VFITrainDataset(group_dataframe, str(dataset_root_dir), False, input_fps)
             else:
-                include_source_depths = flow_approx_method in SPLATTING_FLOW_APPROX_METHODS
+                include_source_depths = is_splatting_flow_approx_method(flow_approx_method=flow_approx_method)
                 dataset = FlowEstimationTrainDataset(
                     group_dataframe,
                     str(dataset_root_dir),
@@ -722,7 +750,15 @@ def main(argv: list[str] | None = None) -> None:
             group_rows: list[dict[str, object]] = []
 
             for batch in progress:
-                inference_result = run_inference_batch(batch, device, flow_approx_method, model, model_name, scale_factor)
+                inference_result = run_inference_batch_with_fill_strategy(
+                    batch,
+                    device,
+                    flow_approx_method,
+                    splatting_fill_strategy,
+                    model,
+                    model_name,
+                    scale_factor,
+                )
                 imgt = inference_result["imgt"]
                 imgt_pred = inference_result["imgt_pred"]
                 init_bmv = inference_result["init_bmv"]
@@ -854,7 +890,15 @@ def main(argv: list[str] | None = None) -> None:
                     frame_range = str(selected_row["frame_range"])
                     save_dir = output_dir / str(record) / str(mode_name) / frame_range
 
-                    inference_result = run_inference_batch(batch, device, flow_approx_method, model, model_name, scale_factor)
+                    inference_result = run_inference_batch_with_fill_strategy(
+                        batch,
+                        device,
+                        flow_approx_method,
+                        splatting_fill_strategy,
+                        model,
+                        model_name,
+                        scale_factor,
+                    )
                     image_paths = save_selected_sample_artifacts(
                         cv2,
                         flow_diff_percentile,

@@ -10,12 +10,18 @@
     "train_minor_0507",
     "test_minor_0507"
   ],
-  "checkpoint_path": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_Zero_Minor_0601/checkpoints/best.pth",
-  "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_Zero_Minor_0601/",
+  "checkpoint_path": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_ZeroSplat_Minor_0603/checkpoints/best.pth",
+  "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_ZeroSplat_Minor_0603/",
   "seed": 1234,
   "batch_size": 1,
   "only_fps": 60,
   "input_fps": 30,
+  "metrics": {
+    "enable_psnr": true,
+    "enable_ssim": true,
+    "enable_lpips": true,
+    "lpips_net": "alex"
+  },
   "scale_factor": 1.0,
   "flow_approx_method": "splatting",
   "flow_diff_threshold": 1.0,
@@ -24,7 +30,7 @@
   "save_topk_best_psnr": 5,
   "save_topk_largest_flow_diff": 10,
   "video": {
-    "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_Zero_Minor_0601/videos",
+    "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_ZeroSplat_Minor_0603/videos",
     "fps": 60,
     "ignore_valid": true,
     "record_filter": null,

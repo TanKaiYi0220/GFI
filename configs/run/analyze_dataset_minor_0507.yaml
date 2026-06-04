@@ -1,0 +1,15 @@
+{
+  "mode": "analyze",
+  "root_dir": "data/",
+  "dataset_root_dir": "/workspace/datasets/Minor_0507/",
+  "analysis_presets": [
+    "train_minor_0507",
+    "test_minor_0507"
+  ],
+  "output_dir": "analysis_outputs/test_minor_0507/",
+  "batch_size": 1,
+  "only_fps": 60,
+  "input_fps": 30,
+  "seed": 1234,
+  "filter_valid_only": true
+}

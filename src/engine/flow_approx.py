@@ -9,8 +9,21 @@ if TYPE_CHECKING:
 
 FLOW_APPROX_METHODS: tuple[str, ...] = ("single", "combination", "splatting")
 SPLATTING_FLOW_APPROX_METHODS: tuple[str, ...] = ("splatting", "linear_splatting")
-FLOW_APPROX_METHOD_CHOICES: tuple[str, ...] = FLOW_APPROX_METHODS + ("linear_splatting",)
+SPLATTING_FILL_STRATEGIES: tuple[str, ...] = (
+    "zero",
+    "outside_in_4direction",
+    "outside_in_4neighbor",
+    "outside_in_8neighbor",
+)
+SPLATTING_FILL_METHOD_ALIASES: dict[str, str] = {
+    "splatting_zero_fill": "zero",
+    "splatting_outside_in_4direction": "outside_in_4direction",
+    "splatting_outside_in_4neighbor": "outside_in_4neighbor",
+    "splatting_outside_in_8neighbor": "outside_in_8neighbor",
+}
+FLOW_APPROX_METHOD_CHOICES: tuple[str, ...] = FLOW_APPROX_METHODS + ("linear_splatting",) + tuple(SPLATTING_FILL_METHOD_ALIASES.keys())
 DEPTH_REDUCE_MODE: str = "amax"
+DEFAULT_SPLATTING_FILL_STRATEGY: str = "outside_in_4neighbor"
 
 
 @dataclass(frozen=True)
@@ -29,6 +42,21 @@ def flow_approx_combination(fmv: Tensor, bmv: Tensor, time: Tensor, forward: boo
         return (1 - time) * (1 - time) * fmv - time * (1 - time) * bmv
 
     return -(1 - time) * time * fmv + time * time * bmv
+
+
+def is_splatting_flow_approx_method(flow_approx_method: str) -> bool:
+    return flow_approx_method in SPLATTING_FLOW_APPROX_METHODS or flow_approx_method in SPLATTING_FILL_METHOD_ALIASES
+
+
+def resolve_splatting_fill_strategy(flow_approx_method: str, splatting_fill_strategy: str) -> str:
+    if flow_approx_method in SPLATTING_FILL_METHOD_ALIASES:
+        return SPLATTING_FILL_METHOD_ALIASES[flow_approx_method]
+
+    if splatting_fill_strategy not in SPLATTING_FILL_STRATEGIES:
+        available_strategies = ", ".join(SPLATTING_FILL_STRATEGIES)
+        raise ValueError(f"Unsupported splatting_fill_strategy '{splatting_fill_strategy}'. Available strategies: {available_strategies}")
+
+    return splatting_fill_strategy
 
 
 def validate_flow_tensor(name: str, tensor: Tensor) -> None:
@@ -59,6 +87,149 @@ def make_source_grid(batch_size: int, height: int, width: int, device: torch.dev
 
 def flatten_target_index(target_x: Tensor, target_y: Tensor, width: int) -> Tensor:
     return target_y * width + target_x
+
+
+def validate_coverage_mask(name: str, mask: Tensor, flow: Tensor) -> None:
+    expected_shape = (flow.shape[0], 1, flow.shape[2], flow.shape[3])
+    if tuple(mask.shape) != expected_shape:
+        raise ValueError(f"{name} must have shape {expected_shape}, got {tuple(mask.shape)}.")
+
+
+def build_neighbor_kernel(neighbor_mode: str, device: torch.device, dtype: torch.dtype) -> Tensor:
+    import torch
+
+    if neighbor_mode == "4neighbor":
+        return torch.tensor(
+            [[[[0.0, 1.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]]],
+            device=device,
+            dtype=dtype,
+        )
+
+    if neighbor_mode == "8neighbor":
+        return torch.tensor(
+            [[[[1.0, 1.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0]]]],
+            device=device,
+            dtype=dtype,
+        )
+
+    raise ValueError(f"Unsupported neighbor_mode: {neighbor_mode}.")
+
+
+def outside_in_fill_flow_holes_by_neighbors(flow: Tensor, mask: Tensor, neighbor_mode: str) -> Tensor:
+    import torch
+    import torch.nn.functional as functional
+
+    validate_flow_tensor("flow", flow)
+    validate_coverage_mask("mask", mask, flow)
+
+    valid = mask.bool()
+    filled = torch.where(valid, flow, torch.zeros_like(flow))
+    max_iterations = int(flow.shape[2] + flow.shape[3])
+    neighbor_kernel = build_neighbor_kernel(neighbor_mode=neighbor_mode, device=flow.device, dtype=flow.dtype)
+    flow_kernel = neighbor_kernel.expand(flow.shape[1], 1, 3, 3)
+
+    for _iteration in range(max_iterations):
+        if bool(valid.all().detach().cpu().item()):
+            break
+
+        valid_float = valid.to(dtype=flow.dtype)
+        neighbor_count = functional.conv2d(valid_float, neighbor_kernel, padding=1)
+        fillable = (~valid) & (neighbor_count > 0)
+        if not bool(fillable.any().detach().cpu().item()):
+            break
+
+        neighbor_sum = functional.conv2d(filled * valid_float, flow_kernel, padding=1, groups=flow.shape[1])
+        neighbor_average = neighbor_sum / neighbor_count.clamp_min(1.0)
+        filled = torch.where(fillable.expand_as(flow), neighbor_average, filled)
+        valid = valid | fillable
+
+    return filled
+
+
+def outside_in_fill_flow_holes(flow: Tensor, mask: Tensor) -> Tensor:
+    return outside_in_fill_flow_holes_by_neighbors(flow=flow, mask=mask, neighbor_mode="4neighbor")
+
+
+def gather_nearest_valid_along_width(flow: Tensor, valid: Tensor) -> tuple[Tensor, Tensor]:
+    import torch
+
+    batch_size = int(flow.shape[0])
+    height = int(flow.shape[2])
+    width = int(flow.shape[3])
+    x_coords = torch.arange(width, device=flow.device, dtype=torch.long).reshape(1, 1, 1, width)
+    x_coords = x_coords.expand(batch_size, 1, height, width)
+    valid_indices = torch.where(valid, x_coords, torch.full_like(x_coords, -1))
+    nearest_indices = torch.cummax(valid_indices, dim=3).values
+    has_value = nearest_indices >= 0
+    gathered = flow.gather(dim=3, index=nearest_indices.clamp_min(0).expand(batch_size, flow.shape[1], height, width))
+    return torch.where(has_value.expand_as(flow), gathered, torch.zeros_like(flow)), has_value
+
+
+def gather_nearest_valid_along_height(flow: Tensor, valid: Tensor) -> tuple[Tensor, Tensor]:
+    import torch
+
+    batch_size = int(flow.shape[0])
+    height = int(flow.shape[2])
+    width = int(flow.shape[3])
+    y_coords = torch.arange(height, device=flow.device, dtype=torch.long).reshape(1, 1, height, 1)
+    y_coords = y_coords.expand(batch_size, 1, height, width)
+    valid_indices = torch.where(valid, y_coords, torch.full_like(y_coords, -1))
+    nearest_indices = torch.cummax(valid_indices, dim=2).values
+    has_value = nearest_indices >= 0
+    gathered = flow.gather(dim=2, index=nearest_indices.clamp_min(0).expand(batch_size, flow.shape[1], height, width))
+    return torch.where(has_value.expand_as(flow), gathered, torch.zeros_like(flow)), has_value
+
+
+def outside_in_fill_flow_holes_by_4direction(flow: Tensor, mask: Tensor) -> Tensor:
+    import torch
+
+    validate_flow_tensor("flow", flow)
+    validate_coverage_mask("mask", mask, flow)
+
+    valid = mask.bool()
+    filled = torch.where(valid, flow, torch.zeros_like(flow))
+    left_flow, has_left = gather_nearest_valid_along_width(flow=filled, valid=valid)
+    right_flow_reversed, has_right_reversed = gather_nearest_valid_along_width(
+        flow=torch.flip(filled, dims=(3,)),
+        valid=torch.flip(valid, dims=(3,)),
+    )
+    up_flow, has_up = gather_nearest_valid_along_height(flow=filled, valid=valid)
+    down_flow_reversed, has_down_reversed = gather_nearest_valid_along_height(
+        flow=torch.flip(filled, dims=(2,)),
+        valid=torch.flip(valid, dims=(2,)),
+    )
+
+    right_flow = torch.flip(right_flow_reversed, dims=(3,))
+    down_flow = torch.flip(down_flow_reversed, dims=(2,))
+    has_right = torch.flip(has_right_reversed, dims=(3,))
+    has_down = torch.flip(has_down_reversed, dims=(2,))
+    direction_sum = left_flow + right_flow + up_flow + down_flow
+    direction_count = (
+        has_left.to(dtype=flow.dtype)
+        + has_right.to(dtype=flow.dtype)
+        + has_up.to(dtype=flow.dtype)
+        + has_down.to(dtype=flow.dtype)
+    )
+    direction_average = direction_sum / direction_count.clamp_min(1.0)
+    fillable = (~valid) & (direction_count > 0)
+    return torch.where(fillable.expand_as(flow), direction_average, filled)
+
+
+def fill_splatting_flow_holes(flow: Tensor, mask: Tensor, fill_strategy: str) -> Tensor:
+    if fill_strategy == "zero":
+        return flow
+
+    if fill_strategy == "outside_in_4direction":
+        return outside_in_fill_flow_holes_by_4direction(flow=flow, mask=mask)
+
+    if fill_strategy == "outside_in_4neighbor":
+        return outside_in_fill_flow_holes_by_neighbors(flow=flow, mask=mask, neighbor_mode="4neighbor")
+
+    if fill_strategy == "outside_in_8neighbor":
+        return outside_in_fill_flow_holes_by_neighbors(flow=flow, mask=mask, neighbor_mode="8neighbor")
+
+    available_strategies = ", ".join(SPLATTING_FILL_STRATEGIES)
+    raise ValueError(f"Unsupported splatting fill_strategy '{fill_strategy}'. Available strategies: {available_strategies}")
 
 
 def nearest_depth_splat_flow(source_motion: Tensor, source_depth: Tensor) -> tuple[Tensor, Tensor]:
@@ -140,6 +311,24 @@ def build_linear_splatting_flow_init(
     source_depth0: Tensor,
     source_depth1: Tensor,
 ) -> FlowInitResult:
+    return build_linear_splatting_flow_init_with_fill_strategy(
+        fmv_30=fmv_30,
+        bmv_30=bmv_30,
+        embt=embt,
+        source_depth0=source_depth0,
+        source_depth1=source_depth1,
+        fill_strategy=DEFAULT_SPLATTING_FILL_STRATEGY,
+    )
+
+
+def build_linear_splatting_flow_init_with_fill_strategy(
+    fmv_30: Tensor,
+    bmv_30: Tensor,
+    embt: Tensor,
+    source_depth0: Tensor,
+    source_depth1: Tensor,
+    fill_strategy: str,
+) -> FlowInitResult:
     import torch
 
     time = embt.reshape(embt.shape[0], 1, 1, 1)
@@ -151,10 +340,8 @@ def build_linear_splatting_flow_init(
     approx_bmv, bmv_mask = nearest_depth_splat_flow(partial_fmv, source_depth0)
     approx_fmv, fmv_mask = nearest_depth_splat_flow(partial_bmv, source_depth1)
 
-    fill_fmv = flow_approx_combination(fmv_30, bmv_30, time, True)
-    fill_bmv = flow_approx_combination(fmv_30, bmv_30, time, False)
-    approx_fmv = torch.where(fmv_mask.bool(), approx_fmv, torch.zeros_like(approx_fmv))
-    approx_bmv = torch.where(bmv_mask.bool(), approx_bmv, torch.zeros_like(approx_bmv))
+    approx_fmv = fill_splatting_flow_holes(flow=approx_fmv, mask=fmv_mask, fill_strategy=fill_strategy)
+    approx_bmv = fill_splatting_flow_holes(flow=approx_bmv, mask=bmv_mask, fill_strategy=fill_strategy)
     return FlowInitResult(bmv=approx_bmv, fmv=approx_fmv, masks=torch.cat((bmv_mask, fmv_mask), dim=1))
 
 
@@ -165,6 +352,26 @@ def build_flow_init_result(
     flow_approx_method: str,
     source_depth0: Tensor | None,
     source_depth1: Tensor | None,
+) -> FlowInitResult:
+    return build_flow_init_result_with_fill_strategy(
+        fmv_30=fmv_30,
+        bmv_30=bmv_30,
+        embt=embt,
+        flow_approx_method=flow_approx_method,
+        source_depth0=source_depth0,
+        source_depth1=source_depth1,
+        splatting_fill_strategy=DEFAULT_SPLATTING_FILL_STRATEGY,
+    )
+
+
+def build_flow_init_result_with_fill_strategy(
+    fmv_30: Tensor,
+    bmv_30: Tensor,
+    embt: Tensor,
+    flow_approx_method: str,
+    source_depth0: Tensor | None,
+    source_depth1: Tensor | None,
+    splatting_fill_strategy: str,
 ) -> FlowInitResult:
     time = embt.reshape(embt.shape[0], 1, 1, 1)
 
@@ -178,16 +385,20 @@ def build_flow_init_result(
         approx_bmv = flow_approx_combination(fmv_30, bmv_30, time, False)
         return FlowInitResult(bmv=approx_bmv, fmv=approx_fmv, masks=None)
 
-    if flow_approx_method in SPLATTING_FLOW_APPROX_METHODS:
+    if is_splatting_flow_approx_method(flow_approx_method=flow_approx_method):
         if source_depth0 is None or source_depth1 is None:
             raise ValueError("linear_splatting flow approximation requires source_depth0 and source_depth1 tensors.")
 
-        return build_linear_splatting_flow_init(
+        return build_linear_splatting_flow_init_with_fill_strategy(
             fmv_30=fmv_30,
             bmv_30=bmv_30,
             embt=embt,
             source_depth0=source_depth0,
             source_depth1=source_depth1,
+            fill_strategy=resolve_splatting_fill_strategy(
+                flow_approx_method=flow_approx_method,
+                splatting_fill_strategy=splatting_fill_strategy,
+            ),
         )
 
     available_methods = ", ".join(FLOW_APPROX_METHOD_CHOICES)

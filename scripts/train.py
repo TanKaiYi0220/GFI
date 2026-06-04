@@ -29,10 +29,13 @@ from src.engine.evaluation import format_metric_values
 from src.engine.evaluation import get_enabled_metric_names
 from src.engine.evaluation import read_metric_config
 from src.engine.evaluation import require_psnr_enabled
-from src.engine.flow_approx import build_flow_init_result
+from src.engine.flow_approx import build_flow_init_result_with_fill_strategy
+from src.engine.flow_approx import DEFAULT_SPLATTING_FILL_STRATEGY
 from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
 from src.engine.flow_approx import FLOW_APPROX_METHODS
-from src.engine.flow_approx import SPLATTING_FLOW_APPROX_METHODS
+from src.engine.flow_approx import is_splatting_flow_approx_method
+from src.engine.flow_approx import resolve_splatting_fill_strategy
+from src.engine.flow_approx import SPLATTING_FILL_STRATEGIES
 from src.utils.config import load_yaml_file
 
 MODEL_NAMES: tuple[str, ...] = ("IFRNet", "IFRNet_Residual", "IFRNet_Residual_FlowApprox")
@@ -179,6 +182,7 @@ def forward_model(
     source_bmv: Any,
     source_fmv: Any,
     flow_approx_method: str,
+    splatting_fill_strategy: str,
     source_depth0: Any | None,
     source_depth1: Any | None,
 ) -> Any:
@@ -188,13 +192,14 @@ def forward_model(
     init_fmv = source_fmv
 
     if uses_flow_approx_model(model_name):
-        flow_init = build_flow_init_result(
+        flow_init = build_flow_init_result_with_fill_strategy(
             fmv_30=source_fmv,
             bmv_30=source_bmv,
             embt=embt,
             flow_approx_method=flow_approx_method,
             source_depth0=source_depth0,
             source_depth1=source_depth1,
+            splatting_fill_strategy=splatting_fill_strategy,
         )
         init_bmv = flow_init.bmv
         init_fmv = flow_init.fmv
@@ -291,7 +296,7 @@ def build_training_dataset(
     if uses_flow_approx_model(model_name):
         from src.data.dataset_loader import FlowEstimationTrainDataset
 
-        include_source_depths = flow_approx_method in SPLATTING_FLOW_APPROX_METHODS
+        include_source_depths = is_splatting_flow_approx_method(flow_approx_method=flow_approx_method)
         return FlowEstimationTrainDataset(normalized_dataframe, dataset_root_dir, input_fps, augment, include_source_depths)
 
     from src.data.dataset_loader import VFITrainDataset
@@ -330,7 +335,7 @@ def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: 
     import numpy as np
     import torch
     from torch.utils.data import DataLoader
-    from scripts.inference import run_inference_batch, save_selected_sample_artifacts
+    from scripts.inference import run_inference_batch_with_fill_strategy, save_selected_sample_artifacts
     from src.data.image_ops import flow_to_image, save_image
 
     frame_groups = {"train": args.sample_train_frames, "test": args.sample_test_frames}
@@ -357,7 +362,15 @@ def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: 
             )
             for frame_key, batch in zip(frame_keys, DataLoader(sample_dataset, batch_size=1, shuffle=False)):
                 save_dir = Path(args.output_dir) / "samples" / split_name / frame_key / f"epoch_{epoch + 1:04d}"
-                inference_result = run_inference_batch(batch, device, args.flow_approx_method, model, args.model_name, 1.0)
+                inference_result = run_inference_batch_with_fill_strategy(
+                    batch,
+                    device,
+                    args.flow_approx_method,
+                    args.splatting_fill_strategy,
+                    model,
+                    args.model_name,
+                    1.0,
+                )
                 save_selected_sample_artifacts(cv2, 99.0, 1.0, flow_to_image, inference_result, np, save_dir, save_image)
                 logger.info("Saved sample frame split=%s frame=%s epoch=%s dir=%s", split_name, frame_key, epoch + 1, save_dir)
 
@@ -379,7 +392,7 @@ def run_training_batch(
         img0, imgt, img1, _bmv_60, _fmv_60, bmv_30, fmv_30, embt, info = batch
         source_bmv = bmv_30.to(device)
         source_fmv = fmv_30.to(device)
-        if args.flow_approx_method in SPLATTING_FLOW_APPROX_METHODS:
+        if is_splatting_flow_approx_method(flow_approx_method=args.flow_approx_method):
             source_depth0 = info["source_depth0"].to(device)
             source_depth1 = info["source_depth1"].to(device)
         else:
@@ -407,6 +420,7 @@ def run_training_batch(
         source_bmv,
         source_fmv,
         args.flow_approx_method,
+        args.splatting_fill_strategy,
         source_depth0,
         source_depth1,
     )
@@ -619,6 +633,12 @@ def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.Argument
         choices=FLOW_APPROX_METHOD_CHOICES,
         help="How to approximate middle-frame flows from 30fps motion vectors.",
     )
+    parser.add_argument(
+        "--splatting-fill-strategy",
+        default=config_defaults.get("splatting_fill_strategy", DEFAULT_SPLATTING_FILL_STRATEGY),
+        choices=SPLATTING_FILL_STRATEGIES,
+        help="How splatting fills no-hit target pixels when flow_approx_method is splatting or linear_splatting.",
+    )
     return parser
 
 
@@ -636,6 +656,19 @@ def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
     require_psnr_enabled(args.metric_config, "training")
     args.input_config = config_defaults
     return args
+
+
+def resolve_effective_splatting_fill_strategy(args: argparse.Namespace) -> str:
+    if not uses_flow_approx_model(args.model_name):
+        return ""
+
+    if not is_splatting_flow_approx_method(flow_approx_method=args.flow_approx_method):
+        return ""
+
+    return resolve_splatting_fill_strategy(
+        flow_approx_method=args.flow_approx_method,
+        splatting_fill_strategy=args.splatting_fill_strategy,
+    )
 
 
 def log_run_summary(
@@ -756,6 +789,8 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
 
     if uses_flow_approx_model(args.model_name):
         summary["flow_approx_method"] = args.flow_approx_method
+        summary["splatting_fill_strategy"] = args.splatting_fill_strategy
+        summary["effective_splatting_fill_strategy"] = resolve_effective_splatting_fill_strategy(args=args)
 
     return summary
 
@@ -784,6 +819,11 @@ def run_training(args: argparse.Namespace) -> None:
     logger.info("metrics=%s", args.metric_config)
     if uses_flow_approx_model(args.model_name):
         logger.info("flow_approx_method=%s", args.flow_approx_method)
+        logger.info(
+            "splatting_fill_strategy=%s effective_splatting_fill_strategy=%s",
+            args.splatting_fill_strategy,
+            resolve_effective_splatting_fill_strategy(args=args),
+        )
 
     root_dir = Path(args.root_dir)
     train_df = build_merged_dataframe(root_dir, checkpoints_dir, args.train_preset, args.only_fps, logger)
