@@ -13,6 +13,7 @@ from src.data.dataset_config import DatasetConfig
 from src.data.image_ops import identical_images
 from src.data.image_ops import load_backward_velocity
 from src.data.image_ops import load_exr
+from src.data.image_ops import load_exr_allow_non_finite
 from src.data.image_ops import load_png
 
 FRAME_GLOB_PATTERN: str = "colorNoScreenUI_*.exr"
@@ -156,7 +157,7 @@ def find_non_finite_exr_modalities(mode_dir: Path, frame_idx: int) -> list[tuple
     }
 
     for modality_column, exr_path in exr_paths.items():
-        exr_data = load_exr(exr_path)
+        exr_data = load_exr_allow_non_finite(exr_path)
         if not np.isfinite(exr_data).all():
             invalid_modalities.append((modality_column, display_names[modality_column]))
 
@@ -277,6 +278,8 @@ def build_valid_clip_windows(dataframe: Any, target_frames_count: int) -> list[d
 
 def merge_easy_medium_dataframes(easy_df: Any, medium_df: Any) -> Any:
     """Merge easy and medium dataframes with one shared validity column."""
+    easy_df = ensure_modality_validity_columns(easy_df)
+    medium_df = ensure_modality_validity_columns(medium_df)
     merged_df = easy_df.merge(
         medium_df,
         on=["record", "frame_idx"],
@@ -284,6 +287,9 @@ def merge_easy_medium_dataframes(easy_df: Any, medium_df: Any) -> Any:
         suffixes=("_easy", "_medium"),
     )
     merged_df["global_is_valid"] = merged_df["is_valid_easy"] & merged_df["is_valid_medium"]
+    merged_df[COLOR_VALID_COLUMN] = merged_df[f"{COLOR_VALID_COLUMN}_easy"] & merged_df[f"{COLOR_VALID_COLUMN}_medium"]
+    merged_df[BACKWARD_VALID_COLUMN] = merged_df[f"{BACKWARD_VALID_COLUMN}_easy"] & merged_df[f"{BACKWARD_VALID_COLUMN}_medium"]
+    merged_df[FORWARD_VALID_COLUMN] = merged_df[f"{FORWARD_VALID_COLUMN}_easy"] & merged_df[f"{FORWARD_VALID_COLUMN}_medium"]
     return merged_df
 
 

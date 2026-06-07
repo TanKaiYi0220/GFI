@@ -6,10 +6,50 @@
     "train_minor_0507",
     "test_minor_0507"
   ],
-  "output_dir": "analysis_outputs/test_minor_0507/",
+  "output_dir": "analysis_outputs/test_minor_0507_layer/",
   "batch_size": 1,
   "only_fps": 60,
   "input_fps": 30,
   "seed": 1234,
-  "filter_valid_only": true
+  "filter_valid_only": true,
+  "layer_scales": [
+    {
+      "layer": 1,
+      "scale": 1.0
+    },
+    {
+      "layer": 2,
+      "scale": 0.5
+    },
+    {
+      "layer": 3,
+      "scale": 0.25
+    },
+    {
+      "layer": 4,
+      "scale": 0.125
+    }
+  ],
+  "layer_scatter_methods": [
+    "ground_truth",
+    "single",
+    "combination",
+    "splatting_zero_fill",
+    "splatting_outside_in_4direction",
+    "splatting_outside_in_4neighbor",
+    "splatting_outside_in_8neighbor"
+  ],
+  "layer_bar_methods": [
+    "ground_truth",
+    "splatting_zero_fill",
+    "splatting_outside_in_4direction",
+    "splatting_outside_in_4neighbor",
+    "splatting_outside_in_8neighbor"
+  ],
+  "metrics": {
+    "enable_psnr": true,
+    "enable_ssim": true,
+    "enable_lpips": true,
+    "lpips_net": "alex"
+  }
 }

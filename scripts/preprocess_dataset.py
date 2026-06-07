@@ -31,16 +31,17 @@ from src.utils.io import ensure_directory
 
 
 DATASET_PRESET_NAME: str = "train_vfx_0416"
-TEST_DATASET_PRESET_NAME: str = "test_vfx_0416"
+TEST_DATASET_PRESET_NAME: str = "test_minor_0604"
 DATASET_ROOT_DIR_OVERRIDE: str | None = None
 PATHS_CONFIG_PATH: str | None = None
-DATA_DIR: str = "./data"
-MERGE_STRATEGY: str = "only-difficult"
+DATA_DIR: str = "./data/Minor_0604/"
+# MERGE_STRATEGY: str = "only-difficult"
+MERGE_STRATEGY: str = "ignore-easy"
 ONLY_FPS: int = 60
 
-DRY_RUN: bool = True
-REMOVE_IDENTICAL: bool = False
-CHECK_NON_FINITE_EXR: bool = False
+DRY_RUN: bool = False
+REMOVE_IDENTICAL: bool = True
+CHECK_NON_FINITE_EXR: bool = True
 CHECK_IDENTICAL_CROSS_FPS: bool = False
 MANUAL_LABELING: bool = False
 MERGE_DATASETS: bool = True
@@ -230,33 +231,33 @@ def run_linearity_check(dataset_root_dir: Path, data_dir: Path, dataset_configs:
 
 
 def main() -> None:
-    dataset_root_dir = resolve_dataset_root_dir(DATASET_ROOT_DIR_OVERRIDE, PATHS_CONFIG_PATH)
-    data_dir = Path(DATA_DIR)
-    dataset_configs = get_target_configs(DATASET_PRESET_NAME)
+    # dataset_root_dir = resolve_dataset_root_dir(DATASET_ROOT_DIR_OVERRIDE, PATHS_CONFIG_PATH)
+    # data_dir = Path(DATA_DIR)
+    # dataset_configs = get_target_configs(DATASET_PRESET_NAME)
 
-    if DRY_RUN:
-        print_run_summary(dataset_root_dir, data_dir, dataset_configs)
+    # if DRY_RUN:
+    #     print_run_summary(dataset_root_dir, data_dir, dataset_configs)
 
-    if REMOVE_IDENTICAL:
-        run_remove_identical(dataset_root_dir, data_dir, dataset_configs)
+    # if REMOVE_IDENTICAL:
+    #     run_remove_identical(dataset_root_dir, data_dir, dataset_configs)
 
-    if CHECK_NON_FINITE_EXR:
-        run_check_non_finite_exr(dataset_root_dir, data_dir, dataset_configs)
+    # if CHECK_NON_FINITE_EXR:
+    #     run_check_non_finite_exr(dataset_root_dir, data_dir, dataset_configs)
 
-    if CHECK_IDENTICAL_CROSS_FPS:
-        run_check_cross_fps(dataset_root_dir, data_dir, dataset_configs)
+    # if CHECK_IDENTICAL_CROSS_FPS:
+    #     run_check_cross_fps(dataset_root_dir, data_dir, dataset_configs)
 
-    if MANUAL_LABELING:
-        run_manual_labeling(dataset_root_dir, data_dir, dataset_configs)
+    # if MANUAL_LABELING:
+    #     run_manual_labeling(dataset_root_dir, data_dir, dataset_configs)
 
-    if MERGE_DATASETS:
-        run_merge(data_dir, dataset_configs, MERGE_STRATEGY)
+    # if MERGE_DATASETS:
+    #     run_merge(data_dir, dataset_configs, MERGE_STRATEGY)
 
-    if RAW_SEQUENCE:
-        run_raw_sequence(data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
+    # if RAW_SEQUENCE:
+    #     run_raw_sequence(data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
 
-    if LINEARITY_CHECK:
-        run_linearity_check(dataset_root_dir, data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
+    # if LINEARITY_CHECK:
+    #     run_linearity_check(dataset_root_dir, data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
 
     dataset_root_dir = resolve_dataset_root_dir(DATASET_ROOT_DIR_OVERRIDE, PATHS_CONFIG_PATH)
     data_dir = Path(DATA_DIR)

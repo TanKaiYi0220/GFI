@@ -816,6 +816,29 @@ def run_training(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lpips_model = build_lpips_model(args.metric_config, device)
     logger.info("device=%s", device)
+    logger.info("model_name=%s model_init_args=%s", args.model_name, args.model_init_args)
+    logger.info(
+        "train_preset=%s test_preset=%s input_fps=%s only_fps=%s",
+        args.train_preset,
+        args.test_preset,
+        args.input_fps,
+        args.only_fps,
+    )
+    logger.info(
+        "epochs=%s batch_size=%s eval_interval=%s lr_start=%s lr_end=%s seed=%s",
+        args.epochs,
+        args.batch_size,
+        args.eval_interval,
+        args.lr_start,
+        args.lr_end,
+        args.seed,
+    )
+    logger.info(
+        "resume_path=%s pretrained_checkpoint_path=%s output_dir=%s",
+        args.resume_path,
+        args.pretrained_checkpoint_path,
+        args.output_dir,
+    )
     logger.info("metrics=%s", args.metric_config)
     if uses_flow_approx_model(args.model_name):
         logger.info("flow_approx_method=%s", args.flow_approx_method)
@@ -859,6 +882,8 @@ def run_training(args: argparse.Namespace) -> None:
     model_class = resolve_model_class(args.model_name)
     model_init_args = dict(getattr(args, "model_init_args", {}))
     model = model_class(**model_init_args).to(device)
+    if hasattr(model, "init_flow_layer"):
+        logger.info("model_init_flow_layer=%s", model.init_flow_layer)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr_start, weight_decay=0)
     training_state = load_training_state(args, model, optimizer, device, logger)
 

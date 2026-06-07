@@ -1,8 +1,10 @@
 {
   "mode": "train",
   "model_name": "IFRNet_Residual_FlowApprox",
+  "flow_approx_method": "splatting",
+  "splatting_fill_strategy": "outside_in_8neighbor",
     "model_init_args": {
-        "init_flow_layer": 1
+        "init_flow_layer": 4
   },
   "root_dir": "data/Minor_0507/",
   "dataset_root_dir": "/workspace/datasets/Minor_0507/",
@@ -11,10 +13,10 @@
   "epochs": 50,
   "eval_interval": 1,
   "lr_start": 1e-4,
-  "lr_end": 8.5e-5,
+  "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 16,
-  "output_dir": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_ZeroSplat_Minor_0603",
+  "output_dir": "outputs/IFRNet_Residual_FlowApprox_4_Layer_TwoStage_Splat_8Neighbor_Minor_0605",
   "only_fps": 60,
   "input_fps": 30,
   "metrics": {
@@ -23,7 +25,6 @@
     "enable_lpips": true,
     "lpips_net": "alex"
   },
-  "flow_approx_method": "splatting",
   "resume_path": null,
   "pretrained_checkpoint_path": "outputs/IFRNet_Residual_0416/checkpoints/best.pth",
   "sample_train_frames": [

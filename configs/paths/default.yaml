@@ -5,6 +5,6 @@
   "output_root": "outputs",
   "dataset_roots": {
     "default_dataset_root": "/datasets/VFI/datasets/VFX_0326",
-    "default_workspace_root": "/workspace/datasets"
+    "default_workspace_root": "/workspace/datasets/Minor_0604"
   }
 }

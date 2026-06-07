@@ -1,0 +1,44 @@
+{
+  "mode": "infer",
+  "model_name": "IFRNet_Residual_FlowApprox",
+    "model_init_args": {
+        "init_flow_layer": 1
+  },
+  "root_dir": "data/Minor_0604/",
+  "dataset_root_dir": "/workspace/datasets/Minor_0604/",
+  "inference_preset": [
+    "test_minor_0604"
+  ],
+  "checkpoint_path": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_ZeroSplat_Minor_0603/checkpoints/best.pth",
+  "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_ZeroSplat_Minor_0603/",
+  "seed": 1234,
+  "batch_size": 1,
+  "only_fps": 60,
+  "input_fps": 30,
+  "metrics": {
+    "enable_psnr": true,
+    "enable_ssim": true,
+    "enable_lpips": true,
+    "lpips_net": "alex"
+  },
+  "scale_factor": 1.0,
+  "flow_approx_method": "splatting",
+  "flow_diff_threshold": 1.0,
+  "flow_diff_percentile": 99.0,
+  "save_topk_worst_psnr": 10,
+  "save_topk_best_psnr": 5,
+  "save_topk_largest_flow_diff": 10,
+  "video": {
+    "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_ZeroSplat_Minor_0603/videos",
+    "fps": 60,
+    "ignore_valid": true,
+    "record_filter": null,
+    "mode_filter": null,
+    "export_grid": true,
+    "tile_scale": 0.5,
+    "pad": 8,
+    "export_all": false,
+    "export_vfi60": true,
+    "single_files": []
+  }
+}

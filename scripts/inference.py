@@ -717,6 +717,8 @@ def main(argv: list[str] | None = None) -> None:
         dataframe = dataframe[dataframe["valid"] == True].reset_index(drop=True)
     model_class = resolve_model_class(model_name)
     model = model_class(**model_init_args).to(device)
+    if hasattr(model, "init_flow_layer"):
+        logger.info("model_init_flow_layer=%s", model.init_flow_layer)
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     # print("Load Pretrained Weights from IFRNet_Vimeo90K.pth as Baseline")

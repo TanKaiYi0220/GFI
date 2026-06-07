@@ -124,6 +124,7 @@ def load_dataset_roots(paths_config_path: Path | None) -> dict[str, Path]:
 def resolve_active_dataset_root(paths_config_path: Path | None) -> Path:
     """Resolve the active dataset root from the global selector and shared paths config."""
     dataset_roots: dict[str, Path] = load_dataset_roots(paths_config_path=paths_config_path)
+    print(dataset_roots[ACTIVE_DATASET_ROOT_KEY])
     return dataset_roots[ACTIVE_DATASET_ROOT_KEY]
 
 
@@ -483,6 +484,19 @@ TEST_MINOR_0507_DATASET_PRESET: DatasetPreset = build_dataset_preset(
     },
 )
 
+TEST_MINOR_0604_DATASET_PRESET: DatasetPreset = build_dataset_preset(
+    name="Minor_0604",
+    records={
+        "ARPG_3": make_record_config(
+            main_indices=("0", "1"),
+            difficulties=("Medium", ),
+            sub_indices=("0", "0"),
+            fps_values=(30, 60),
+            max_indices=(300, 600),
+        ),
+    },
+)
+
 DATASET_PRESETS: dict[str, DatasetPreset] = {
     "minor": MINOR_DATASET_PRESET,
     "full": FULL_DATASET_PRESET,
@@ -500,6 +514,7 @@ DATASET_PRESETS: dict[str, DatasetPreset] = {
     "smoke_arpg2_dual": SMOKE_ARPG2_DUAL_PRESET,
     "train_minor_0507": TRAIN_MINOR_0507_DATASET_PRESET,
     "test_minor_0507": TEST_MINOR_0507_DATASET_PRESET,
+    "test_minor_0604": TEST_MINOR_0604_DATASET_PRESET,
 }
 
 TRAIN_VFX_0416_DATASET_CONFIGS: DatasetPreset = TRAIN_VFX_0416_DATASET_PRESET

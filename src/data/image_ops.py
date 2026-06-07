@@ -65,6 +65,11 @@ def load_exr(image_path: Path) -> np.ndarray:
     return retry_load_image(image_path, cv2.IMREAD_UNCHANGED, "EXR image")
 
 
+def load_exr_allow_non_finite(image_path: Path) -> np.ndarray:
+    """Load one EXR image as a float array without rejecting NaN or Inf values."""
+    return retry_load_image(image_path, cv2.IMREAD_UNCHANGED, "EXR image", validate_finite=False)
+
+
 def convert_exr_to_png(source_path: Path, target_path: Path) -> None:
     """Convert one EXR image into one PNG image."""
     exr_image = load_exr(source_path)
@@ -80,7 +85,7 @@ def save_image(image_path: Path, image: np.ndarray) -> None:
         raise ValueError(f"Failed to save image: {image_path}")
 
 
-def retry_load_image(image_path: Path, read_flag: int, image_kind: str) -> np.ndarray:
+def retry_load_image(image_path: Path, read_flag: int, image_kind: str, validate_finite: bool = True) -> np.ndarray:
     """Load one image with short retries for transient filesystem or decoder failures."""
     if not image_path.is_file():
         raise FileNotFoundError(f"Missing {image_kind}: path={image_path}")
@@ -94,7 +99,7 @@ def retry_load_image(image_path: Path, read_flag: int, image_kind: str) -> np.nd
 
             decoded_image = cv2.imread(str(image_path), read_flag)
             if decoded_image is not None:
-                if not np.isfinite(decoded_image).all():
+                if validate_finite and not np.isfinite(decoded_image).all():
                     nan_count = int(np.count_nonzero(np.isnan(decoded_image)))
                     inf_count = int(np.count_nonzero(np.isinf(decoded_image)))
                     last_error = ValueError(
