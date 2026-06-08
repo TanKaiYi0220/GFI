@@ -1184,6 +1184,55 @@ def write_run_config(data_preset_name: str, data_preset: DataPreset, output_dir:
     (output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
 
 
+def build_model_config_snapshot(
+    inference_config_path_text: str | None,
+    result_root_text: str | None,
+) -> dict[str, object]:
+    if inference_config_path_text is None:
+        return {
+            "inference_config_path": "",
+            "result_root": "" if result_root_text is None else str(resolve_input_path(result_root_text)),
+            "config": None,
+        }
+
+    inference_config_path = require_file(resolve_input_path(inference_config_path_text))
+    inference_config = load_yaml_file(inference_config_path)
+    if not isinstance(inference_config, dict):
+        raise TypeError(
+            f"Inference config must be a mapping: path={inference_config_path}, "
+            f"type={type(inference_config).__name__}"
+        )
+
+    checkpoint_path = resolve_model_checkpoint_path(
+        config=inference_config,
+        config_path=inference_config_path,
+    )
+    return {
+        "inference_config_path": str(inference_config_path),
+        "resolved_checkpoint_path": str(checkpoint_path),
+        "config": inference_config,
+    }
+
+
+def write_model_config_snapshots(output_dir: Path, args: argparse.Namespace) -> None:
+    candidate_snapshot = build_model_config_snapshot(
+        inference_config_path_text=args.candidate_inference_config,
+        result_root_text=args.candidate_result_root,
+    )
+    baseline_snapshot = build_model_config_snapshot(
+        inference_config_path_text=args.baseline_inference_config,
+        result_root_text=args.baseline_result_root,
+    )
+    (output_dir / "candidate_config.json").write_text(
+        json.dumps(candidate_snapshot, indent=2),
+        encoding="utf-8",
+    )
+    (output_dir / "baseline_config.json").write_text(
+        json.dumps(baseline_snapshot, indent=2),
+        encoding="utf-8",
+    )
+
+
 def resolve_output_dir(args: argparse.Namespace, data_preset_name: str) -> Path:
     if args.output_path is None or str(args.output_path) == "":
         return OUTPUT_ROOT / data_preset_name
@@ -1347,6 +1396,7 @@ def run_analysis(data_preset_name: str, data_preset: DataPreset, args: argparse.
     output_dir = resolve_output_dir(args=args, data_preset_name=data_preset_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_run_config(data_preset_name=data_preset_name, data_preset=data_preset, output_dir=output_dir, args=args)
+    write_model_config_snapshots(output_dir=output_dir, args=args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     rows: list[dict[str, object]] = []
     save_all_overlays = bool(args.save_overlay_images) and not bool(args.save_selected_cases_only)

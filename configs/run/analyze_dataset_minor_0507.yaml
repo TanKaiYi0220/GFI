@@ -37,14 +37,16 @@
     "splatting_zero_fill",
     "splatting_outside_in_4direction",
     "splatting_outside_in_4neighbor",
-    "splatting_outside_in_8neighbor"
+    "splatting_outside_in_8neighbor",
+    "splatting_ground_truth_fill"
   ],
   "layer_bar_methods": [
     "ground_truth",
     "splatting_zero_fill",
     "splatting_outside_in_4direction",
     "splatting_outside_in_4neighbor",
-    "splatting_outside_in_8neighbor"
+    "splatting_outside_in_8neighbor",
+    "splatting_ground_truth_fill"
   ],
   "metrics": {
     "enable_psnr": true,
