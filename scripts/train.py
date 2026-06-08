@@ -185,6 +185,8 @@ def forward_model(
     splatting_fill_strategy: str,
     source_depth0: Any | None,
     source_depth1: Any | None,
+    ground_truth_bmv: Any | None,
+    ground_truth_fmv: Any | None,
 ) -> Any:
     import torch
 
@@ -200,6 +202,8 @@ def forward_model(
             source_depth0=source_depth0,
             source_depth1=source_depth1,
             splatting_fill_strategy=splatting_fill_strategy,
+            ground_truth_bmv=ground_truth_bmv,
+            ground_truth_fmv=ground_truth_fmv,
         )
         init_bmv = flow_init.bmv
         init_fmv = flow_init.fmv
@@ -389,9 +393,11 @@ def run_training_batch(
     device: Any,
 ) -> BatchStepOutput:
     if uses_flow_approx_model(args.model_name):
-        img0, imgt, img1, _bmv_60, _fmv_60, bmv_30, fmv_30, embt, info = batch
+        img0, imgt, img1, bmv_60, fmv_60, bmv_30, fmv_30, embt, info = batch
         source_bmv = bmv_30.to(device)
         source_fmv = fmv_30.to(device)
+        ground_truth_bmv = bmv_60.to(device)
+        ground_truth_fmv = fmv_60.to(device)
         if is_splatting_flow_approx_method(flow_approx_method=args.flow_approx_method):
             source_depth0 = info["source_depth0"].to(device)
             source_depth1 = info["source_depth1"].to(device)
@@ -404,6 +410,8 @@ def run_training_batch(
         source_fmv = fmv.to(device)
         source_depth0 = None
         source_depth1 = None
+        ground_truth_bmv = None
+        ground_truth_fmv = None
 
     img0 = img0.to(device)
     img1 = img1.to(device)
@@ -423,6 +431,8 @@ def run_training_batch(
         args.splatting_fill_strategy,
         source_depth0,
         source_depth1,
+        ground_truth_bmv,
+        ground_truth_fmv,
     )
     imgt_pred, loss_rec, loss_geo, loss_dis, _up_flow0_1, _up_flow1_1, _up_mask_1 = model_output
     return BatchStepOutput(

@@ -385,6 +385,8 @@ def run_inference_batch_with_fill_strategy(
             source_depth0=source_depth0,
             source_depth1=source_depth1,
             splatting_fill_strategy=splatting_fill_strategy,
+            ground_truth_bmv=bmv,
+            ground_truth_fmv=fmv,
         )
         init_bmv = flow_init.bmv
         init_fmv = flow_init.fmv

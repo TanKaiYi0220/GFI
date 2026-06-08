@@ -28,6 +28,7 @@ ANALYSIS_SPLATTING_FILL_METHODS: dict[str, str] = {
     "splatting_outside_in_4direction": "outside_in_4direction",
     "splatting_outside_in_4neighbor": "outside_in_4neighbor",
     "splatting_outside_in_8neighbor": "outside_in_8neighbor",
+    "splatting_ground_truth_fill": "ground_truth",
 }
 ANALYSIS_FLOW_APPROX_METHODS: tuple[str, ...] = FLOW_APPROX_METHODS + tuple(ANALYSIS_SPLATTING_FILL_METHODS.keys())
 GROUND_TRUTH_METHOD: str = "ground_truth"
@@ -41,6 +42,7 @@ METHOD_DISPLAY_NAMES: dict[str, str] = {
     "splatting_outside_in_4direction": "outside-in 4-direction",
     "splatting_outside_in_4neighbor": "outside-in 4-neighbor",
     "splatting_outside_in_8neighbor": "outside-in 8-neighbor",
+    "splatting_ground_truth_fill": "GT hole fill",
 }
 METHOD_COLORS: dict[str, str] = {
     GROUND_TRUTH_METHOD: "#222222",
@@ -51,6 +53,7 @@ METHOD_COLORS: dict[str, str] = {
     "splatting_outside_in_4direction": "#F2CF5B",
     "splatting_outside_in_4neighbor": "#54A24B",
     "splatting_outside_in_8neighbor": "#B279A2",
+    "splatting_ground_truth_fill": "#D62728",
 }
 
 
@@ -254,6 +257,8 @@ def build_flow_init_result_with_runtime(
     flow_approx_method: str,
     source_depth0: Any | None,
     source_depth1: Any | None,
+    ground_truth_bmv: Any,
+    ground_truth_fmv: Any,
     device: Any,
 ) -> tuple[Any, float]:
     import time
@@ -271,6 +276,8 @@ def build_flow_init_result_with_runtime(
                 source_depth0=source_depth0,
                 source_depth1=source_depth1,
                 fill_strategy=ANALYSIS_SPLATTING_FILL_METHODS[flow_approx_method],
+                ground_truth_bmv=ground_truth_bmv,
+                ground_truth_fmv=ground_truth_fmv,
             )
 
         return build_flow_init_result(
@@ -911,6 +918,8 @@ def analyze_dataset(config: AnalysisConfig) -> None:
                         flow_approx_method=flow_approx_method,
                         source_depth0=source_depth0,
                         source_depth1=source_depth1,
+                        ground_truth_bmv=bmv_60,
+                        ground_truth_fmv=fmv_60,
                         device=device,
                     )
                     approx_bmv = flow_init.bmv

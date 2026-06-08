@@ -14,12 +14,14 @@ SPLATTING_FILL_STRATEGIES: tuple[str, ...] = (
     "outside_in_4direction",
     "outside_in_4neighbor",
     "outside_in_8neighbor",
+    "ground_truth",
 )
 SPLATTING_FILL_METHOD_ALIASES: dict[str, str] = {
     "splatting_zero_fill": "zero",
     "splatting_outside_in_4direction": "outside_in_4direction",
     "splatting_outside_in_4neighbor": "outside_in_4neighbor",
     "splatting_outside_in_8neighbor": "outside_in_8neighbor",
+    "splatting_ground_truth_fill": "ground_truth",
 }
 FLOW_APPROX_METHOD_CHOICES: tuple[str, ...] = FLOW_APPROX_METHODS + ("linear_splatting",) + tuple(SPLATTING_FILL_METHOD_ALIASES.keys())
 DEPTH_REDUCE_MODE: str = "amax"
@@ -215,7 +217,28 @@ def outside_in_fill_flow_holes_by_4direction(flow: Tensor, mask: Tensor) -> Tens
     return torch.where(fillable.expand_as(flow), direction_average, filled)
 
 
-def fill_splatting_flow_holes(flow: Tensor, mask: Tensor, fill_strategy: str) -> Tensor:
+def fill_flow_holes_with_ground_truth(flow: Tensor, mask: Tensor, ground_truth_flow: Tensor | None) -> Tensor:
+    import torch
+
+    if ground_truth_flow is None:
+        raise ValueError("ground_truth splatting fill requires a ground-truth target flow tensor.")
+
+    validate_flow_tensor("ground_truth_flow", ground_truth_flow)
+    if tuple(ground_truth_flow.shape) != tuple(flow.shape):
+        raise ValueError(
+            f"ground_truth_flow must have shape {tuple(flow.shape)}, got {tuple(ground_truth_flow.shape)}."
+        )
+
+    normalized_ground_truth = ground_truth_flow.to(device=flow.device, dtype=flow.dtype)
+    return torch.where(mask.bool().expand_as(flow), flow, normalized_ground_truth)
+
+
+def fill_splatting_flow_holes(
+    flow: Tensor,
+    mask: Tensor,
+    fill_strategy: str,
+    ground_truth_flow: Tensor | None,
+) -> Tensor:
     if fill_strategy == "zero":
         return flow
 
@@ -227,6 +250,13 @@ def fill_splatting_flow_holes(flow: Tensor, mask: Tensor, fill_strategy: str) ->
 
     if fill_strategy == "outside_in_8neighbor":
         return outside_in_fill_flow_holes_by_neighbors(flow=flow, mask=mask, neighbor_mode="8neighbor")
+
+    if fill_strategy == "ground_truth":
+        return fill_flow_holes_with_ground_truth(
+            flow=flow,
+            mask=mask,
+            ground_truth_flow=ground_truth_flow,
+        )
 
     available_strategies = ", ".join(SPLATTING_FILL_STRATEGIES)
     raise ValueError(f"Unsupported splatting fill_strategy '{fill_strategy}'. Available strategies: {available_strategies}")
@@ -318,6 +348,8 @@ def build_linear_splatting_flow_init(
         source_depth0=source_depth0,
         source_depth1=source_depth1,
         fill_strategy=DEFAULT_SPLATTING_FILL_STRATEGY,
+        ground_truth_bmv=None,
+        ground_truth_fmv=None,
     )
 
 
@@ -328,6 +360,8 @@ def build_linear_splatting_flow_init_with_fill_strategy(
     source_depth0: Tensor,
     source_depth1: Tensor,
     fill_strategy: str,
+    ground_truth_bmv: Tensor | None,
+    ground_truth_fmv: Tensor | None,
 ) -> FlowInitResult:
     import torch
 
@@ -340,8 +374,18 @@ def build_linear_splatting_flow_init_with_fill_strategy(
     approx_bmv, bmv_mask = nearest_depth_splat_flow(partial_fmv, source_depth0)
     approx_fmv, fmv_mask = nearest_depth_splat_flow(partial_bmv, source_depth1)
 
-    approx_fmv = fill_splatting_flow_holes(flow=approx_fmv, mask=fmv_mask, fill_strategy=fill_strategy)
-    approx_bmv = fill_splatting_flow_holes(flow=approx_bmv, mask=bmv_mask, fill_strategy=fill_strategy)
+    approx_fmv = fill_splatting_flow_holes(
+        flow=approx_fmv,
+        mask=fmv_mask,
+        fill_strategy=fill_strategy,
+        ground_truth_flow=ground_truth_fmv,
+    )
+    approx_bmv = fill_splatting_flow_holes(
+        flow=approx_bmv,
+        mask=bmv_mask,
+        fill_strategy=fill_strategy,
+        ground_truth_flow=ground_truth_bmv,
+    )
     return FlowInitResult(bmv=approx_bmv, fmv=approx_fmv, masks=torch.cat((bmv_mask, fmv_mask), dim=1))
 
 
@@ -361,6 +405,8 @@ def build_flow_init_result(
         source_depth0=source_depth0,
         source_depth1=source_depth1,
         splatting_fill_strategy=DEFAULT_SPLATTING_FILL_STRATEGY,
+        ground_truth_bmv=None,
+        ground_truth_fmv=None,
     )
 
 
@@ -372,6 +418,8 @@ def build_flow_init_result_with_fill_strategy(
     source_depth0: Tensor | None,
     source_depth1: Tensor | None,
     splatting_fill_strategy: str,
+    ground_truth_bmv: Tensor | None,
+    ground_truth_fmv: Tensor | None,
 ) -> FlowInitResult:
     time = embt.reshape(embt.shape[0], 1, 1, 1)
 
@@ -399,6 +447,8 @@ def build_flow_init_result_with_fill_strategy(
                 flow_approx_method=flow_approx_method,
                 splatting_fill_strategy=splatting_fill_strategy,
             ),
+            ground_truth_bmv=ground_truth_bmv,
+            ground_truth_fmv=ground_truth_fmv,
         )
 
     available_methods = ", ".join(FLOW_APPROX_METHOD_CHOICES)
