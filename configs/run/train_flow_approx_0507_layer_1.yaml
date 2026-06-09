@@ -3,6 +3,8 @@
   "model_name": "IFRNet_Residual_FlowApprox",
   "flow_approx_method": "splatting",
   "splatting_fill_strategy": "outside_in_8neighbor",
+  "init_flow_downscale_strategy": "masked_area",
+  "init_flow_mask_epsilon": 1.0e-6,
     "model_init_args": {
         "init_flow_layer": 4
   },
@@ -16,7 +18,7 @@
   "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 16,
-  "output_dir": "outputs/IFRNet_Residual_FlowApprox_4_Layer_Scratch_Splat_8Neighbor_Minor_0608",
+  "output_dir": "outputs/IFRNet_Residual_FlowApprox_4_Layer_TwoStage_Splat_8Neighbor_MaskedDownScaled_Minor_0608",
   "only_fps": 60,
   "input_fps": 30,
   "metrics": {
@@ -26,7 +28,7 @@
     "lpips_net": "alex"
   },
   "resume_path": null,
-  "pretrained_checkpoint_path": null,
+  "pretrained_checkpoint_path": "outputs/IFRNet_Residual_0416/checkpoints/best.pth",
   "sample_train_frames": [
     "ARPG_3_0_Medium_5_0404",
     "ARPG_3_1_Medium_5_0452"

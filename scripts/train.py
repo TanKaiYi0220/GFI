@@ -339,7 +339,10 @@ def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: 
     import numpy as np
     import torch
     from torch.utils.data import DataLoader
-    from scripts.inference import run_inference_batch_with_fill_strategy, save_selected_sample_artifacts
+    from scripts.inference import DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY
+    from scripts.inference import DEFAULT_INIT_FLOW_MASK_EPSILON
+    from scripts.inference import run_inference_batch_with_fill_strategy
+    from scripts.inference import save_selected_sample_artifacts
     from src.data.image_ops import flow_to_image, save_image
 
     frame_groups = {"train": args.sample_train_frames, "test": args.sample_test_frames}
@@ -371,6 +374,8 @@ def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: 
                     device,
                     args.flow_approx_method,
                     args.splatting_fill_strategy,
+                    DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY,
+                    DEFAULT_INIT_FLOW_MASK_EPSILON,
                     model,
                     args.model_name,
                     1.0,

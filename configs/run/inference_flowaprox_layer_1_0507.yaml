@@ -4,14 +4,18 @@
     "model_init_args": {
         "init_flow_layer": 1
   },
+  "flow_approx_method": "splatting",
+  "splatting_fill_strategy": "outside_in_8neighbor",
+  "init_flow_downscale_strategy": "masked_area",
+  "init_flow_mask_epsilon": 1.0e-6,
   "root_dir": "data/Minor_0507/",
   "dataset_root_dir": "/workspace/datasets/Minor_0507/",
   "inference_preset": [
     "train_minor_0507",
     "test_minor_0507"
   ],
-  "checkpoint_path": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_ZeroSplat_Minor_0603/checkpoints/best.pth",
-  "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_ZeroSplat_Minor_0603/",
+  "checkpoint_path": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_8Neighbor_Minor_0605/checkpoints/best.pth",
+  "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_8Neighbor_Minor_0605/",
   "seed": 1234,
   "batch_size": 1,
   "only_fps": 60,

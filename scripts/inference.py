@@ -36,6 +36,9 @@ from src.utils.logger import build_logger
 BASELINE_MODEL_NAME: str = "IFRNet"
 RESIDUAL_MODEL_NAME: str = "IFRNet_Residual"
 RESIDUAL_FLOW_APPROX_MODEL_NAME: str = "IFRNet_Residual_FlowApprox"
+DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY: str = "bilinear"
+DEFAULT_INIT_FLOW_MASK_EPSILON: float = 1e-6
+INIT_FLOW_DOWNSCALE_STRATEGIES: tuple[str, ...] = ("bilinear", "masked_area")
 # Model variants:
 # - IFRNet: baseline
 # - IFRNet_Residual: residual model initialized by bmv/fmv from the 60fps motion labels
@@ -329,6 +332,8 @@ def run_inference_batch_with_fill_strategy(
     device: Any,
     flow_approx_method: str,
     splatting_fill_strategy: str,
+    init_flow_downscale_strategy: str,
+    init_flow_mask_epsilon: float,
     model: Any,
     model_name: str,
     scale_factor: float,
@@ -391,6 +396,15 @@ def run_inference_batch_with_fill_strategy(
         init_bmv = flow_init.bmv
         init_fmv = flow_init.fmv
         splatting_region_maps = build_splatting_region_maps(fmv_30, bmv_30, embt, flow_init.masks)
+        init_bmv_mask = None
+        init_fmv_mask = None
+        if init_flow_downscale_strategy == "masked_area":
+            if flow_init.masks is None:
+                raise RuntimeError(
+                    "init_flow_downscale_strategy=masked_area requires splatting coverage masks, but none were produced."
+                )
+            init_bmv_mask = flow_init.masks[:, 0:1]
+            init_fmv_mask = flow_init.masks[:, 1:2]
         imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
             img0,
             img1,
@@ -398,6 +412,9 @@ def run_inference_batch_with_fill_strategy(
             scale_factor,
             init_flow0=init_bmv,
             init_flow1=init_fmv,
+            init_flow0_mask=init_bmv_mask,
+            init_flow1_mask=init_fmv_mask,
+            init_flow_mask_epsilon=init_flow_mask_epsilon,
         )
         return {
             "bmv": bmv,
@@ -466,6 +483,8 @@ def run_inference_batch(
         device=device,
         flow_approx_method=flow_approx_method,
         splatting_fill_strategy=DEFAULT_SPLATTING_FILL_STRATEGY,
+        init_flow_downscale_strategy=DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY,
+        init_flow_mask_epsilon=DEFAULT_INIT_FLOW_MASK_EPSILON,
         model=model,
         model_name=model_name,
         scale_factor=scale_factor,
@@ -626,6 +645,10 @@ def main(argv: list[str] | None = None) -> None:
     inference_presets = read_inference_presets(config)
     flow_approx_method = str(config["flow_approx_method"])
     splatting_fill_strategy = str(config.get("splatting_fill_strategy", DEFAULT_SPLATTING_FILL_STRATEGY))
+    init_flow_downscale_strategy = str(
+        config.get("init_flow_downscale_strategy", DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY)
+    )
+    init_flow_mask_epsilon = float(config.get("init_flow_mask_epsilon", DEFAULT_INIT_FLOW_MASK_EPSILON))
     scale_factor = float(config["scale_factor"])
     flow_diff_threshold = float(config.get("flow_diff_threshold", 1.0))
     flow_diff_percentile = float(config.get("flow_diff_percentile", 99.0))
@@ -660,6 +683,22 @@ def main(argv: list[str] | None = None) -> None:
     if splatting_fill_strategy not in SPLATTING_FILL_STRATEGIES:
         available_strategies = ", ".join(SPLATTING_FILL_STRATEGIES)
         raise ValueError(f"Unsupported splatting_fill_strategy: {splatting_fill_strategy}. Available strategies: {available_strategies}")
+    if init_flow_downscale_strategy not in INIT_FLOW_DOWNSCALE_STRATEGIES:
+        available_strategies = ", ".join(INIT_FLOW_DOWNSCALE_STRATEGIES)
+        raise ValueError(
+            f"Unsupported init_flow_downscale_strategy: {init_flow_downscale_strategy}. "
+            f"Available strategies: {available_strategies}"
+        )
+    if init_flow_mask_epsilon <= 0:
+        raise ValueError(f"init_flow_mask_epsilon must be positive, got {init_flow_mask_epsilon}")
+    if init_flow_downscale_strategy == "masked_area" and (
+        model_name != RESIDUAL_FLOW_APPROX_MODEL_NAME
+        or not is_splatting_flow_approx_method(flow_approx_method=flow_approx_method)
+    ):
+        raise ValueError(
+            "init_flow_downscale_strategy=masked_area requires "
+            "model_name=IFRNet_Residual_FlowApprox and a splatting flow approximation method."
+        )
 
     summary = {
         "mode": mode,
@@ -675,6 +714,8 @@ def main(argv: list[str] | None = None) -> None:
         "scale_factor": scale_factor,
         "flow_approx_method": flow_approx_method,
         "splatting_fill_strategy": splatting_fill_strategy,
+        "init_flow_downscale_strategy": init_flow_downscale_strategy,
+        "init_flow_mask_epsilon": init_flow_mask_epsilon,
         "flow_diff_threshold": flow_diff_threshold,
         "flow_diff_percentile": flow_diff_percentile,
         "save_topk_worst_psnr": save_topk_worst_psnr,
@@ -707,6 +748,13 @@ def main(argv: list[str] | None = None) -> None:
     lpips_model = build_lpips_model(metric_config, device)
     logger.info("device=%s model=%s", device, model_name)
     logger.info("metrics=%s", metric_config)
+    logger.info(
+        "flow_approx_method=%s splatting_fill_strategy=%s init_flow_downscale_strategy=%s init_flow_mask_epsilon=%s",
+        flow_approx_method,
+        splatting_fill_strategy,
+        init_flow_downscale_strategy,
+        init_flow_mask_epsilon,
+    )
 
     dataframe_list: list[Any] = []
     for inference_preset in inference_presets:
@@ -759,6 +807,8 @@ def main(argv: list[str] | None = None) -> None:
                     device,
                     flow_approx_method,
                     splatting_fill_strategy,
+                    init_flow_downscale_strategy,
+                    init_flow_mask_epsilon,
                     model,
                     model_name,
                     scale_factor,
@@ -899,6 +949,8 @@ def main(argv: list[str] | None = None) -> None:
                         device,
                         flow_approx_method,
                         splatting_fill_strategy,
+                        init_flow_downscale_strategy,
+                        init_flow_mask_epsilon,
                         model,
                         model_name,
                         scale_factor,

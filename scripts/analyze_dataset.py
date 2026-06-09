@@ -15,6 +15,7 @@ from scripts.train import build_merged_dataframe
 from scripts.train import set_seed
 from src.engine.evaluation import build_lpips_model
 from src.engine.evaluation import calculate_batch_metrics
+from src.engine.evaluation import calculate_psnr_batch
 from src.engine.evaluation import read_metric_config
 from src.engine.evaluation import require_psnr_enabled
 from src.engine.flow_approx import build_linear_splatting_flow_init_with_fill_strategy
@@ -32,6 +33,7 @@ ANALYSIS_SPLATTING_FILL_METHODS: dict[str, str] = {
 }
 ANALYSIS_FLOW_APPROX_METHODS: tuple[str, ...] = FLOW_APPROX_METHODS + tuple(ANALYSIS_SPLATTING_FILL_METHODS.keys())
 GROUND_TRUTH_METHOD: str = "ground_truth"
+INTERPOLATION_ALIGN_CORNERS: bool = False
 LAYER_ANALYSIS_METHODS: tuple[str, ...] = (GROUND_TRUTH_METHOD,) + ANALYSIS_FLOW_APPROX_METHODS
 METHOD_DISPLAY_NAMES: dict[str, str] = {
     GROUND_TRUTH_METHOD: "GT target flow",
@@ -329,9 +331,22 @@ def calculate_warp_metrics(
     )
 
 
+def calculate_merged_50_50_psnr(
+    target: Any,
+    warped_img0: Any,
+    warped_img1: Any,
+) -> list[float]:
+    merged_prediction = 0.5 * warped_img0 + 0.5 * warped_img1
+    return calculate_psnr_batch(
+        target=target.detach(),
+        prediction=merged_prediction.detach(),
+    )
+
+
 def build_bidirectional_metric_columns(
     metric_values_img0: dict[str, list[float]],
     metric_values_img1: dict[str, list[float]],
+    merged_50_50_psnr_values: list[float],
     batch_index: int,
     suffix: str,
 ) -> dict[str, float]:
@@ -349,6 +364,8 @@ def build_bidirectional_metric_columns(
         columns[f"warp_{metric_name}_img1{suffix}"] = img1_value
         columns[f"warp_{metric_name}_mean{suffix}"] = (img0_value + img1_value) / 2.0
 
+    columns[f"warp_psnr_directional_mean{suffix}"] = columns[f"warp_psnr_mean{suffix}"]
+    columns[f"warp_psnr_merged_50_50{suffix}"] = float(merged_50_50_psnr_values[batch_index])
     return columns
 
 
@@ -364,6 +381,11 @@ def build_metric_delta_columns(
             gt_key = f"{approx_key}_gt"
             columns[f"warp_{metric_name}_delta_{direction}_vs_gt"] = approx_columns[approx_key] - gt_columns[gt_key]
 
+    for psnr_summary in ("directional_mean", "merged_50_50"):
+        approx_key = f"warp_psnr_{psnr_summary}"
+        gt_key = f"{approx_key}_gt"
+        columns[f"warp_psnr_delta_{psnr_summary}_vs_gt"] = approx_columns[approx_key] - gt_columns[gt_key]
+
     return columns
 
 
@@ -374,7 +396,7 @@ def resize_image_for_layer(image: Any, scale: float) -> Any:
         image,
         scale_factor=scale,
         mode="bilinear",
-        align_corners=False,
+        align_corners=INTERPOLATION_ALIGN_CORNERS,
     )
 
 
@@ -421,6 +443,11 @@ def build_layer_contexts(
                 metric_config=metric_config,
                 lpips_model=lpips_model,
             ),
+            "gt_merged_50_50_psnr": calculate_merged_50_50_psnr(
+                target=layer_imgt,
+                warped_img0=gt_img0_warped,
+                warped_img1=gt_img1_warped,
+            ),
         }
 
     return contexts
@@ -461,18 +488,25 @@ def build_method_layer_rows(
             metric_config=metric_config,
             lpips_model=lpips_model,
         )
+        approx_merged_50_50_psnr = calculate_merged_50_50_psnr(
+            target=context["imgt"],
+            warped_img0=approx_img0_warped,
+            warped_img1=approx_img1_warped,
+        )
 
         for batch_index, base_record in enumerate(base_records):
             epe_layer_pixels = float(error_stats["pooled"]["mean"][batch_index].detach().cpu().item())
             gt_metric_columns = build_bidirectional_metric_columns(
                 metric_values_img0=context["gt_img0_warp_metrics"],
                 metric_values_img1=context["gt_img1_warp_metrics"],
+                merged_50_50_psnr_values=context["gt_merged_50_50_psnr"],
                 batch_index=batch_index,
                 suffix="_gt",
             )
             approx_metric_columns = build_bidirectional_metric_columns(
                 metric_values_img0=approx_img0_warp_metrics,
                 metric_values_img1=approx_img1_warp_metrics,
+                merged_50_50_psnr_values=approx_merged_50_50_psnr,
                 batch_index=batch_index,
                 suffix="",
             )
@@ -564,6 +598,9 @@ def plot_layer_psnr_epe_scatter(
     analysis_preset: str,
     layer_scales: tuple[tuple[int, float], ...],
     methods: tuple[str, ...],
+    psnr_column: str,
+    x_label: str,
+    title: str,
     output_path: Path,
 ) -> None:
     import matplotlib.pyplot as plt
@@ -576,7 +613,7 @@ def plot_layer_psnr_epe_scatter(
     summary = (
         preset_dataframe.groupby(["layer", "scale", "method"], as_index=False)
         .agg(
-            warp_psnr_mean=("warp_psnr_mean", "mean"),
+            psnr=(psnr_column, "mean"),
             epe_fullres_equivalent=("epe_fullres_equivalent", "mean"),
         )
     )
@@ -600,7 +637,7 @@ def plot_layer_psnr_epe_scatter(
                     f"layer={layer} method={method} rows={len(method_row)}",
                 )
 
-            psnr = float(method_row.iloc[0]["warp_psnr_mean"])
+            psnr = float(method_row.iloc[0]["psnr"])
             epe = float(method_row.iloc[0]["epe_fullres_equivalent"])
             axis.scatter(
                 psnr,
@@ -621,14 +658,14 @@ def plot_layer_psnr_epe_scatter(
             )
 
         axis.set_title(f"Layer {layer} (scale={scale:g})")
-        axis.set_xlabel("Mean warped RGB PSNR (dB)")
+        axis.set_xlabel(x_label)
         axis.set_ylabel("Mean EPE (full-resolution-equivalent pixels)")
         axis.grid(alpha=0.25)
 
     for unused_axis_index in range(len(layer_scales), row_count * column_count):
         axes.flat[unused_axis_index].set_visible(False)
 
-    figure.suptitle(f"{analysis_preset}: Flow Approximation by IFRNet Layer", fontsize=15)
+    figure.suptitle(f"{analysis_preset}: {title}", fontsize=15)
     figure.tight_layout()
     figure.savefig(output_path, dpi=180)
     plt.close(figure)
@@ -748,17 +785,40 @@ def save_layer_analysis_outputs(
             analysis_preset=analysis_preset,
             layer_scales=config.layer_scales,
             methods=config.layer_scatter_methods,
+            psnr_column="warp_psnr_directional_mean",
+            x_label="Directional mean warped RGB PSNR (dB)",
+            title="Directional PSNR and Flow EPE by IFRNet Layer",
             output_path=config.output_dir / f"{analysis_preset}_layer_psnr_epe_scatter.png",
+        )
+        plot_layer_psnr_epe_scatter(
+            layer_dataframe=layer_dataframe,
+            analysis_preset=analysis_preset,
+            layer_scales=config.layer_scales,
+            methods=config.layer_scatter_methods,
+            psnr_column="warp_psnr_merged_50_50",
+            x_label="50/50 merged warped RGB PSNR (dB)",
+            title="50/50 Merged PSNR and Flow EPE by IFRNet Layer",
+            output_path=config.output_dir / f"{analysis_preset}_layer_merged_50_50_psnr_epe_scatter.png",
         )
         plot_record_metric_by_layer(
             layer_dataframe=layer_dataframe,
             analysis_preset=analysis_preset,
             layer_scales=config.layer_scales,
             methods=config.layer_bar_methods,
-            metric="warp_psnr_mean",
-            ylabel="Mean warped RGB PSNR (dB)",
-            title="Warped RGB PSNR by Record and Layer",
+            metric="warp_psnr_directional_mean",
+            ylabel="Directional mean warped RGB PSNR (dB)",
+            title="Directional Warped RGB PSNR by Record and Layer",
             output_path=config.output_dir / f"{analysis_preset}_record_layer_psnr.png",
+        )
+        plot_record_metric_by_layer(
+            layer_dataframe=layer_dataframe,
+            analysis_preset=analysis_preset,
+            layer_scales=config.layer_scales,
+            methods=config.layer_bar_methods,
+            metric="warp_psnr_merged_50_50",
+            ylabel="50/50 merged warped RGB PSNR (dB)",
+            title="50/50 Merged Warped RGB PSNR by Record and Layer",
+            output_path=config.output_dir / f"{analysis_preset}_record_layer_merged_50_50_psnr.png",
         )
         plot_record_metric_by_layer(
             layer_dataframe=layer_dataframe,
@@ -885,6 +945,11 @@ def analyze_dataset(config: AnalysisConfig) -> None:
                     metric_config=config.metric_config,
                     lpips_model=lpips_model,
                 )
+                gt_merged_50_50_psnr = calculate_merged_50_50_psnr(
+                    target=imgt,
+                    warped_img0=gt_img0_warped,
+                    warped_img1=gt_img1_warped,
+                )
                 layer_contexts = build_layer_contexts(
                     img0=img0,
                     imgt=imgt,
@@ -944,6 +1009,11 @@ def analyze_dataset(config: AnalysisConfig) -> None:
                         metric_config=config.metric_config,
                         lpips_model=lpips_model,
                     )
+                    approx_merged_50_50_psnr = calculate_merged_50_50_psnr(
+                        target=imgt,
+                        warped_img0=approx_img0_warped,
+                        warped_img1=approx_img1_warped,
+                    )
                     layer_rows.extend(
                         build_method_layer_rows(
                             base_records=base_records,
@@ -960,6 +1030,7 @@ def analyze_dataset(config: AnalysisConfig) -> None:
                         "error_stats": error_stats,
                         "img0_warp_metrics": approx_img0_warp_metrics,
                         "img1_warp_metrics": approx_img1_warp_metrics,
+                        "merged_50_50_psnr": approx_merged_50_50_psnr,
                         "masks": flow_init.masks,
                         "flow_init_runtime_ms": flow_init_runtime_ms,
                     }
@@ -969,6 +1040,7 @@ def analyze_dataset(config: AnalysisConfig) -> None:
                     gt_metric_columns = build_bidirectional_metric_columns(
                         metric_values_img0=gt_img0_warp_metrics,
                         metric_values_img1=gt_img1_warp_metrics,
+                        merged_50_50_psnr_values=gt_merged_50_50_psnr,
                         batch_index=batch_index,
                         suffix="_gt60",
                     )
@@ -994,6 +1066,7 @@ def analyze_dataset(config: AnalysisConfig) -> None:
                         approx_metric_columns = build_bidirectional_metric_columns(
                             metric_values_img0=flow_method_metric["img0_warp_metrics"],
                             metric_values_img1=flow_method_metric["img1_warp_metrics"],
+                            merged_50_50_psnr_values=flow_method_metric["merged_50_50_psnr"],
                             batch_index=batch_index,
                             suffix="_approx",
                         )
@@ -1005,6 +1078,12 @@ def analyze_dataset(config: AnalysisConfig) -> None:
                                 metric_delta_columns[f"warp_{metric_name}_delta_{direction}_vs_gt60"] = (
                                     approx_metric_columns[approx_key] - gt_metric_columns[gt_key]
                                 )
+                        for psnr_summary in ("directional_mean", "merged_50_50"):
+                            approx_key = f"warp_psnr_{psnr_summary}_approx"
+                            gt_key = f"warp_psnr_{psnr_summary}_gt60"
+                            metric_delta_columns[f"warp_psnr_delta_{psnr_summary}_vs_gt60"] = (
+                                approx_metric_columns[approx_key] - gt_metric_columns[gt_key]
+                            )
                         masks = flow_method_metric["masks"]
                         flow_init_runtime_ms = float(flow_method_metric["flow_init_runtime_ms"])
                         flow_init_runtime_ms_per_sample = flow_init_runtime_ms / float(batch_size)
