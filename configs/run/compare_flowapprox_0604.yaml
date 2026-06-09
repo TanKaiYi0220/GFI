@@ -3,11 +3,20 @@
   "root_dir": "data/Minor_0604/",
   "dataset_root_dir": "/workspace/datasets/Minor_0604/",
 
-  "candidate_inference_config": "configs/run/inference_flowaprox_layer_1_0604.yaml",
-  "baseline_inference_config": "configs/run/inference_finetuning_0604.yaml",
-
-  "candidate_name": "Splat Training",
-  "baseline_name": "FineTuning",
+  "models": [
+    {
+      "key": "baseline",
+      "name": "FineTuning",
+      "inference_config": "configs/run/inference_finetuning_0604.yaml",
+      "epoch": "latest"
+    },
+    {
+      "key": "candidate_1",
+      "name": "Splat Training",
+      "inference_config": "configs/run/inference_flowaprox_layer_1_0604.yaml",
+      "epoch": "latest"
+    }
+  ],
 
   "save_overlay_images": true,
   "save_selected_cases_only": true,
@@ -15,5 +24,9 @@
 
   "kernel_size": 9,
   "confidence_threshold": 0.08,
+  "winner_alpha_max": 0.70,
+  "winner_alpha_full_rmse_delta": 8.0,
+  "neutral_alpha": 0.30,
+  "sequence_length": 1,
   "output_path": "compare_outputs/GFI_prediction_region_compare/train_minor_0604_twostage_Splat"
 }
