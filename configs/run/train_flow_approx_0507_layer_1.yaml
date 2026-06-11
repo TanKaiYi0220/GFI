@@ -6,7 +6,7 @@
   "init_flow_downscale_strategy": "masked_area",
   "init_flow_mask_epsilon": 1.0e-6,
     "model_init_args": {
-        "init_flow_layer": 4
+        "init_flow_layer": 1
   },
   "root_dir": "data/Minor_0507/",
   "dataset_root_dir": "/workspace/datasets/Minor_0507/",
@@ -18,7 +18,7 @@
   "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 16,
-  "output_dir": "outputs/IFRNet_Residual_FlowApprox_4_Layer_TwoStage_Splat_8Neighbor_MaskedDownScaled_Minor_0608",
+  "output_dir": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_8Neighbor_MaskedDownScaled_Minor_0608",
   "only_fps": 60,
   "input_fps": 30,
   "metrics": {
