@@ -14,6 +14,12 @@
   "output_dir": "outputs/IFRNet_FineTuning_0611/",
   "only_fps": 60,
   "input_fps": 30,
+  "metrics": {
+    "enable_psnr": true,
+    "enable_ssim": true,
+    "enable_lpips": true,
+    "lpips_net": "alex"
+  },
   "resume_path": null,
   "pretrained_checkpoint_path": "src/models/external/IFRNet/checkpoints/IFRNet/IFRNet_Vimeo90K.pth",
   "sample_train_frames": [

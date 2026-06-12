@@ -62,6 +62,23 @@ class Model(ExternalIFRNetResidualModel):
         self._inference_init_flow1_mask: Tensor | None = None
         self._inference_init_flow_mask_epsilon: float = 1e-6
 
+    def _prepare_runtime_init_flow_masks(
+        self,
+        init_flow0_mask: Tensor | None,
+        init_flow1_mask: Tensor | None,
+        init_flow_mask_epsilon: float,
+    ) -> tuple[Tensor | None, Tensor | None]:
+        if (init_flow0_mask is None) != (init_flow1_mask is None):
+            raise ValueError("init_flow0_mask and init_flow1_mask must either both be provided or both be omitted.")
+        if init_flow_mask_epsilon <= 0:
+            raise ValueError(f"init_flow_mask_epsilon must be positive, got {init_flow_mask_epsilon}")
+        if init_flow0_mask is None or init_flow1_mask is None:
+            return None, None
+
+        padded_init_flow0_mask, _ = pad_to_multiple(init_flow0_mask, multiple=8, mode="replicate")
+        padded_init_flow1_mask, _ = pad_to_multiple(init_flow1_mask, multiple=8, mode="replicate")
+        return padded_init_flow0_mask, padded_init_flow1_mask
+
     def _get_init_flows(
         self,
         init_flow0: Tensor | None = None,
@@ -99,14 +116,11 @@ class Model(ExternalIFRNetResidualModel):
         init_flow1_mask: Tensor | None = None,
         init_flow_mask_epsilon: float = 1e-6,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        if (init_flow0_mask is None) != (init_flow1_mask is None):
-            raise ValueError("init_flow0_mask and init_flow1_mask must either both be provided or both be omitted.")
-
-        padded_init_flow0_mask = None
-        padded_init_flow1_mask = None
-        if init_flow0_mask is not None and init_flow1_mask is not None:
-            padded_init_flow0_mask, _ = pad_to_multiple(init_flow0_mask, multiple=8, mode="replicate")
-            padded_init_flow1_mask, _ = pad_to_multiple(init_flow1_mask, multiple=8, mode="replicate")
+        padded_init_flow0_mask, padded_init_flow1_mask = self._prepare_runtime_init_flow_masks(
+            init_flow0_mask=init_flow0_mask,
+            init_flow1_mask=init_flow1_mask,
+            init_flow_mask_epsilon=init_flow_mask_epsilon,
+        )
 
         self._inference_init_flow0_mask = padded_init_flow0_mask
         self._inference_init_flow1_mask = padded_init_flow1_mask
@@ -117,6 +131,42 @@ class Model(ExternalIFRNetResidualModel):
                 img1=img1,
                 embt=embt,
                 scale_factor=scale_factor,
+                init_flow0=init_flow0,
+                init_flow1=init_flow1,
+            )
+        finally:
+            self._inference_init_flow0_mask = None
+            self._inference_init_flow1_mask = None
+            self._inference_init_flow_mask_epsilon = 1e-6
+        return result
+
+    def forward(
+        self,
+        img0: Tensor,
+        img1: Tensor,
+        embt: Tensor,
+        imgt: Tensor,
+        init_flow0: Tensor | None = None,
+        init_flow1: Tensor | None = None,
+        init_flow0_mask: Tensor | None = None,
+        init_flow1_mask: Tensor | None = None,
+        init_flow_mask_epsilon: float = 1e-6,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        padded_init_flow0_mask, padded_init_flow1_mask = self._prepare_runtime_init_flow_masks(
+            init_flow0_mask=init_flow0_mask,
+            init_flow1_mask=init_flow1_mask,
+            init_flow_mask_epsilon=init_flow_mask_epsilon,
+        )
+
+        self._inference_init_flow0_mask = padded_init_flow0_mask
+        self._inference_init_flow1_mask = padded_init_flow1_mask
+        self._inference_init_flow_mask_epsilon = init_flow_mask_epsilon
+        try:
+            result: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] = super().forward(
+                img0=img0,
+                img1=img1,
+                embt=embt,
+                imgt=imgt,
                 init_flow0=init_flow0,
                 init_flow1=init_flow1,
             )

@@ -40,6 +40,9 @@ from src.utils.config import load_yaml_file
 
 MODEL_NAMES: tuple[str, ...] = ("IFRNet", "IFRNet_Residual", "IFRNet_Residual_FlowApprox")
 FLOW_APPROX_MODEL_NAMES: tuple[str, ...] = ("IFRNet_Residual_FlowApprox",)
+DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY: str = "bilinear"
+DEFAULT_INIT_FLOW_MASK_EPSILON: float = 1e-6
+INIT_FLOW_DOWNSCALE_STRATEGIES: tuple[str, ...] = ("bilinear", "masked_area")
 
 
 @dataclass(frozen=True)
@@ -183,6 +186,8 @@ def forward_model(
     source_fmv: Any,
     flow_approx_method: str,
     splatting_fill_strategy: str,
+    init_flow_downscale_strategy: str,
+    init_flow_mask_epsilon: float,
     source_depth0: Any | None,
     source_depth1: Any | None,
     ground_truth_bmv: Any | None,
@@ -192,6 +197,8 @@ def forward_model(
 
     init_bmv = source_bmv
     init_fmv = source_fmv
+    init_bmv_mask = None
+    init_fmv_mask = None
 
     if uses_flow_approx_model(model_name):
         flow_init = build_flow_init_result_with_fill_strategy(
@@ -207,12 +214,29 @@ def forward_model(
         )
         init_bmv = flow_init.bmv
         init_fmv = flow_init.fmv
+        if init_flow_downscale_strategy == "masked_area":
+            if flow_init.masks is None:
+                raise RuntimeError(
+                    "init_flow_downscale_strategy=masked_area requires splatting coverage masks, but none were produced."
+                )
+            init_bmv_mask = flow_init.masks[:, 0:1]
+            init_fmv_mask = flow_init.masks[:, 1:2]
 
     if model_name == "IFRNet":
         flow = torch.cat([init_bmv, init_fmv], dim=1).float()
         return model(img0, img1, embt, imgt, flow)
 
-    return model(img0, img1, embt, imgt, init_flow0=init_bmv, init_flow1=init_fmv)
+    return model(
+        img0,
+        img1,
+        embt,
+        imgt,
+        init_flow0=init_bmv,
+        init_flow1=init_fmv,
+        init_flow0_mask=init_bmv_mask,
+        init_flow1_mask=init_fmv_mask,
+        init_flow_mask_epsilon=init_flow_mask_epsilon,
+    )
 
 
 def build_loss_record(
@@ -339,8 +363,6 @@ def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: 
     import numpy as np
     import torch
     from torch.utils.data import DataLoader
-    from scripts.inference import DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY
-    from scripts.inference import DEFAULT_INIT_FLOW_MASK_EPSILON
     from scripts.inference import run_inference_batch_with_fill_strategy
     from scripts.inference import save_selected_sample_artifacts
     from src.data.image_ops import flow_to_image, save_image
@@ -374,8 +396,8 @@ def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: 
                     device,
                     args.flow_approx_method,
                     args.splatting_fill_strategy,
-                    DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY,
-                    DEFAULT_INIT_FLOW_MASK_EPSILON,
+                    args.init_flow_downscale_strategy,
+                    args.init_flow_mask_epsilon,
                     model,
                     args.model_name,
                     1.0,
@@ -434,6 +456,8 @@ def run_training_batch(
         source_fmv,
         args.flow_approx_method,
         args.splatting_fill_strategy,
+        args.init_flow_downscale_strategy,
+        args.init_flow_mask_epsilon,
         source_depth0,
         source_depth1,
         ground_truth_bmv,
@@ -654,6 +678,18 @@ def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.Argument
         choices=SPLATTING_FILL_STRATEGIES,
         help="How splatting fills no-hit target pixels when flow_approx_method is splatting or linear_splatting.",
     )
+    parser.add_argument(
+        "--init-flow-downscale-strategy",
+        default=config_defaults.get("init_flow_downscale_strategy", DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY),
+        choices=INIT_FLOW_DOWNSCALE_STRATEGIES,
+        help="How init flows are downscaled inside IFRNet residual pyramids.",
+    )
+    parser.add_argument(
+        "--init-flow-mask-epsilon",
+        default=config_defaults.get("init_flow_mask_epsilon", DEFAULT_INIT_FLOW_MASK_EPSILON),
+        type=float,
+        help="Numerical epsilon for mask-normalized init-flow downscaling.",
+    )
     return parser
 
 
@@ -670,6 +706,7 @@ def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.metric_config = read_metric_config(config_defaults)
     require_psnr_enabled(args.metric_config, "training")
     args.input_config = config_defaults
+    validate_flow_approx_runtime_args(args)
     return args
 
 
@@ -684,6 +721,28 @@ def resolve_effective_splatting_fill_strategy(args: argparse.Namespace) -> str:
         flow_approx_method=args.flow_approx_method,
         splatting_fill_strategy=args.splatting_fill_strategy,
     )
+
+
+def resolve_effective_init_flow_downscale_strategy(args: argparse.Namespace) -> str:
+    if not uses_flow_approx_model(args.model_name):
+        return ""
+    if not is_splatting_flow_approx_method(flow_approx_method=args.flow_approx_method):
+        return ""
+    return args.init_flow_downscale_strategy
+
+
+def validate_flow_approx_runtime_args(args: argparse.Namespace) -> None:
+    if args.init_flow_mask_epsilon <= 0:
+        raise ValueError(f"init_flow_mask_epsilon must be positive, got {args.init_flow_mask_epsilon}")
+    if args.init_flow_downscale_strategy == "masked_area":
+        if not uses_flow_approx_model(args.model_name):
+            raise ValueError(
+                "init_flow_downscale_strategy=masked_area requires model_name=IFRNet_Residual_FlowApprox."
+            )
+        if not is_splatting_flow_approx_method(flow_approx_method=args.flow_approx_method):
+            raise ValueError(
+                "init_flow_downscale_strategy=masked_area requires a splatting flow approximation method."
+            )
 
 
 def log_run_summary(
@@ -806,6 +865,9 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
         summary["flow_approx_method"] = args.flow_approx_method
         summary["splatting_fill_strategy"] = args.splatting_fill_strategy
         summary["effective_splatting_fill_strategy"] = resolve_effective_splatting_fill_strategy(args=args)
+        summary["init_flow_downscale_strategy"] = args.init_flow_downscale_strategy
+        summary["effective_init_flow_downscale_strategy"] = resolve_effective_init_flow_downscale_strategy(args=args)
+        summary["init_flow_mask_epsilon"] = args.init_flow_mask_epsilon
 
     return summary
 
@@ -861,6 +923,12 @@ def run_training(args: argparse.Namespace) -> None:
             "splatting_fill_strategy=%s effective_splatting_fill_strategy=%s",
             args.splatting_fill_strategy,
             resolve_effective_splatting_fill_strategy(args=args),
+        )
+        logger.info(
+            "init_flow_downscale_strategy=%s effective_init_flow_downscale_strategy=%s init_flow_mask_epsilon=%s",
+            args.init_flow_downscale_strategy,
+            resolve_effective_init_flow_downscale_strategy(args=args),
+            args.init_flow_mask_epsilon,
         )
 
     root_dir = Path(args.root_dir)

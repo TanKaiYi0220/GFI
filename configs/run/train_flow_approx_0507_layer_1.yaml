@@ -2,8 +2,8 @@
   "mode": "train",
   "model_name": "IFRNet_Residual_FlowApprox",
   "flow_approx_method": "splatting",
-  "splatting_fill_strategy": "outside_in_8neighbor",
-  "init_flow_downscale_strategy": "masked_area",
+  "splatting_fill_strategy": "outside_in_4direction",
+  "init_flow_downscale_strategy": "bilinear",
   "init_flow_mask_epsilon": 1.0e-6,
     "model_init_args": {
         "init_flow_layer": 1
@@ -18,7 +18,7 @@
   "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 16,
-  "output_dir": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_8Neighbor_MaskedDownScaled_Minor_0608",
+  "output_dir": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_Minor_0611",
   "only_fps": 60,
   "input_fps": 30,
   "metrics": {

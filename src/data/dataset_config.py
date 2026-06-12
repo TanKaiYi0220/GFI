@@ -463,7 +463,7 @@ TRAIN_MINOR_0507_DATASET_PRESET: DatasetPreset = build_dataset_preset(
         ),
         "ARPG_2": make_record_config(
             main_indices=("4",),
-            difficulties=("Medium"),
+            difficulties=("Easy", ),
             sub_indices=("5",),
             fps_values=(30, 60),
             max_indices=(400, 800),
