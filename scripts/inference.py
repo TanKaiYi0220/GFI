@@ -11,9 +11,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.train import build_merged_dataframe
+from scripts.train import build_model_effective_time_init_flows
 from scripts.train import read_model_init_args
 from scripts.train import resolve_model_class
 from scripts.train import set_seed
+from scripts.train import uses_model_effective_time
 from src.engine.evaluation import average_metric_values
 from src.engine.evaluation import build_lpips_model
 from src.engine.evaluation import build_metric_meters
@@ -382,29 +384,44 @@ def run_inference_batch_with_fill_strategy(
             source_depth0 = info["source_depth0"].to(device)
             source_depth1 = info["source_depth1"].to(device)
 
-        flow_init = build_flow_init_result_with_fill_strategy(
-            fmv_30=fmv_30,
-            bmv_30=bmv_30,
-            embt=embt,
-            flow_approx_method=flow_approx_method,
-            source_depth0=source_depth0,
-            source_depth1=source_depth1,
-            splatting_fill_strategy=splatting_fill_strategy,
-            ground_truth_bmv=bmv,
-            ground_truth_fmv=fmv,
-        )
-        init_bmv = flow_init.bmv
-        init_fmv = flow_init.fmv
-        splatting_region_maps = build_splatting_region_maps(fmv_30, bmv_30, embt, flow_init.masks)
+        init_masks = None
+        if uses_model_effective_time(model):
+            if init_flow_downscale_strategy == "masked_area":
+                raise ValueError("model effective-time init flow does not produce masks for masked-area downscaling.")
+            init_bmv, init_fmv = build_model_effective_time_init_flows(
+                model=model,
+                img0=img0,
+                img1=img1,
+                embt=embt,
+                source_bmv=bmv_30,
+                source_fmv=fmv_30,
+            )
+            splatting_region_maps = None
+        else:
+            flow_init = build_flow_init_result_with_fill_strategy(
+                fmv_30=fmv_30,
+                bmv_30=bmv_30,
+                embt=embt,
+                flow_approx_method=flow_approx_method,
+                source_depth0=source_depth0,
+                source_depth1=source_depth1,
+                splatting_fill_strategy=splatting_fill_strategy,
+                ground_truth_bmv=bmv,
+                ground_truth_fmv=fmv,
+            )
+            init_bmv = flow_init.bmv
+            init_fmv = flow_init.fmv
+            init_masks = flow_init.masks
+            splatting_region_maps = build_splatting_region_maps(fmv_30, bmv_30, embt, flow_init.masks)
         init_bmv_mask = None
         init_fmv_mask = None
         if init_flow_downscale_strategy == "masked_area":
-            if flow_init.masks is None:
+            if init_masks is None:
                 raise RuntimeError(
                     "init_flow_downscale_strategy=masked_area requires splatting coverage masks, but none were produced."
                 )
-            init_bmv_mask = flow_init.masks[:, 0:1]
-            init_fmv_mask = flow_init.masks[:, 1:2]
+            init_bmv_mask = init_masks[:, 0:1]
+            init_fmv_mask = init_masks[:, 1:2]
         imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
             img0,
             img1,
@@ -427,7 +444,7 @@ def run_inference_batch_with_fill_strategy(
             "imgt_pred": imgt_pred,
             "init_bmv": init_bmv,
             "init_fmv": init_fmv,
-            "init_masks": flow_init.masks,
+            "init_masks": init_masks,
             "splatting_region_maps": splatting_region_maps,
             "up_flow0_1": up_flow0_1,
             "up_flow1_1": up_flow1_1,
@@ -769,6 +786,12 @@ def main(argv: list[str] | None = None) -> None:
     model = model_class(**model_init_args).to(device)
     if hasattr(model, "init_flow_layer"):
         logger.info("model_init_flow_layer=%s", model.init_flow_layer)
+    if hasattr(model, "effective_time_mode"):
+        logger.info(
+            "model_effective_time_mode=%s effective_time_radius=%s",
+            model.effective_time_mode,
+            getattr(model, "effective_time_radius", None),
+        )
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     # print("Load Pretrained Weights from IFRNet_Vimeo90K.pth as Baseline")

@@ -67,6 +67,35 @@ def uses_flow_approx_model(model_name: str) -> bool:
     return model_name in FLOW_APPROX_MODEL_NAMES
 
 
+def uses_model_effective_time(model: Any) -> bool:
+    if hasattr(model, "uses_model_effective_time"):
+        return bool(model.uses_model_effective_time())
+
+    return str(getattr(model, "effective_time_mode", "disabled")) in ("manual", "learnable")
+
+
+def build_model_effective_time_init_flows(
+    model: Any,
+    img0: Any,
+    img1: Any,
+    embt: Any,
+    source_bmv: Any,
+    source_fmv: Any,
+) -> tuple[Any, Any]:
+    if not hasattr(model, "build_effective_time_init_flows"):
+        raise AttributeError(
+            "Model effective-time mode is enabled, but the model does not implement build_effective_time_init_flows."
+        )
+
+    return model.build_effective_time_init_flows(
+        img0=img0,
+        img1=img1,
+        embt=embt,
+        source_bmv=source_bmv,
+        source_fmv=source_fmv,
+    )
+
+
 def read_model_init_args(config_values: dict[str, Any]) -> dict[str, Any]:
     raw_model_init_args = config_values.get("model_init_args", {})
     if raw_model_init_args is None:
@@ -201,26 +230,40 @@ def forward_model(
     init_fmv_mask = None
 
     if uses_flow_approx_model(model_name):
-        flow_init = build_flow_init_result_with_fill_strategy(
-            fmv_30=source_fmv,
-            bmv_30=source_bmv,
-            embt=embt,
-            flow_approx_method=flow_approx_method,
-            source_depth0=source_depth0,
-            source_depth1=source_depth1,
-            splatting_fill_strategy=splatting_fill_strategy,
-            ground_truth_bmv=ground_truth_bmv,
-            ground_truth_fmv=ground_truth_fmv,
-        )
-        init_bmv = flow_init.bmv
-        init_fmv = flow_init.fmv
-        if init_flow_downscale_strategy == "masked_area":
-            if flow_init.masks is None:
-                raise RuntimeError(
-                    "init_flow_downscale_strategy=masked_area requires splatting coverage masks, but none were produced."
-                )
-            init_bmv_mask = flow_init.masks[:, 0:1]
-            init_fmv_mask = flow_init.masks[:, 1:2]
+        if uses_model_effective_time(model):
+            if init_flow_downscale_strategy == "masked_area":
+                raise ValueError("model effective-time init flow does not produce masks for masked-area downscaling.")
+            init_bmv, init_fmv = build_model_effective_time_init_flows(
+                model=model,
+                img0=img0,
+                img1=img1,
+                embt=embt,
+                source_bmv=source_bmv,
+                source_fmv=source_fmv,
+            )
+        else:
+            flow_init = build_flow_init_result_with_fill_strategy(
+                fmv_30=source_fmv,
+                bmv_30=source_bmv,
+                embt=embt,
+                flow_approx_method=flow_approx_method,
+                source_depth0=source_depth0,
+                source_depth1=source_depth1,
+                splatting_fill_strategy=splatting_fill_strategy,
+                ground_truth_bmv=ground_truth_bmv,
+                ground_truth_fmv=ground_truth_fmv,
+            )
+            init_bmv = flow_init.bmv
+            init_fmv = flow_init.fmv
+            if init_flow_downscale_strategy == "masked_area":
+                if flow_init.masks is None:
+                    raise RuntimeError(
+                        "init_flow_downscale_strategy=masked_area requires splatting coverage masks, but none were produced."
+                    )
+                init_bmv_mask = flow_init.masks[:, 0:1]
+                init_fmv_mask = flow_init.masks[:, 1:2]
+    elif uses_model_effective_time(model):
+        raise ValueError("effective_time_mode requires model_name=IFRNet_Residual_FlowApprox.")
 
     if model_name == "IFRNet":
         flow = torch.cat([init_bmv, init_fmv], dim=1).float()
@@ -790,6 +833,29 @@ def extract_pretrained_state_dict(checkpoint: Any, checkpoint_path: Path, torch_
     )
 
 
+def load_pretrained_model_state(
+    model: Any,
+    state_dict: Any,
+    logger: logging.Logger,
+) -> None:
+    allowed_prefixes = tuple(model.allowed_pretrained_missing_key_prefixes()) if hasattr(model, "allowed_pretrained_missing_key_prefixes") else ()
+    load_result = model.load_state_dict(state_dict, strict=False)
+    missing_keys = list(load_result.missing_keys)
+    unexpected_keys = list(load_result.unexpected_keys)
+    disallowed_missing_keys = [
+        key
+        for key in missing_keys
+        if not any(key.startswith(prefix) for prefix in allowed_prefixes)
+    ]
+    if len(disallowed_missing_keys) > 0 or len(unexpected_keys) > 0:
+        raise RuntimeError(
+            "Pretrained checkpoint is incompatible with the current model: "
+            f"missing_keys={disallowed_missing_keys} unexpected_keys={unexpected_keys}"
+        )
+    if len(missing_keys) > 0:
+        logger.warning("Initialized missing pretrained keys from scratch: %s", missing_keys)
+
+
 def load_training_state(
     args: argparse.Namespace,
     model: Any,
@@ -820,7 +886,11 @@ def load_training_state(
         pretrained_path = Path(pretrained_path)
         logger.info("Loading pretrained checkpoint from %s", pretrained_path)
         checkpoint = torch.load(str(pretrained_path), map_location=device)
-        model.load_state_dict(extract_pretrained_state_dict(checkpoint, pretrained_path, torch))
+        load_pretrained_model_state(
+            model=model,
+            state_dict=extract_pretrained_state_dict(checkpoint, pretrained_path, torch),
+            logger=logger,
+        )
         return TrainingState(
             start_epoch=0,
             global_step=0,
@@ -967,6 +1037,12 @@ def run_training(args: argparse.Namespace) -> None:
     model = model_class(**model_init_args).to(device)
     if hasattr(model, "init_flow_layer"):
         logger.info("model_init_flow_layer=%s", model.init_flow_layer)
+    if hasattr(model, "effective_time_mode"):
+        logger.info(
+            "model_effective_time_mode=%s effective_time_radius=%s",
+            model.effective_time_mode,
+            getattr(model, "effective_time_radius", None),
+        )
     optimizer = optim.AdamW(model.parameters(), lr=args.lr_start, weight_decay=0)
     training_state = load_training_state(args, model, optimizer, device, logger)
 
