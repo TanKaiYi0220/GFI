@@ -32,6 +32,29 @@ FORWARD_VALID_COLUMN: str = "is_valid_forwardVel_Depth"
 MOTION_MAGNITUDE_MEAN_COLUMN: str = "motion_magnitude_mean"
 MOTION_MAGNITUDE_P95_COLUMN: str = "motion_magnitude_p95"
 MOTION_MAGNITUDE_MAX_COLUMN: str = "motion_magnitude_max"
+ORACLE_EFFECTIVE_TIME_EPSILON: float = 1.0e-6
+ORACLE_EFFECTIVE_TIME_MIN_MOTION: float = 1.0e-3
+ORACLE_EFFECTIVE_TIME_INVALID_SCALE: float = 0.5
+ORACLE_FMV_T_EFF_MEAN_COLUMN: str = "oracle_fmv_t_eff_mean"
+ORACLE_BMV_T_EFF_MEAN_COLUMN: str = "oracle_bmv_t_eff_mean"
+ORACLE_FMV_SCALE_MEAN_COLUMN: str = "oracle_fmv_scale_mean"
+ORACLE_BMV_SCALE_MEAN_COLUMN: str = "oracle_bmv_scale_mean"
+ORACLE_T_EFF_GAP_MEAN_COLUMN: str = "oracle_t_eff_gap_mean"
+ORACLE_FMV_VALID_RATIO_COLUMN: str = "oracle_fmv_valid_ratio"
+ORACLE_BMV_VALID_RATIO_COLUMN: str = "oracle_bmv_valid_ratio"
+ORACLE_FMV_CLAMPED_RATIO_COLUMN: str = "oracle_fmv_clamped_ratio"
+ORACLE_BMV_CLAMPED_RATIO_COLUMN: str = "oracle_bmv_clamped_ratio"
+ORACLE_EFFECTIVE_TIME_COLUMNS: tuple[str, ...] = (
+    ORACLE_FMV_T_EFF_MEAN_COLUMN,
+    ORACLE_BMV_T_EFF_MEAN_COLUMN,
+    ORACLE_FMV_SCALE_MEAN_COLUMN,
+    ORACLE_BMV_SCALE_MEAN_COLUMN,
+    ORACLE_T_EFF_GAP_MEAN_COLUMN,
+    ORACLE_FMV_VALID_RATIO_COLUMN,
+    ORACLE_BMV_VALID_RATIO_COLUMN,
+    ORACLE_FMV_CLAMPED_RATIO_COLUMN,
+    ORACLE_BMV_CLAMPED_RATIO_COLUMN,
+)
 
 
 def rewrite_sample_root(samples: list[DatasetSample], source_root: Path, target_root: Path) -> list[DatasetSample]:
@@ -396,6 +419,166 @@ def apply_motion_magnitude(raw_seq_df: Any, root_dir: Path, dataset_config: Data
             {
                 "motion_mean": stats[MOTION_MAGNITUDE_MEAN_COLUMN],
                 "motion_p95": stats[MOTION_MAGNITUDE_P95_COLUMN],
+            },
+        )
+
+    return raw_seq_df
+
+
+def calculate_projection_scale(
+    endpoint_flow: np.ndarray,
+    target_flow: np.ndarray,
+    epsilon: float,
+    min_motion: float,
+    invalid_flow_scale: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project target flow onto endpoint flow and return clamped scale, valid mask, and raw scale."""
+    if endpoint_flow.shape != target_flow.shape:
+        raise ValueError(
+            f"endpoint_flow and target_flow shapes must match, got {endpoint_flow.shape} and {target_flow.shape}"
+        )
+    if endpoint_flow.ndim != 3 or endpoint_flow.shape[2] != 2:
+        raise ValueError(f"flow arrays must have shape [H, W, 2], got {endpoint_flow.shape}")
+
+    denominator = np.sum(endpoint_flow * endpoint_flow, axis=-1, keepdims=True)
+    numerator = np.sum(endpoint_flow * target_flow, axis=-1, keepdims=True)
+    raw_scale = numerator / (denominator + epsilon)
+    valid = np.sqrt(denominator) > min_motion
+    scale = np.where(valid, np.clip(raw_scale, 0.0, 1.0), np.full_like(raw_scale, invalid_flow_scale))
+    return scale, valid, raw_scale
+
+
+def masked_mean(value: np.ndarray, mask: np.ndarray, fallback_value: float) -> float:
+    """Return the masked mean or a fallback when no valid pixels exist."""
+    if value.shape != mask.shape:
+        raise ValueError(f"Masked mean shape mismatch: value={value.shape} mask={mask.shape}")
+
+    valid_values = value[mask]
+    if valid_values.size == 0:
+        return fallback_value
+
+    return float(np.mean(valid_values))
+
+
+def mask_ratio(mask: np.ndarray) -> float:
+    """Return the fraction of true values in one mask."""
+    return float(np.mean(mask.astype(np.float32)))
+
+
+def clamped_ratio(valid: np.ndarray, raw_scale: np.ndarray) -> float:
+    """Return the fraction of valid pixels whose raw scale is outside [0, 1]."""
+    valid_count = int(np.count_nonzero(valid))
+    if valid_count == 0:
+        return 0.0
+
+    clamped = valid & ((raw_scale < 0.0) | (raw_scale > 1.0))
+    return float(np.count_nonzero(clamped) / valid_count)
+
+
+def calculate_oracle_effective_time_stats(
+    bmv_60: np.ndarray,
+    fmv_60: np.ndarray,
+    bmv_30: np.ndarray,
+    fmv_30: np.ndarray,
+    epsilon: float,
+    min_motion: float,
+    invalid_flow_scale: float,
+) -> dict[str, float]:
+    """Calculate oracle effective-time summary columns from 30fps and rendered 60fps flows."""
+    bmv_scale, bmv_valid, bmv_raw_scale = calculate_projection_scale(
+        endpoint_flow=bmv_30,
+        target_flow=bmv_60,
+        epsilon=epsilon,
+        min_motion=min_motion,
+        invalid_flow_scale=invalid_flow_scale,
+    )
+    fmv_scale, fmv_valid, fmv_raw_scale = calculate_projection_scale(
+        endpoint_flow=fmv_30,
+        target_flow=fmv_60,
+        epsilon=epsilon,
+        min_motion=min_motion,
+        invalid_flow_scale=invalid_flow_scale,
+    )
+
+    fmv_t_eff = fmv_scale
+    bmv_t_eff = 1.0 - bmv_scale
+    both_valid = bmv_valid & fmv_valid
+    t_eff_gap = np.abs(fmv_t_eff - bmv_t_eff)
+
+    return {
+        ORACLE_FMV_T_EFF_MEAN_COLUMN: masked_mean(fmv_t_eff, fmv_valid, invalid_flow_scale),
+        ORACLE_BMV_T_EFF_MEAN_COLUMN: masked_mean(bmv_t_eff, bmv_valid, 1.0 - invalid_flow_scale),
+        ORACLE_FMV_SCALE_MEAN_COLUMN: masked_mean(fmv_scale, fmv_valid, invalid_flow_scale),
+        ORACLE_BMV_SCALE_MEAN_COLUMN: masked_mean(bmv_scale, bmv_valid, invalid_flow_scale),
+        ORACLE_T_EFF_GAP_MEAN_COLUMN: masked_mean(t_eff_gap, both_valid, 0.0),
+        ORACLE_FMV_VALID_RATIO_COLUMN: mask_ratio(fmv_valid),
+        ORACLE_BMV_VALID_RATIO_COLUMN: mask_ratio(bmv_valid),
+        ORACLE_FMV_CLAMPED_RATIO_COLUMN: clamped_ratio(fmv_valid, fmv_raw_scale),
+        ORACLE_BMV_CLAMPED_RATIO_COLUMN: clamped_ratio(bmv_valid, bmv_raw_scale),
+    }
+
+
+def apply_oracle_effective_time(
+    raw_seq_df: Any,
+    root_dir: Path,
+    dataset_config: DatasetConfig,
+    epsilon: float,
+    min_motion: float,
+    invalid_flow_scale: float,
+) -> Any:
+    """Append oracle effective-time statistics to one raw sequence dataframe."""
+    for column in ORACLE_EFFECTIVE_TIME_COLUMNS:
+        raw_seq_df[column] = [-1.0] * len(raw_seq_df)
+
+    progress = tqdm(range(len(raw_seq_df)), desc=f"oracle_t_eff:{dataset_config.record_name}:{dataset_config.mode_index}")
+    for row_index in progress:
+        row = raw_seq_df.iloc[row_index]
+        if not bool(row["valid"]):
+            progress.set_postfix({"skipped_invalid": row_index + 1})
+            continue
+
+        img_0_idx = int(row["img0"])
+        img_1_idx = int(row["img1"])
+        img_2_idx = int(row["img2"])
+        fps_30_mode_path = dataset_config.mode_path.replace("fps_60", "fps_30")
+        fps_30_dir = root_dir / dataset_config.record_name / fps_30_mode_path
+        fps_60_dir = root_dir / dataset_config.record_name / dataset_config.mode_path
+
+        bmv_60_path = fps_60_dir / BACKWARD_VELOCITY_TEMPLATE.format(frame_idx=img_1_idx)
+        fmv_60_path = fps_60_dir / FORWARD_VELOCITY_TEMPLATE.format(frame_idx=img_1_idx)
+        bmv_30_path = fps_30_dir / BACKWARD_VELOCITY_TEMPLATE.format(frame_idx=img_2_idx // 2)
+        fmv_30_path = fps_30_dir / FORWARD_VELOCITY_TEMPLATE.format(frame_idx=img_0_idx // 2)
+        bmv_60, _bmv_60_depth = load_backward_velocity(bmv_60_path)
+        fmv_60, _fmv_60_depth = load_backward_velocity(fmv_60_path)
+        bmv_30, _bmv_30_depth = load_backward_velocity(bmv_30_path)
+        fmv_30, _fmv_30_depth = load_backward_velocity(fmv_30_path)
+
+        try:
+            stats = calculate_oracle_effective_time_stats(
+                bmv_60=bmv_60,
+                fmv_60=fmv_60,
+                bmv_30=bmv_30,
+                fmv_30=fmv_30,
+                epsilon=epsilon,
+                min_motion=min_motion,
+                invalid_flow_scale=invalid_flow_scale,
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"Failed to calculate oracle effective time for record={dataset_config.record_name} "
+                f"mode={dataset_config.mode_path} img0={img_0_idx} img1={img_1_idx} img2={img_2_idx} "
+                f"bmv_60_path={bmv_60_path} fmv_60_path={fmv_60_path} "
+                f"bmv_30_path={bmv_30_path} fmv_30_path={fmv_30_path}"
+            ) from error
+
+        for column, value in stats.items():
+            raw_seq_df.at[row_index, column] = value
+
+        progress.set_postfix(
+            {
+                "fmv_t": stats[ORACLE_FMV_T_EFF_MEAN_COLUMN],
+                "bmv_t": stats[ORACLE_BMV_T_EFF_MEAN_COLUMN],
+                "gap": stats[ORACLE_T_EFF_GAP_MEAN_COLUMN],
             },
         )
 

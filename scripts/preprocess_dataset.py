@@ -18,6 +18,7 @@ from src.data.dataset_config import resolve_active_dataset_root
 from src.data.manual_labeling import review_images
 from src.data.preprocess import apply_linearity_check
 from src.data.preprocess import apply_motion_magnitude
+from src.data.preprocess import apply_oracle_effective_time
 from src.data.preprocess import build_difficult_only_dataframe
 from src.data.preprocess import build_frame_index_csv_path
 from src.data.preprocess import build_frame_index_for_mode
@@ -27,6 +28,9 @@ from src.data.preprocess import check_identical_images_cross_fps
 from src.data.preprocess import ensure_modality_validity_columns
 from src.data.preprocess import mark_non_finite_frames_invalid
 from src.data.preprocess import merge_easy_medium_dataframes
+from src.data.preprocess import ORACLE_EFFECTIVE_TIME_EPSILON
+from src.data.preprocess import ORACLE_EFFECTIVE_TIME_INVALID_SCALE
+from src.data.preprocess import ORACLE_EFFECTIVE_TIME_MIN_MOTION
 from src.data.preprocess import remove_identical_frames
 from src.utils.io import ensure_directory
 
@@ -48,6 +52,7 @@ MANUAL_LABELING: bool = False
 MERGE_DATASETS: bool = True
 RAW_SEQUENCE: bool = True
 MOTION_MAGNITUDE: bool = True
+ORACLE_EFFECTIVE_TIME: bool = True
 LINEARITY_CHECK: bool = True
 
 
@@ -84,6 +89,7 @@ def print_run_summary(
     print(f"merge_strategy={MERGE_STRATEGY}")
     print(f"only_fps={ONLY_FPS}")
     print(f"motion_magnitude={MOTION_MAGNITUDE}")
+    print(f"oracle_effective_time={ORACLE_EFFECTIVE_TIME}")
     print(f"linearity_check={LINEARITY_CHECK}")
 
 
@@ -240,6 +246,38 @@ def run_motion_magnitude(
         print(raw_sequence_path)
 
 
+def run_oracle_effective_time(
+    dataset_root_dir: Path,
+    data_dir: Path,
+    dataset_configs: list[DatasetConfig],
+    merge_strategy: str,
+    only_fps: int,
+) -> None:
+    for dataset_config in dataset_configs:
+        if not should_use_sequence_config(dataset_config, merge_strategy):
+            continue
+        if dataset_config.fps != only_fps:
+            continue
+
+        raw_sequence_path = build_preprocessed_csv_path(
+            data_dir,
+            dataset_config.record_name,
+            dataset_config.mode_index,
+            "raw_sequence_frame_index",
+        )
+        raw_seq_df = pd.read_csv(raw_sequence_path)
+        raw_seq_df = apply_oracle_effective_time(
+            raw_seq_df=raw_seq_df,
+            root_dir=dataset_root_dir,
+            dataset_config=dataset_config,
+            epsilon=ORACLE_EFFECTIVE_TIME_EPSILON,
+            min_motion=ORACLE_EFFECTIVE_TIME_MIN_MOTION,
+            invalid_flow_scale=ORACLE_EFFECTIVE_TIME_INVALID_SCALE,
+        )
+        raw_seq_df.to_csv(raw_sequence_path, index=False)
+        print(raw_sequence_path)
+
+
 def run_linearity_check(
     dataset_root_dir: Path,
     data_dir: Path,
@@ -294,6 +332,9 @@ def main() -> None:
     # if MOTION_MAGNITUDE:
     #     run_motion_magnitude(dataset_root_dir, data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
 
+    # if ORACLE_EFFECTIVE_TIME:
+    #     run_oracle_effective_time(dataset_root_dir, data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
+
     # if LINEARITY_CHECK:
     #     run_linearity_check(dataset_root_dir, data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
 
@@ -324,6 +365,9 @@ def main() -> None:
 
     if MOTION_MAGNITUDE:
         run_motion_magnitude(dataset_root_dir, data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
+
+    if ORACLE_EFFECTIVE_TIME:
+        run_oracle_effective_time(dataset_root_dir, data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
 
     if LINEARITY_CHECK:
         run_linearity_check(dataset_root_dir, data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
