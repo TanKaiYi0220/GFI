@@ -29,6 +29,9 @@ RATIO_DENOMINATOR_EPSILON: float = 1e-12
 COLOR_VALID_COLUMN: str = "is_valid_colorNoScreenUI"
 BACKWARD_VALID_COLUMN: str = "is_valid_backwardVel_Depth"
 FORWARD_VALID_COLUMN: str = "is_valid_forwardVel_Depth"
+MOTION_MAGNITUDE_MEAN_COLUMN: str = "motion_magnitude_mean"
+MOTION_MAGNITUDE_P95_COLUMN: str = "motion_magnitude_p95"
+MOTION_MAGNITUDE_MAX_COLUMN: str = "motion_magnitude_max"
 
 
 def rewrite_sample_root(samples: list[DatasetSample], source_root: Path, target_root: Path) -> list[DatasetSample]:
@@ -333,6 +336,70 @@ def build_raw_sequence_dataframe(df_30: Any, df_60: Any, dataset_config: Dataset
         )
 
     return pd.DataFrame(rows)
+
+
+def calculate_motion_magnitude_stats(backward_flow: np.ndarray, forward_flow: np.ndarray) -> dict[str, float]:
+    """Calculate pooled bidirectional target-frame motion magnitude statistics."""
+    if backward_flow.shape != forward_flow.shape:
+        raise ValueError(
+            f"backward_flow and forward_flow shapes must match, got {backward_flow.shape} and {forward_flow.shape}"
+        )
+    if backward_flow.ndim != 3 or backward_flow.shape[2] != 2:
+        raise ValueError(f"flow arrays must have shape [H, W, 2], got {backward_flow.shape}")
+
+    backward_magnitude = np.linalg.norm(backward_flow, axis=-1).reshape(-1)
+    forward_magnitude = np.linalg.norm(forward_flow, axis=-1).reshape(-1)
+    pooled_magnitude = np.concatenate([backward_magnitude, forward_magnitude])
+    finite_magnitude = pooled_magnitude[np.isfinite(pooled_magnitude)]
+    if finite_magnitude.size == 0:
+        raise ValueError("Motion magnitude contains no finite values.")
+
+    return {
+        MOTION_MAGNITUDE_MEAN_COLUMN: float(np.mean(finite_magnitude)),
+        MOTION_MAGNITUDE_P95_COLUMN: float(np.percentile(finite_magnitude, 95.0)),
+        MOTION_MAGNITUDE_MAX_COLUMN: float(np.max(finite_magnitude)),
+    }
+
+
+def apply_motion_magnitude(raw_seq_df: Any, root_dir: Path, dataset_config: DatasetConfig) -> Any:
+    """Append target-frame bidirectional motion magnitude statistics to one raw sequence dataframe."""
+    raw_seq_df[MOTION_MAGNITUDE_MEAN_COLUMN] = [-1.0] * len(raw_seq_df)
+    raw_seq_df[MOTION_MAGNITUDE_P95_COLUMN] = [-1.0] * len(raw_seq_df)
+    raw_seq_df[MOTION_MAGNITUDE_MAX_COLUMN] = [-1.0] * len(raw_seq_df)
+
+    progress = tqdm(range(len(raw_seq_df)), desc=f"motion_magnitude:{dataset_config.record_name}:{dataset_config.mode_index}")
+    for row_index in progress:
+        row = raw_seq_df.iloc[row_index]
+        if not bool(row["valid"]):
+            progress.set_postfix({"skipped_invalid": row_index + 1})
+            continue
+
+        img_1_idx = int(row["img1"])
+        fps_60_dir = root_dir / dataset_config.record_name / dataset_config.mode_path
+        backward_path = fps_60_dir / BACKWARD_VELOCITY_TEMPLATE.format(frame_idx=img_1_idx)
+        forward_path = fps_60_dir / FORWARD_VELOCITY_TEMPLATE.format(frame_idx=img_1_idx)
+        backward_flow, _backward_depth = load_backward_velocity(backward_path)
+        forward_flow, _forward_depth = load_backward_velocity(forward_path)
+        try:
+            stats = calculate_motion_magnitude_stats(backward_flow=backward_flow, forward_flow=forward_flow)
+        except ValueError as error:
+            raise ValueError(
+                f"Failed to calculate motion magnitude for record={dataset_config.record_name} "
+                f"mode={dataset_config.mode_path} img1={img_1_idx} "
+                f"backward_path={backward_path} forward_path={forward_path}"
+            ) from error
+
+        for column, value in stats.items():
+            raw_seq_df.at[row_index, column] = value
+
+        progress.set_postfix(
+            {
+                "motion_mean": stats[MOTION_MAGNITUDE_MEAN_COLUMN],
+                "motion_p95": stats[MOTION_MAGNITUDE_P95_COLUMN],
+            },
+        )
+
+    return raw_seq_df
 
 
 def apply_linearity_check(raw_seq_df: Any, root_dir: Path, dataset_config: DatasetConfig) -> Any:

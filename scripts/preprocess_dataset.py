@@ -17,6 +17,7 @@ from src.data.dataset_config import iter_dataset_configs
 from src.data.dataset_config import resolve_active_dataset_root
 from src.data.manual_labeling import review_images
 from src.data.preprocess import apply_linearity_check
+from src.data.preprocess import apply_motion_magnitude
 from src.data.preprocess import build_difficult_only_dataframe
 from src.data.preprocess import build_frame_index_csv_path
 from src.data.preprocess import build_frame_index_for_mode
@@ -46,6 +47,7 @@ CHECK_IDENTICAL_CROSS_FPS: bool = False
 MANUAL_LABELING: bool = False
 MERGE_DATASETS: bool = True
 RAW_SEQUENCE: bool = True
+MOTION_MAGNITUDE: bool = True
 LINEARITY_CHECK: bool = True
 
 
@@ -81,6 +83,8 @@ def print_run_summary(
     print(f"config_count={len(dataset_configs)}")
     print(f"merge_strategy={MERGE_STRATEGY}")
     print(f"only_fps={ONLY_FPS}")
+    print(f"motion_magnitude={MOTION_MAGNITUDE}")
+    print(f"linearity_check={LINEARITY_CHECK}")
 
 
 def load_or_build_frame_index_dataframe(dataset_root_dir: Path, data_dir: Path, dataset_config: DatasetConfig) -> Any:
@@ -211,7 +215,38 @@ def run_raw_sequence(data_dir: Path, dataset_configs: list[DatasetConfig], merge
         print(output_path)
 
 
-def run_linearity_check(dataset_root_dir: Path, data_dir: Path, dataset_configs: list[DatasetConfig], merge_strategy: str, only_fps: int) -> None:
+def run_motion_magnitude(
+    dataset_root_dir: Path,
+    data_dir: Path,
+    dataset_configs: list[DatasetConfig],
+    merge_strategy: str,
+    only_fps: int,
+) -> None:
+    for dataset_config in dataset_configs:
+        if not should_use_sequence_config(dataset_config, merge_strategy):
+            continue
+        if dataset_config.fps != only_fps:
+            continue
+
+        raw_sequence_path = build_preprocessed_csv_path(
+            data_dir,
+            dataset_config.record_name,
+            dataset_config.mode_index,
+            "raw_sequence_frame_index",
+        )
+        raw_seq_df = pd.read_csv(raw_sequence_path)
+        raw_seq_df = apply_motion_magnitude(raw_seq_df, dataset_root_dir, dataset_config)
+        raw_seq_df.to_csv(raw_sequence_path, index=False)
+        print(raw_sequence_path)
+
+
+def run_linearity_check(
+    dataset_root_dir: Path,
+    data_dir: Path,
+    dataset_configs: list[DatasetConfig],
+    merge_strategy: str,
+    only_fps: int,
+) -> None:
     for dataset_config in dataset_configs:
         if not should_use_sequence_config(dataset_config, merge_strategy):
             continue
@@ -256,6 +291,9 @@ def main() -> None:
     # if RAW_SEQUENCE:
     #     run_raw_sequence(data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
 
+    # if MOTION_MAGNITUDE:
+    #     run_motion_magnitude(dataset_root_dir, data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
+
     # if LINEARITY_CHECK:
     #     run_linearity_check(dataset_root_dir, data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
 
@@ -283,6 +321,9 @@ def main() -> None:
 
     if RAW_SEQUENCE:
         run_raw_sequence(data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
+
+    if MOTION_MAGNITUDE:
+        run_motion_magnitude(dataset_root_dir, data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)
 
     if LINEARITY_CHECK:
         run_linearity_check(dataset_root_dir, data_dir, dataset_configs, MERGE_STRATEGY, ONLY_FPS)

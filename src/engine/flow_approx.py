@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import torch
+import torch.nn as nn
+
 if TYPE_CHECKING:
-    import torch
     from torch import Tensor
 
 FLOW_APPROX_METHODS: tuple[str, ...] = ("single", "combination", "splatting")
@@ -26,6 +28,10 @@ SPLATTING_FILL_METHOD_ALIASES: dict[str, str] = {
 FLOW_APPROX_METHOD_CHOICES: tuple[str, ...] = FLOW_APPROX_METHODS + ("linear_splatting",) + tuple(SPLATTING_FILL_METHOD_ALIASES.keys())
 DEPTH_REDUCE_MODE: str = "amax"
 DEFAULT_SPLATTING_FILL_STRATEGY: str = "outside_in_4neighbor"
+EFFECTIVE_TIME_MODES: tuple[str, ...] = ("disabled", "manual", "learnable")
+DEFAULT_EFFECTIVE_TIME_MODE: str = "disabled"
+DEFAULT_EFFECTIVE_TIME_HIDDEN_CHANNELS: int = 32
+DEFAULT_EFFECTIVE_TIME_RADIUS: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,125 @@ class FlowInitResult:
     bmv: Tensor
     fmv: Tensor
     masks: Tensor | None
+
+
+class EffectiveTimeEstimator(nn.Module):
+    def __init__(self, input_channels: int, hidden_channels: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(input_channels, hidden_channels, 3, 1, 1),
+            nn.PReLU(hidden_channels),
+            nn.Conv2d(hidden_channels, hidden_channels, 3, 1, 1),
+            nn.PReLU(hidden_channels),
+            nn.Conv2d(hidden_channels, 1, 3, 1, 1),
+        )
+        final_conv = self.net[-1]
+        if not isinstance(final_conv, nn.Conv2d):
+            raise TypeError(f"Expected final effective-time layer to be Conv2d, got {type(final_conv).__name__}")
+        nn.init.zeros_(final_conv.weight)
+        nn.init.zeros_(final_conv.bias)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.net(inputs)
+
+
+def validate_effective_time_args(
+    effective_time_mode: str,
+    effective_time_hidden_channels: int,
+    effective_time_radius: float,
+) -> None:
+    if effective_time_mode not in EFFECTIVE_TIME_MODES:
+        available_modes = ", ".join(EFFECTIVE_TIME_MODES)
+        raise ValueError(f"Unsupported effective_time_mode '{effective_time_mode}'. Available modes: {available_modes}")
+    if effective_time_hidden_channels <= 0:
+        raise ValueError(f"effective_time_hidden_channels must be positive, got {effective_time_hidden_channels}")
+    if effective_time_radius <= 0.0 or effective_time_radius > 1.0:
+        raise ValueError(f"effective_time_radius must be in (0, 1], got {effective_time_radius}")
+
+
+def attach_effective_time_estimator(
+    model: nn.Module,
+    effective_time_mode: str,
+    effective_time_hidden_channels: int,
+) -> None:
+    validate_effective_time_args(
+        effective_time_mode=effective_time_mode,
+        effective_time_hidden_channels=effective_time_hidden_channels,
+        effective_time_radius=DEFAULT_EFFECTIVE_TIME_RADIUS,
+    )
+    model.effective_time_mode = effective_time_mode
+    if effective_time_mode == "learnable":
+        model.effective_time_estimator = EffectiveTimeEstimator(input_channels=11, hidden_channels=effective_time_hidden_channels)
+    else:
+        model.effective_time_estimator = None
+
+
+def build_time_map(
+    embt: Tensor,
+    reference_flow: Tensor,
+    effective_time: Tensor | None,
+) -> Tensor:
+    height = int(reference_flow.shape[2])
+    width = int(reference_flow.shape[3])
+    if effective_time is None:
+        return embt.reshape(int(embt.shape[0]), 1, 1, 1).to(
+            device=reference_flow.device,
+            dtype=reference_flow.dtype,
+        ).expand(-1, 1, height, width)
+
+    if effective_time.ndim != 4 or effective_time.shape[1] != 1:
+        raise ValueError(f"effective_time must have shape [B, 1, H, W] or [B, 1, 1, 1], got {tuple(effective_time.shape)}")
+    if int(effective_time.shape[0]) != int(reference_flow.shape[0]):
+        raise ValueError(
+            f"effective_time batch size must match flow batch size, got {int(effective_time.shape[0])} and {int(reference_flow.shape[0])}"
+        )
+    if tuple(effective_time.shape[-2:]) == (1, 1):
+        return effective_time.to(device=reference_flow.device, dtype=reference_flow.dtype).expand(-1, 1, height, width)
+    if tuple(effective_time.shape[-2:]) != (height, width):
+        raise ValueError(f"effective_time spatial shape must be {(height, width)}, got {tuple(effective_time.shape[-2:])}")
+
+    return effective_time.to(device=reference_flow.device, dtype=reference_flow.dtype)
+
+
+def build_effective_time_map(
+    img0: Tensor,
+    img1: Tensor,
+    embt: Tensor,
+    bmv_30: Tensor,
+    fmv_30: Tensor,
+    effective_time_mode: str,
+    effective_time_radius: float,
+    effective_time_estimator: nn.Module | None,
+) -> Tensor | None:
+    validate_effective_time_args(
+        effective_time_mode=effective_time_mode,
+        effective_time_hidden_channels=DEFAULT_EFFECTIVE_TIME_HIDDEN_CHANNELS,
+        effective_time_radius=effective_time_radius,
+    )
+    if effective_time_mode == "disabled":
+        return None
+
+    validate_flow_tensor("bmv_30", bmv_30)
+    validate_flow_tensor("fmv_30", fmv_30)
+    if tuple(bmv_30.shape) != tuple(fmv_30.shape):
+        raise ValueError(f"bmv_30 and fmv_30 shapes must match, got {tuple(bmv_30.shape)} and {tuple(fmv_30.shape)}")
+
+    base_time = build_time_map(embt=embt, reference_flow=fmv_30, effective_time=None)
+    if effective_time_mode == "manual":
+        return base_time
+
+    if effective_time_estimator is None:
+        raise RuntimeError("effective_time_mode='learnable' requires effective_time_estimator.")
+
+    expected_image_shape = (int(fmv_30.shape[0]), 3, int(fmv_30.shape[2]), int(fmv_30.shape[3]))
+    if tuple(img0.shape) != expected_image_shape:
+        raise ValueError(f"img0 must have shape {expected_image_shape}, got {tuple(img0.shape)}")
+    if tuple(img1.shape) != expected_image_shape:
+        raise ValueError(f"img1 must have shape {expected_image_shape}, got {tuple(img1.shape)}")
+
+    estimator_inputs = torch.cat([img0, img1, bmv_30, fmv_30, base_time], dim=1)
+    delta = effective_time_radius * torch.tanh(effective_time_estimator(estimator_inputs))
+    return (base_time + delta).clamp(0.0, 1.0)
 
 
 def flow_approx(flow: Tensor, time: Tensor, forward: bool) -> Tensor:
@@ -350,6 +475,7 @@ def build_linear_splatting_flow_init(
         fill_strategy=DEFAULT_SPLATTING_FILL_STRATEGY,
         ground_truth_bmv=None,
         ground_truth_fmv=None,
+        effective_time=None,
     )
 
 
@@ -362,10 +488,9 @@ def build_linear_splatting_flow_init_with_fill_strategy(
     fill_strategy: str,
     ground_truth_bmv: Tensor | None,
     ground_truth_fmv: Tensor | None,
+    effective_time: Tensor | None,
 ) -> FlowInitResult:
-    import torch
-
-    time = embt.reshape(embt.shape[0], 1, 1, 1)
+    time = build_time_map(embt=embt, reference_flow=fmv_30, effective_time=effective_time)
     source_depth0 = normalize_depth_tensor("source_depth0", source_depth0, fmv_30)
     source_depth1 = normalize_depth_tensor("source_depth1", source_depth1, bmv_30)
     partial_fmv = time * fmv_30
@@ -407,6 +532,7 @@ def build_flow_init_result(
         splatting_fill_strategy=DEFAULT_SPLATTING_FILL_STRATEGY,
         ground_truth_bmv=None,
         ground_truth_fmv=None,
+        effective_time=None,
     )
 
 
@@ -420,8 +546,9 @@ def build_flow_init_result_with_fill_strategy(
     splatting_fill_strategy: str,
     ground_truth_bmv: Tensor | None,
     ground_truth_fmv: Tensor | None,
+    effective_time: Tensor | None,
 ) -> FlowInitResult:
-    time = embt.reshape(embt.shape[0], 1, 1, 1)
+    time = build_time_map(embt=embt, reference_flow=fmv_30, effective_time=effective_time)
 
     if flow_approx_method == "single":
         approx_fmv = flow_approx(fmv_30, time, True)
@@ -449,6 +576,7 @@ def build_flow_init_result_with_fill_strategy(
             ),
             ground_truth_bmv=ground_truth_bmv,
             ground_truth_fmv=ground_truth_fmv,
+            effective_time=effective_time,
         )
 
     available_methods = ", ".join(FLOW_APPROX_METHOD_CHOICES)

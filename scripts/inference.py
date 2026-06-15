@@ -11,11 +11,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.train import build_merged_dataframe
-from scripts.train import build_model_effective_time_init_flows
+from scripts.train import load_pretrained_model_state
+from scripts.train import read_effective_time_config
 from scripts.train import read_model_init_args
 from scripts.train import resolve_model_class
 from scripts.train import set_seed
-from scripts.train import uses_model_effective_time
+from scripts.train import uses_effective_time_mode
+from src.engine.flow_approx import attach_effective_time_estimator
+from src.engine.flow_approx import build_effective_time_map
 from src.engine.evaluation import average_metric_values
 from src.engine.evaluation import build_lpips_model
 from src.engine.evaluation import build_metric_meters
@@ -24,13 +27,18 @@ from src.engine.evaluation import format_metric_averages
 from src.engine.evaluation import read_metric_config
 from src.engine.evaluation import require_psnr_enabled
 from src.engine.flow_approx import build_flow_init_result_with_fill_strategy
+from src.engine.flow_approx import DEFAULT_EFFECTIVE_TIME_HIDDEN_CHANNELS
+from src.engine.flow_approx import DEFAULT_EFFECTIVE_TIME_MODE
+from src.engine.flow_approx import DEFAULT_EFFECTIVE_TIME_RADIUS
 from src.engine.flow_approx import DEFAULT_SPLATTING_FILL_STRATEGY
+from src.engine.flow_approx import EFFECTIVE_TIME_MODES
 from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
 from src.engine.flow_approx import FLOW_APPROX_METHODS
 from src.engine.flow_approx import flatten_target_index
 from src.engine.flow_approx import is_splatting_flow_approx_method
 from src.engine.flow_approx import make_source_grid
 from src.engine.flow_approx import SPLATTING_FILL_STRATEGIES
+from src.engine.flow_approx import validate_effective_time_args
 from src.models.external.IFRNet.utils import warp
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
@@ -163,11 +171,17 @@ def build_nearest_splat_hit_count(source_motion: Any) -> Any:
     return hit_count.reshape(batch_size, 1, height, width)
 
 
-def build_splatting_region_maps(fmv_30: Any, bmv_30: Any, embt: Any, init_masks: Any | None) -> SplattingRegionMaps | None:
+def build_splatting_region_maps(
+    fmv_30: Any,
+    bmv_30: Any,
+    embt: Any,
+    init_masks: Any | None,
+    effective_time: Any | None,
+) -> SplattingRegionMaps | None:
     if init_masks is None:
         return None
 
-    time = embt.reshape(embt.shape[0], 1, 1, 1)
+    time = effective_time if effective_time is not None else embt.reshape(embt.shape[0], 1, 1, 1)
     bmv_hit_count = build_nearest_splat_hit_count(time * fmv_30)
     fmv_hit_count = build_nearest_splat_hit_count((1 - time) * bmv_30)
     bmv_hit = init_masks[:, 0:1] > 0
@@ -336,6 +350,8 @@ def run_inference_batch_with_fill_strategy(
     splatting_fill_strategy: str,
     init_flow_downscale_strategy: str,
     init_flow_mask_epsilon: float,
+    effective_time_mode: str,
+    effective_time_radius: float,
     model: Any,
     model_name: str,
     scale_factor: float,
@@ -384,35 +400,32 @@ def run_inference_batch_with_fill_strategy(
             source_depth0 = info["source_depth0"].to(device)
             source_depth1 = info["source_depth1"].to(device)
 
-        init_masks = None
-        if uses_model_effective_time(model):
-            if init_flow_downscale_strategy == "masked_area":
-                raise ValueError("model effective-time init flow does not produce masks for masked-area downscaling.")
-            init_bmv, init_fmv = build_model_effective_time_init_flows(
-                model=model,
-                img0=img0,
-                img1=img1,
-                embt=embt,
-                source_bmv=bmv_30,
-                source_fmv=fmv_30,
-            )
-            splatting_region_maps = None
-        else:
-            flow_init = build_flow_init_result_with_fill_strategy(
-                fmv_30=fmv_30,
-                bmv_30=bmv_30,
-                embt=embt,
-                flow_approx_method=flow_approx_method,
-                source_depth0=source_depth0,
-                source_depth1=source_depth1,
-                splatting_fill_strategy=splatting_fill_strategy,
-                ground_truth_bmv=bmv,
-                ground_truth_fmv=fmv,
-            )
-            init_bmv = flow_init.bmv
-            init_fmv = flow_init.fmv
-            init_masks = flow_init.masks
-            splatting_region_maps = build_splatting_region_maps(fmv_30, bmv_30, embt, flow_init.masks)
+        effective_time = build_effective_time_map(
+            img0=img0,
+            img1=img1,
+            embt=embt,
+            bmv_30=bmv_30,
+            fmv_30=fmv_30,
+            effective_time_mode=effective_time_mode,
+            effective_time_radius=effective_time_radius,
+            effective_time_estimator=getattr(model, "effective_time_estimator", None),
+        )
+        flow_init = build_flow_init_result_with_fill_strategy(
+            fmv_30=fmv_30,
+            bmv_30=bmv_30,
+            embt=embt,
+            flow_approx_method=flow_approx_method,
+            source_depth0=source_depth0,
+            source_depth1=source_depth1,
+            splatting_fill_strategy=splatting_fill_strategy,
+            ground_truth_bmv=bmv,
+            ground_truth_fmv=fmv,
+            effective_time=effective_time,
+        )
+        init_bmv = flow_init.bmv
+        init_fmv = flow_init.fmv
+        init_masks = flow_init.masks
+        splatting_region_maps = build_splatting_region_maps(fmv_30, bmv_30, embt, flow_init.masks, effective_time)
         init_bmv_mask = None
         init_fmv_mask = None
         if init_flow_downscale_strategy == "masked_area":
@@ -502,6 +515,8 @@ def run_inference_batch(
         splatting_fill_strategy=DEFAULT_SPLATTING_FILL_STRATEGY,
         init_flow_downscale_strategy=DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY,
         init_flow_mask_epsilon=DEFAULT_INIT_FLOW_MASK_EPSILON,
+        effective_time_mode=DEFAULT_EFFECTIVE_TIME_MODE,
+        effective_time_radius=DEFAULT_EFFECTIVE_TIME_RADIUS,
         model=model,
         model_name=model_name,
         scale_factor=scale_factor,
@@ -666,6 +681,7 @@ def main(argv: list[str] | None = None) -> None:
         config.get("init_flow_downscale_strategy", DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY)
     )
     init_flow_mask_epsilon = float(config.get("init_flow_mask_epsilon", DEFAULT_INIT_FLOW_MASK_EPSILON))
+    effective_time_mode, effective_time_hidden_channels, effective_time_radius = read_effective_time_config(config)
     scale_factor = float(config["scale_factor"])
     flow_diff_threshold = float(config.get("flow_diff_threshold", 1.0))
     flow_diff_percentile = float(config.get("flow_diff_percentile", 99.0))
@@ -708,6 +724,13 @@ def main(argv: list[str] | None = None) -> None:
         )
     if init_flow_mask_epsilon <= 0:
         raise ValueError(f"init_flow_mask_epsilon must be positive, got {init_flow_mask_epsilon}")
+    validate_effective_time_args(
+        effective_time_mode=effective_time_mode,
+        effective_time_hidden_channels=effective_time_hidden_channels,
+        effective_time_radius=effective_time_radius,
+    )
+    if uses_effective_time_mode(effective_time_mode) and model_name != RESIDUAL_FLOW_APPROX_MODEL_NAME:
+        raise ValueError("effective_time_mode requires model_name=IFRNet_Residual_FlowApprox.")
     if init_flow_downscale_strategy == "masked_area" and (
         model_name != RESIDUAL_FLOW_APPROX_MODEL_NAME
         or not is_splatting_flow_approx_method(flow_approx_method=flow_approx_method)
@@ -733,6 +756,9 @@ def main(argv: list[str] | None = None) -> None:
         "splatting_fill_strategy": splatting_fill_strategy,
         "init_flow_downscale_strategy": init_flow_downscale_strategy,
         "init_flow_mask_epsilon": init_flow_mask_epsilon,
+        "effective_time_mode": effective_time_mode,
+        "effective_time_hidden_channels": effective_time_hidden_channels,
+        "effective_time_radius": effective_time_radius,
         "flow_diff_threshold": flow_diff_threshold,
         "flow_diff_percentile": flow_diff_percentile,
         "save_topk_worst_psnr": save_topk_worst_psnr,
@@ -772,6 +798,12 @@ def main(argv: list[str] | None = None) -> None:
         init_flow_downscale_strategy,
         init_flow_mask_epsilon,
     )
+    logger.info(
+        "effective_time_mode=%s effective_time_hidden_channels=%s effective_time_radius=%s",
+        effective_time_mode,
+        effective_time_hidden_channels,
+        effective_time_radius,
+    )
 
     dataframe_list: list[Any] = []
     for inference_preset in inference_presets:
@@ -783,20 +815,26 @@ def main(argv: list[str] | None = None) -> None:
     if "valid" in dataframe.columns:
         dataframe = dataframe[dataframe["valid"] == True].reset_index(drop=True)
     model_class = resolve_model_class(model_name)
-    model = model_class(**model_init_args).to(device)
+    model = model_class(**model_init_args)
+    attach_effective_time_estimator(
+        model=model,
+        effective_time_mode=effective_time_mode,
+        effective_time_hidden_channels=effective_time_hidden_channels,
+    )
+    model = model.to(device)
     if hasattr(model, "init_flow_layer"):
         logger.info("model_init_flow_layer=%s", model.init_flow_layer)
-    if hasattr(model, "effective_time_mode"):
-        logger.info(
-            "model_effective_time_mode=%s effective_time_radius=%s",
-            model.effective_time_mode,
-            getattr(model, "effective_time_radius", None),
-        )
+    logger.info(
+        "effective_time_mode=%s effective_time_hidden_channels=%s effective_time_radius=%s",
+        effective_time_mode,
+        effective_time_hidden_channels,
+        effective_time_radius,
+    )
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     # print("Load Pretrained Weights from IFRNet_Vimeo90K.pth as Baseline")
     # state_dict = torch.load("src/models/external/IFRNet/checkpoints/IFRNet/IFRNet_Vimeo90K.pth", map_location=device)
-    model.load_state_dict(state_dict)
+    load_pretrained_model_state(model=model, state_dict=state_dict, logger=logger)
     model.eval()
 
     metric_meters = build_metric_meters(metric_config)
@@ -832,6 +870,8 @@ def main(argv: list[str] | None = None) -> None:
                     splatting_fill_strategy,
                     init_flow_downscale_strategy,
                     init_flow_mask_epsilon,
+                    effective_time_mode,
+                    effective_time_radius,
                     model,
                     model_name,
                     scale_factor,
@@ -974,6 +1014,8 @@ def main(argv: list[str] | None = None) -> None:
                         splatting_fill_strategy,
                         init_flow_downscale_strategy,
                         init_flow_mask_epsilon,
+                        effective_time_mode,
+                        effective_time_radius,
                         model,
                         model_name,
                         scale_factor,

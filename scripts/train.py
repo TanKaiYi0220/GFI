@@ -29,13 +29,20 @@ from src.engine.evaluation import format_metric_values
 from src.engine.evaluation import get_enabled_metric_names
 from src.engine.evaluation import read_metric_config
 from src.engine.evaluation import require_psnr_enabled
+from src.engine.flow_approx import attach_effective_time_estimator
+from src.engine.flow_approx import build_effective_time_map
 from src.engine.flow_approx import build_flow_init_result_with_fill_strategy
+from src.engine.flow_approx import DEFAULT_EFFECTIVE_TIME_HIDDEN_CHANNELS
+from src.engine.flow_approx import DEFAULT_EFFECTIVE_TIME_MODE
+from src.engine.flow_approx import DEFAULT_EFFECTIVE_TIME_RADIUS
 from src.engine.flow_approx import DEFAULT_SPLATTING_FILL_STRATEGY
+from src.engine.flow_approx import EFFECTIVE_TIME_MODES
 from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
 from src.engine.flow_approx import FLOW_APPROX_METHODS
 from src.engine.flow_approx import is_splatting_flow_approx_method
 from src.engine.flow_approx import resolve_splatting_fill_strategy
 from src.engine.flow_approx import SPLATTING_FILL_STRATEGIES
+from src.engine.flow_approx import validate_effective_time_args
 from src.utils.config import load_yaml_file
 
 MODEL_NAMES: tuple[str, ...] = ("IFRNet", "IFRNet_Residual", "IFRNet_Residual_FlowApprox")
@@ -43,6 +50,11 @@ FLOW_APPROX_MODEL_NAMES: tuple[str, ...] = ("IFRNet_Residual_FlowApprox",)
 DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY: str = "bilinear"
 DEFAULT_INIT_FLOW_MASK_EPSILON: float = 1e-6
 INIT_FLOW_DOWNSCALE_STRATEGIES: tuple[str, ...] = ("bilinear", "masked_area")
+EFFECTIVE_TIME_CONFIG_KEYS: tuple[str, ...] = (
+    "effective_time_mode",
+    "effective_time_hidden_channels",
+    "effective_time_radius",
+)
 
 
 @dataclass(frozen=True)
@@ -67,36 +79,11 @@ def uses_flow_approx_model(model_name: str) -> bool:
     return model_name in FLOW_APPROX_MODEL_NAMES
 
 
-def uses_model_effective_time(model: Any) -> bool:
-    if hasattr(model, "uses_model_effective_time"):
-        return bool(model.uses_model_effective_time())
-
-    return str(getattr(model, "effective_time_mode", "disabled")) in ("manual", "learnable")
+def uses_effective_time_mode(effective_time_mode: str) -> bool:
+    return effective_time_mode in ("manual", "learnable")
 
 
-def build_model_effective_time_init_flows(
-    model: Any,
-    img0: Any,
-    img1: Any,
-    embt: Any,
-    source_bmv: Any,
-    source_fmv: Any,
-) -> tuple[Any, Any]:
-    if not hasattr(model, "build_effective_time_init_flows"):
-        raise AttributeError(
-            "Model effective-time mode is enabled, but the model does not implement build_effective_time_init_flows."
-        )
-
-    return model.build_effective_time_init_flows(
-        img0=img0,
-        img1=img1,
-        embt=embt,
-        source_bmv=source_bmv,
-        source_fmv=source_fmv,
-    )
-
-
-def read_model_init_args(config_values: dict[str, Any]) -> dict[str, Any]:
+def read_raw_model_init_args(config_values: dict[str, Any]) -> dict[str, Any]:
     raw_model_init_args = config_values.get("model_init_args", {})
     if raw_model_init_args is None:
         return {}
@@ -104,6 +91,36 @@ def read_model_init_args(config_values: dict[str, Any]) -> dict[str, Any]:
         raise TypeError(f"model_init_args must be a mapping, got {type(raw_model_init_args).__name__}")
 
     return dict(raw_model_init_args)
+
+
+def read_model_init_args(config_values: dict[str, Any]) -> dict[str, Any]:
+    model_init_args = read_raw_model_init_args(config_values=config_values)
+    for key in EFFECTIVE_TIME_CONFIG_KEYS:
+        model_init_args.pop(key, None)
+    return model_init_args
+
+
+def read_effective_time_config(config_values: dict[str, Any]) -> tuple[str, int, float]:
+    model_init_args = read_raw_model_init_args(config_values=config_values)
+    effective_time_mode = str(
+        config_values.get(
+            "effective_time_mode",
+            model_init_args.get("effective_time_mode", DEFAULT_EFFECTIVE_TIME_MODE),
+        )
+    )
+    effective_time_hidden_channels = int(
+        config_values.get(
+            "effective_time_hidden_channels",
+            model_init_args.get("effective_time_hidden_channels", DEFAULT_EFFECTIVE_TIME_HIDDEN_CHANNELS),
+        )
+    )
+    effective_time_radius = float(
+        config_values.get(
+            "effective_time_radius",
+            model_init_args.get("effective_time_radius", DEFAULT_EFFECTIVE_TIME_RADIUS),
+        )
+    )
+    return effective_time_mode, effective_time_hidden_channels, effective_time_radius
 
 
 def resolve_model_class(model_name: str) -> type[Any]:
@@ -217,6 +234,8 @@ def forward_model(
     splatting_fill_strategy: str,
     init_flow_downscale_strategy: str,
     init_flow_mask_epsilon: float,
+    effective_time_mode: str,
+    effective_time_radius: float,
     source_depth0: Any | None,
     source_depth1: Any | None,
     ground_truth_bmv: Any | None,
@@ -230,39 +249,38 @@ def forward_model(
     init_fmv_mask = None
 
     if uses_flow_approx_model(model_name):
-        if uses_model_effective_time(model):
-            if init_flow_downscale_strategy == "masked_area":
-                raise ValueError("model effective-time init flow does not produce masks for masked-area downscaling.")
-            init_bmv, init_fmv = build_model_effective_time_init_flows(
-                model=model,
-                img0=img0,
-                img1=img1,
-                embt=embt,
-                source_bmv=source_bmv,
-                source_fmv=source_fmv,
-            )
-        else:
-            flow_init = build_flow_init_result_with_fill_strategy(
-                fmv_30=source_fmv,
-                bmv_30=source_bmv,
-                embt=embt,
-                flow_approx_method=flow_approx_method,
-                source_depth0=source_depth0,
-                source_depth1=source_depth1,
-                splatting_fill_strategy=splatting_fill_strategy,
-                ground_truth_bmv=ground_truth_bmv,
-                ground_truth_fmv=ground_truth_fmv,
-            )
-            init_bmv = flow_init.bmv
-            init_fmv = flow_init.fmv
-            if init_flow_downscale_strategy == "masked_area":
-                if flow_init.masks is None:
-                    raise RuntimeError(
-                        "init_flow_downscale_strategy=masked_area requires splatting coverage masks, but none were produced."
-                    )
-                init_bmv_mask = flow_init.masks[:, 0:1]
-                init_fmv_mask = flow_init.masks[:, 1:2]
-    elif uses_model_effective_time(model):
+        effective_time = build_effective_time_map(
+            img0=img0,
+            img1=img1,
+            embt=embt,
+            bmv_30=source_bmv,
+            fmv_30=source_fmv,
+            effective_time_mode=effective_time_mode,
+            effective_time_radius=effective_time_radius,
+            effective_time_estimator=getattr(model, "effective_time_estimator", None),
+        )
+        flow_init = build_flow_init_result_with_fill_strategy(
+            fmv_30=source_fmv,
+            bmv_30=source_bmv,
+            embt=embt,
+            flow_approx_method=flow_approx_method,
+            source_depth0=source_depth0,
+            source_depth1=source_depth1,
+            splatting_fill_strategy=splatting_fill_strategy,
+            ground_truth_bmv=ground_truth_bmv,
+            ground_truth_fmv=ground_truth_fmv,
+            effective_time=effective_time,
+        )
+        init_bmv = flow_init.bmv
+        init_fmv = flow_init.fmv
+        if init_flow_downscale_strategy == "masked_area":
+            if flow_init.masks is None:
+                raise RuntimeError(
+                    "init_flow_downscale_strategy=masked_area requires splatting coverage masks, but none were produced."
+                )
+            init_bmv_mask = flow_init.masks[:, 0:1]
+            init_fmv_mask = flow_init.masks[:, 1:2]
+    elif uses_effective_time_mode(effective_time_mode):
         raise ValueError("effective_time_mode requires model_name=IFRNet_Residual_FlowApprox.")
 
     if model_name == "IFRNet":
@@ -441,6 +459,8 @@ def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: 
                     args.splatting_fill_strategy,
                     args.init_flow_downscale_strategy,
                     args.init_flow_mask_epsilon,
+                    args.effective_time_mode,
+                    args.effective_time_radius,
                     model,
                     args.model_name,
                     1.0,
@@ -501,6 +521,8 @@ def run_training_batch(
         args.splatting_fill_strategy,
         args.init_flow_downscale_strategy,
         args.init_flow_mask_epsilon,
+        args.effective_time_mode,
+        args.effective_time_radius,
         source_depth0,
         source_depth1,
         ground_truth_bmv,
@@ -733,6 +755,24 @@ def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.Argument
         type=float,
         help="Numerical epsilon for mask-normalized init-flow downscaling.",
     )
+    parser.add_argument(
+        "--effective-time-mode",
+        default=config_defaults.get("effective_time_mode", DEFAULT_EFFECTIVE_TIME_MODE),
+        choices=EFFECTIVE_TIME_MODES,
+        help="Use a fixed or learnable effective-time map before flow approximation.",
+    )
+    parser.add_argument(
+        "--effective-time-hidden-channels",
+        default=config_defaults.get("effective_time_hidden_channels", DEFAULT_EFFECTIVE_TIME_HIDDEN_CHANNELS),
+        type=int,
+        help="Hidden channel count for the learnable effective-time estimator.",
+    )
+    parser.add_argument(
+        "--effective-time-radius",
+        default=config_defaults.get("effective_time_radius", DEFAULT_EFFECTIVE_TIME_RADIUS),
+        type=float,
+        help="Maximum learnable residual added around embt before clamping to [0, 1].",
+    )
     return parser
 
 
@@ -743,6 +783,11 @@ def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     config_path = None if bootstrap_args.config is None else Path(bootstrap_args.config)
     config_defaults = load_train_run_config(config_path)
+    effective_time_mode, effective_time_hidden_channels, effective_time_radius = read_effective_time_config(config_defaults)
+    config_defaults = dict(config_defaults)
+    config_defaults["effective_time_mode"] = effective_time_mode
+    config_defaults["effective_time_hidden_channels"] = effective_time_hidden_channels
+    config_defaults["effective_time_radius"] = effective_time_radius
     parser = build_train_arg_parser(config_defaults)
     args = parser.parse_args(argv)
     args.model_init_args = read_model_init_args(config_defaults)
@@ -777,6 +822,13 @@ def resolve_effective_init_flow_downscale_strategy(args: argparse.Namespace) -> 
 def validate_flow_approx_runtime_args(args: argparse.Namespace) -> None:
     if args.init_flow_mask_epsilon <= 0:
         raise ValueError(f"init_flow_mask_epsilon must be positive, got {args.init_flow_mask_epsilon}")
+    validate_effective_time_args(
+        effective_time_mode=args.effective_time_mode,
+        effective_time_hidden_channels=args.effective_time_hidden_channels,
+        effective_time_radius=args.effective_time_radius,
+    )
+    if uses_effective_time_mode(args.effective_time_mode) and not uses_flow_approx_model(args.model_name):
+        raise ValueError("effective_time_mode requires model_name=IFRNet_Residual_FlowApprox.")
     if args.init_flow_downscale_strategy == "masked_area":
         if not uses_flow_approx_model(args.model_name):
             raise ValueError(
@@ -839,6 +891,8 @@ def load_pretrained_model_state(
     logger: logging.Logger,
 ) -> None:
     allowed_prefixes = tuple(model.allowed_pretrained_missing_key_prefixes()) if hasattr(model, "allowed_pretrained_missing_key_prefixes") else ()
+    if getattr(model, "effective_time_estimator", None) is not None:
+        allowed_prefixes = allowed_prefixes + ("effective_time_estimator.",)
     load_result = model.load_state_dict(state_dict, strict=False)
     missing_keys = list(load_result.missing_keys)
     unexpected_keys = list(load_result.unexpected_keys)
@@ -938,6 +992,9 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
         summary["init_flow_downscale_strategy"] = args.init_flow_downscale_strategy
         summary["effective_init_flow_downscale_strategy"] = resolve_effective_init_flow_downscale_strategy(args=args)
         summary["init_flow_mask_epsilon"] = args.init_flow_mask_epsilon
+        summary["effective_time_mode"] = args.effective_time_mode
+        summary["effective_time_hidden_channels"] = args.effective_time_hidden_channels
+        summary["effective_time_radius"] = args.effective_time_radius
 
     return summary
 
@@ -1000,6 +1057,12 @@ def run_training(args: argparse.Namespace) -> None:
             resolve_effective_init_flow_downscale_strategy(args=args),
             args.init_flow_mask_epsilon,
         )
+        logger.info(
+            "effective_time_mode=%s effective_time_hidden_channels=%s effective_time_radius=%s",
+            args.effective_time_mode,
+            args.effective_time_hidden_channels,
+            args.effective_time_radius,
+        )
 
     root_dir = Path(args.root_dir)
     train_df = build_merged_dataframe(root_dir, checkpoints_dir, args.train_preset, args.only_fps, logger)
@@ -1034,15 +1097,21 @@ def run_training(args: argparse.Namespace) -> None:
     args.iters_per_epoch = len(train_loader)
     model_class = resolve_model_class(args.model_name)
     model_init_args = dict(getattr(args, "model_init_args", {}))
-    model = model_class(**model_init_args).to(device)
+    model = model_class(**model_init_args)
+    attach_effective_time_estimator(
+        model=model,
+        effective_time_mode=args.effective_time_mode,
+        effective_time_hidden_channels=args.effective_time_hidden_channels,
+    )
+    model = model.to(device)
     if hasattr(model, "init_flow_layer"):
         logger.info("model_init_flow_layer=%s", model.init_flow_layer)
-    if hasattr(model, "effective_time_mode"):
-        logger.info(
-            "model_effective_time_mode=%s effective_time_radius=%s",
-            model.effective_time_mode,
-            getattr(model, "effective_time_radius", None),
-        )
+    logger.info(
+        "effective_time_mode=%s effective_time_hidden_channels=%s effective_time_radius=%s",
+        args.effective_time_mode,
+        args.effective_time_hidden_channels,
+        args.effective_time_radius,
+    )
     optimizer = optim.AdamW(model.parameters(), lr=args.lr_start, weight_decay=0)
     training_state = load_training_state(args, model, optimizer, device, logger)
 

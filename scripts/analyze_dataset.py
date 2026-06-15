@@ -280,6 +280,7 @@ def build_flow_init_result_with_runtime(
                 fill_strategy=ANALYSIS_SPLATTING_FILL_METHODS[flow_approx_method],
                 ground_truth_bmv=ground_truth_bmv,
                 ground_truth_fmv=ground_truth_fmv,
+                effective_time=None,
             )
 
         return build_flow_init_result(
