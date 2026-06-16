@@ -15,6 +15,7 @@ from scripts.train import load_pretrained_model_state
 from scripts.train import read_effective_time_config
 from scripts.train import read_model_init_args
 from scripts.train import resolve_model_class
+from scripts.train import select_sample_rows
 from scripts.train import set_seed
 from scripts.train import uses_effective_time_mode
 from src.engine.flow_approx import attach_effective_time_estimator
@@ -57,6 +58,8 @@ INIT_FLOW_DOWNSCALE_STRATEGIES: tuple[str, ...] = ("bilinear", "masked_area")
 InferenceBatchResult = dict[str, Any]
 SplattingRegionMaps = dict[str, Any]
 EffectiveTimeStats = dict[str, list[float]]
+SampleIdentity = tuple[str, str, str, int, int, int]
+ConfiguredSaveFrameGroups = dict[str, list[str]]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -82,6 +85,96 @@ def read_inference_presets(config: dict[str, Any]) -> list[str]:
         return value
 
     raise TypeError("inference_preset must be a string, or inference_presets must be a list of strings.")
+
+
+def read_string_list_config_with_alias(config: dict[str, Any], preferred_key: str, legacy_key: str) -> list[str]:
+    preferred_value = config.get(preferred_key)
+    legacy_value = config.get(legacy_key)
+
+    if preferred_value is not None and legacy_value is not None and preferred_value != legacy_value:
+        raise ValueError(f"{preferred_key} and {legacy_key} were both provided with different values.")
+
+    raw_value = preferred_value if preferred_value is not None else legacy_value
+    if raw_value is None:
+        return []
+    if not isinstance(raw_value, list) or not all(isinstance(item, str) for item in raw_value):
+        raise TypeError(f"{preferred_key} must be a list of strings.")
+    return list(raw_value)
+
+
+def read_configured_save_frame_groups(config: dict[str, Any]) -> ConfiguredSaveFrameGroups:
+    return {
+        "train": read_string_list_config_with_alias(config, "save_train_frames", "sample_train_frames"),
+        "test": read_string_list_config_with_alias(config, "save_test_frames", "sample_test_frames"),
+    }
+
+
+def infer_frame_group_name_from_preset(inference_preset: str) -> str | None:
+    normalized_preset = inference_preset.lower()
+    if normalized_preset.startswith("train"):
+        return "train"
+    if normalized_preset.startswith("test"):
+        return "test"
+    return None
+
+
+def build_sample_identity(
+    inference_preset: str,
+    record: str,
+    mode_name: str,
+    img0: int,
+    img1: int,
+    img2: int,
+) -> SampleIdentity:
+    return (inference_preset, record, mode_name, int(img0), int(img1), int(img2))
+
+
+def build_configured_sample_reasons(
+    dataframe: Any,
+    inference_presets: list[str],
+    configured_frame_groups: ConfiguredSaveFrameGroups,
+) -> dict[SampleIdentity, list[str]]:
+    configured_sample_reasons: dict[SampleIdentity, list[str]] = {}
+    for group_name, frame_keys in configured_frame_groups.items():
+        if len(frame_keys) == 0:
+            continue
+
+        matching_presets = [preset for preset in inference_presets if infer_frame_group_name_from_preset(preset) == group_name]
+        if len(matching_presets) == 0:
+            raise ValueError(
+                f"Configured {group_name} frames were provided, but no inference_preset matched group={group_name}. "
+                f"inference_presets={inference_presets}"
+            )
+
+        matching_dataframe = dataframe[dataframe["inference_preset"].isin(matching_presets)].reset_index(drop=True)
+        try:
+            selected_rows = select_sample_rows(matching_dataframe, frame_keys)
+        except Exception as error:
+            raise RuntimeError(
+                f"Failed to resolve configured {group_name} frames for presets={matching_presets}: {frame_keys}"
+            ) from error
+
+        for _row_index, row in selected_rows.iterrows():
+            sample_identity = build_sample_identity(
+                inference_preset=str(row["inference_preset"]),
+                record=str(row["record"]),
+                mode_name=str(row["mode"]),
+                img0=int(row["img0"]),
+                img1=int(row["img1"]),
+                img2=int(row["img2"]),
+            )
+            configured_sample_reasons.setdefault(sample_identity, [])
+            reason = f"configured_{group_name}_frame"
+            if reason not in configured_sample_reasons[sample_identity]:
+                configured_sample_reasons[sample_identity].append(reason)
+
+    return configured_sample_reasons
+
+
+def append_selected_sample_reason(selected_sample_reasons: dict[int, list[str]], sample_index: int, reason: str) -> None:
+    sample_reasons = selected_sample_reasons.setdefault(int(sample_index), [])
+    if reason not in sample_reasons:
+        sample_reasons.append(reason)
 
 
 def save_flow_diff_visuals(
@@ -717,6 +810,7 @@ def main(argv: list[str] | None = None) -> None:
     save_topk_worst_psnr = int(config.get("save_topk_worst_psnr", 3))
     save_topk_best_psnr = int(config.get("save_topk_best_psnr", 0))
     save_topk_largest_flow_diff = int(config.get("save_topk_largest_flow_diff", 3))
+    configured_save_frame_groups = read_configured_save_frame_groups(config)
     metric_config = read_metric_config(config)
     require_psnr_enabled(metric_config, "inference")
     seed = int(config["seed"])
@@ -793,6 +887,8 @@ def main(argv: list[str] | None = None) -> None:
         "save_topk_worst_psnr": save_topk_worst_psnr,
         "save_topk_best_psnr": save_topk_best_psnr,
         "save_topk_largest_flow_diff": save_topk_largest_flow_diff,
+        "save_train_frames": configured_save_frame_groups["train"],
+        "save_test_frames": configured_save_frame_groups["test"],
         "metrics": dict(metric_config),
     }
     if len(model_init_args) > 0:
@@ -843,6 +939,11 @@ def main(argv: list[str] | None = None) -> None:
     dataframe = pd.concat(dataframe_list, ignore_index=True)
     if "valid" in dataframe.columns:
         dataframe = dataframe[dataframe["valid"] == True].reset_index(drop=True)
+    configured_sample_reasons_by_identity = build_configured_sample_reasons(
+        dataframe=dataframe,
+        inference_presets=inference_presets,
+        configured_frame_groups=configured_save_frame_groups,
+    )
     model_class = resolve_model_class(model_name)
     model = model_class(**model_init_args)
     attach_effective_time_estimator(
@@ -858,6 +959,12 @@ def main(argv: list[str] | None = None) -> None:
         effective_time_mode,
         effective_time_hidden_channels,
         effective_time_radius,
+    )
+    logger.info(
+        "configured_save_frames train=%s test=%s matched_samples=%s",
+        len(configured_save_frame_groups["train"]),
+        len(configured_save_frame_groups["test"]),
+        len(configured_sample_reasons_by_identity),
     )
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
@@ -991,18 +1098,29 @@ def main(argv: list[str] | None = None) -> None:
                 }
             )
             selected_sample_reasons: dict[int, list[str]] = {}
+            for sample_index, row in group_dataframe.iterrows():
+                sample_identity = build_sample_identity(
+                    inference_preset=str(inference_preset),
+                    record=str(record),
+                    mode_name=str(mode_name),
+                    img0=int(row["img0"]),
+                    img1=int(row["img1"]),
+                    img2=int(row["img2"]),
+                )
+                for reason in configured_sample_reasons_by_identity.get(sample_identity, []):
+                    append_selected_sample_reason(selected_sample_reasons, int(sample_index), reason)
 
             if save_topk_worst_psnr > 0:
                 for sample_index in group_metrics_df.nsmallest(save_topk_worst_psnr, "psnr")["sample_index"].tolist():
-                    selected_sample_reasons.setdefault(int(sample_index), []).append("worst_psnr")
+                    append_selected_sample_reason(selected_sample_reasons, int(sample_index), "worst_psnr")
             if save_topk_best_psnr > 0:
                 for sample_index in group_metrics_df.nlargest(save_topk_best_psnr, "psnr")["sample_index"].tolist():
-                    selected_sample_reasons.setdefault(int(sample_index), []).append("best_psnr")
+                    append_selected_sample_reason(selected_sample_reasons, int(sample_index), "best_psnr")
             if model_name in (RESIDUAL_MODEL_NAME, RESIDUAL_FLOW_APPROX_MODEL_NAME) and save_topk_largest_flow_diff > 0:
                 for sample_index in group_metrics_df.nlargest(save_topk_largest_flow_diff, "flow_diff_1_to_0_changed_ratio")["sample_index"].tolist():
-                    selected_sample_reasons.setdefault(int(sample_index), []).append("largest_flow_diff_1_to_0")
+                    append_selected_sample_reason(selected_sample_reasons, int(sample_index), "largest_flow_diff_1_to_0")
                 for sample_index in group_metrics_df.nlargest(save_topk_largest_flow_diff, "flow_diff_1_to_2_changed_ratio")["sample_index"].tolist():
-                    selected_sample_reasons.setdefault(int(sample_index), []).append("largest_flow_diff_1_to_2")
+                    append_selected_sample_reason(selected_sample_reasons, int(sample_index), "largest_flow_diff_1_to_2")
 
             group_metrics_df["selected_for_save"] = group_metrics_df["sample_index"].map(lambda sample_index: int(sample_index) in selected_sample_reasons)
             group_metrics_df["save_reason"] = group_metrics_df["sample_index"].map(
