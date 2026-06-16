@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 PROJECT_ROOT: Path = Path(__file__).parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -14,7 +17,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.train import build_logger
 from scripts.train import build_merged_dataframe
 from scripts.train import build_record_name_summary
-from scripts.train import build_training_dataset
 from scripts.train import build_train_arg_parser
 from scripts.train import get_lr
 from scripts.train import load_train_run_config
@@ -28,6 +30,19 @@ from scripts.train import save_input_config
 from scripts.train import set_lr
 from scripts.train import set_seed
 from scripts.train import uses_flow_approx_model
+from src.data.augment import shared_random_crop
+from src.data.augment import shared_random_horizontal_flip
+from src.data.augment import shared_random_reverse_channel
+from src.data.augment import shared_random_rotate
+from src.data.augment import shared_random_vertical_flip
+from src.data.dataset_loader import BaseDataset
+from src.data.dataset_loader import DEFAULT_MODALITY_CONFIG
+from src.data.dataset_loader import build_distance_indexing
+from src.data.dataset_loader import build_embedding_tensor
+from src.data.dataset_loader import depth_to_tensor
+from src.data.dataset_loader import flow_to_tensor
+from src.data.dataset_loader import image_to_tensor
+from src.data.image_ops import load_backward_velocity
 from src.engine.evaluation import AverageMeter
 from src.engine.evaluation import average_metric_values
 from src.engine.evaluation import build_lpips_model
@@ -46,6 +61,8 @@ DEFAULT_ORACLE_EFFECTIVE_TIME_SOURCE: str = "average"
 DEFAULT_ORACLE_EFFECTIVE_TIME_EPSILON: float = 1.0e-6
 DEFAULT_ORACLE_EFFECTIVE_TIME_MIN_MOTION: float = 1.0e-3
 DEFAULT_ORACLE_EFFECTIVE_TIME_INVALID_FLOW_SCALE: float = 0.5
+ORACLE_EFFECTIVE_TIME_CACHE_DTYPES: tuple[str, ...] = ("float16", "float32")
+DEFAULT_ORACLE_EFFECTIVE_TIME_CACHE_DTYPE: str = "float16"
 
 
 @dataclass(frozen=True)
@@ -126,7 +143,32 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=float,
         help="Fallback scale for invalid oracle projection. 0.5 means fixed midpoint fallback.",
     )
+    parser.add_argument(
+        "--oracle-effective-time-cache-dir",
+        default=config_defaults.get("oracle_effective_time_cache_dir"),
+        type=str,
+        help="Directory for offline oracle t_eff .npy cache files. Defaults to output_dir/oracle_t_eff_cache.",
+    )
+    parser.add_argument(
+        "--oracle-effective-time-cache-dtype",
+        default=config_defaults.get("oracle_effective_time_cache_dtype", DEFAULT_ORACLE_EFFECTIVE_TIME_CACHE_DTYPE),
+        choices=ORACLE_EFFECTIVE_TIME_CACHE_DTYPES,
+        help="Storage dtype for cached oracle t_eff maps.",
+    )
+    parser.set_defaults(
+        rebuild_oracle_effective_time_cache=bool(
+            config_defaults.get("rebuild_oracle_effective_time_cache", False)
+        )
+    )
+    parser.add_argument(
+        "--rebuild-oracle-effective-time-cache",
+        dest="rebuild_oracle_effective_time_cache",
+        action="store_true",
+        help="Regenerate oracle t_eff cache files even when they already exist.",
+    )
     args = parser.parse_args(argv)
+    if args.oracle_effective_time_cache_dir is None:
+        args.oracle_effective_time_cache_dir = str(Path(args.output_dir) / "oracle_t_eff_cache")
     args.model_init_args = read_model_init_args(config_defaults)
     args.metric_config = read_metric_config(config_defaults)
     args.input_config = dict(config_defaults)
@@ -134,91 +176,136 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     args.input_config["oracle_effective_time_epsilon"] = args.oracle_effective_time_epsilon
     args.input_config["oracle_effective_time_min_motion"] = args.oracle_effective_time_min_motion
     args.input_config["oracle_effective_time_invalid_flow_scale"] = args.oracle_effective_time_invalid_flow_scale
+    args.input_config["oracle_effective_time_cache_dir"] = args.oracle_effective_time_cache_dir
+    args.input_config["oracle_effective_time_cache_dtype"] = args.oracle_effective_time_cache_dtype
+    args.input_config["rebuild_oracle_effective_time_cache"] = args.rebuild_oracle_effective_time_cache
     require_psnr_enabled(args.metric_config, "oracle effective-time training")
     validate_oracle_args(args)
     return args
 
 
 def validate_flow_pair(endpoint_flow: Any, target_flow: Any) -> None:
-    if endpoint_flow.ndim != 4 or endpoint_flow.shape[1] != 2:
-        raise ValueError(f"endpoint_flow must have shape [B, 2, H, W], got {tuple(endpoint_flow.shape)}")
+    if endpoint_flow.ndim != 3 or endpoint_flow.shape[2] != 2:
+        raise ValueError(f"endpoint_flow must have shape [H, W, 2], got {tuple(endpoint_flow.shape)}")
     if tuple(endpoint_flow.shape) != tuple(target_flow.shape):
         raise ValueError(
             f"Flow shape mismatch: endpoint_flow={tuple(endpoint_flow.shape)} target_flow={tuple(target_flow.shape)}"
         )
 
 
-def projection_scale(
-    endpoint_flow: Any,
-    target_flow: Any,
+def projection_scale_numpy(
+    endpoint_flow: np.ndarray,
+    target_flow: np.ndarray,
     epsilon: float,
     min_motion: float,
     invalid_flow_scale: float,
 ) -> ProjectionScaleResult:
-    import torch
-
     validate_flow_pair(endpoint_flow, target_flow)
-    target_flow = target_flow.to(device=endpoint_flow.device, dtype=endpoint_flow.dtype)
-    denominator = (endpoint_flow * endpoint_flow).sum(dim=1, keepdim=True)
-    raw_scale = (endpoint_flow * target_flow).sum(dim=1, keepdim=True) / (denominator + epsilon)
-    valid = denominator.sqrt() > min_motion
-    clamped_scale = raw_scale.clamp(0.0, 1.0)
-    fallback_scale = torch.full_like(clamped_scale, invalid_flow_scale)
-    scale = torch.where(valid, clamped_scale, fallback_scale)
+    denominator = np.sum(endpoint_flow * endpoint_flow, axis=2, keepdims=True)
+    raw_scale = np.sum(endpoint_flow * target_flow, axis=2, keepdims=True) / (denominator + epsilon)
+    valid = np.sqrt(denominator) > min_motion
+    scale = np.where(valid, np.clip(raw_scale, 0.0, 1.0), invalid_flow_scale).astype(np.float32)
     return ProjectionScaleResult(scale=scale, valid=valid, raw_scale=raw_scale)
 
 
-def build_fixed_time(embt: Any, reference_flow: Any) -> Any:
-    return embt.reshape(int(embt.shape[0]), 1, 1, 1).to(
-        device=reference_flow.device,
-        dtype=reference_flow.dtype,
-    ).expand(-1, 1, int(reference_flow.shape[2]), int(reference_flow.shape[3]))
+def build_oracle_cache_key(args: argparse.Namespace, row: Any) -> str:
+    key_payload = {
+        "version": 1,
+        "record": str(row["record"]),
+        "mode": str(row["mode"]),
+        "fps": int(row["fps"]),
+        "img0": int(row["img0"]),
+        "img1": int(row["img1"]),
+        "img2": int(row["img2"]),
+        "source": str(args.oracle_effective_time_source),
+        "epsilon": float(args.oracle_effective_time_epsilon),
+        "min_motion": float(args.oracle_effective_time_min_motion),
+        "invalid_flow_scale": float(args.oracle_effective_time_invalid_flow_scale),
+        "dtype": str(args.oracle_effective_time_cache_dtype),
+    }
+    serialized = json.dumps(key_payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
 
 
-def combine_oracle_t_eff(
-    embt: Any,
-    reference_flow: Any,
-    fmv_t_eff: Any,
-    fmv_valid: Any,
-    bmv_t_eff: Any,
-    bmv_valid: Any,
+def build_oracle_cache_path(cache_dir: Path, args: argparse.Namespace, row: Any) -> Path:
+    return cache_dir / f"{build_oracle_cache_key(args, row)}.npy"
+
+
+def build_modality_path(
+    dataset_root_dir: Path,
+    record: str,
+    mode: str,
+    frame_idx: int,
+    modality_name: str,
+) -> Path:
+    modality_spec = DEFAULT_MODALITY_CONFIG[modality_name]
+    base_dir = dataset_root_dir / record / mode
+    subdir = str(modality_spec.get("subdir", ""))
+    if subdir != "":
+        base_dir = base_dir / subdir
+
+    filename = f"{modality_spec['prefix']}{frame_idx}{modality_spec['ext']}"
+    return base_dir / filename
+
+
+def load_motion_for_oracle_cache(row: Any, dataset_root_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    frame_30_0_idx = int(row["img0"]) // 2
+    frame_30_1_idx = int(row["img2"]) // 2
+    frame_60_1_idx = int(row["img1"])
+    record = str(row["record"])
+    mode = str(row["mode"])
+    mode_30 = mode.replace("fps_60", "fps_30")
+
+    bmv_60_path = build_modality_path(dataset_root_dir, record, mode, frame_60_1_idx, "backwardVel_Depth")
+    fmv_60_path = build_modality_path(dataset_root_dir, record, mode, frame_60_1_idx, "forwardVel_Depth")
+    bmv_30_path = build_modality_path(dataset_root_dir, record, mode_30, frame_30_1_idx, "backwardVel_Depth")
+    fmv_30_path = build_modality_path(dataset_root_dir, record, mode_30, frame_30_0_idx, "forwardVel_Depth")
+    bmv_60, _bmv_60_depth = load_backward_velocity(bmv_60_path)
+    fmv_60, _fmv_60_depth = load_backward_velocity(fmv_60_path)
+    bmv_30, _bmv_30_depth = load_backward_velocity(bmv_30_path)
+    fmv_30, _fmv_30_depth = load_backward_velocity(fmv_30_path)
+    return bmv_60, fmv_60, bmv_30, fmv_30
+
+
+def combine_oracle_t_eff_numpy(
+    fmv_t_eff: np.ndarray,
+    fmv_valid: np.ndarray,
+    bmv_t_eff: np.ndarray,
+    bmv_valid: np.ndarray,
     oracle_effective_time_source: str,
-) -> Any:
-    import torch
-
-    fixed_time = build_fixed_time(embt, reference_flow)
+) -> np.ndarray:
+    fixed_time = np.full_like(fmv_t_eff, 0.5, dtype=np.float32)
     if oracle_effective_time_source == "fmv":
-        return torch.where(fmv_valid, fmv_t_eff, fixed_time)
+        return np.where(fmv_valid, fmv_t_eff, fixed_time).astype(np.float32)
     if oracle_effective_time_source == "bmv":
-        return torch.where(bmv_valid, bmv_t_eff, fixed_time)
+        return np.where(bmv_valid, bmv_t_eff, fixed_time).astype(np.float32)
     if oracle_effective_time_source == "average":
         both_valid = fmv_valid & bmv_valid
         fmv_only = fmv_valid & ~bmv_valid
         bmv_only = bmv_valid & ~fmv_valid
         average_time = 0.5 * (fmv_t_eff + bmv_t_eff)
-        oracle_time = torch.where(both_valid, average_time, fixed_time)
-        oracle_time = torch.where(fmv_only, fmv_t_eff, oracle_time)
-        return torch.where(bmv_only, bmv_t_eff, oracle_time)
+        oracle_time = np.where(both_valid, average_time, fixed_time)
+        oracle_time = np.where(fmv_only, fmv_t_eff, oracle_time)
+        return np.where(bmv_only, bmv_t_eff, oracle_time).astype(np.float32)
 
     raise ValueError(f"Unsupported oracle_effective_time_source={oracle_effective_time_source}")
 
 
-def build_oracle_t_eff(
+def calculate_oracle_t_eff_numpy(
     args: argparse.Namespace,
-    embt: Any,
-    bmv_30: Any,
-    fmv_30: Any,
-    bmv_60: Any,
-    fmv_60: Any,
-) -> Any:
-    bmv_scale = projection_scale(
+    bmv_30: np.ndarray,
+    fmv_30: np.ndarray,
+    bmv_60: np.ndarray,
+    fmv_60: np.ndarray,
+) -> np.ndarray:
+    bmv_scale = projection_scale_numpy(
         endpoint_flow=bmv_30,
         target_flow=bmv_60,
         epsilon=args.oracle_effective_time_epsilon,
         min_motion=args.oracle_effective_time_min_motion,
         invalid_flow_scale=args.oracle_effective_time_invalid_flow_scale,
     )
-    fmv_scale = projection_scale(
+    fmv_scale = projection_scale_numpy(
         endpoint_flow=fmv_30,
         target_flow=fmv_60,
         epsilon=args.oracle_effective_time_epsilon,
@@ -227,15 +314,190 @@ def build_oracle_t_eff(
     )
     fmv_t_eff = fmv_scale.scale
     bmv_t_eff = 1.0 - bmv_scale.scale
-    return combine_oracle_t_eff(
-        embt=embt,
-        reference_flow=fmv_30,
+    return combine_oracle_t_eff_numpy(
         fmv_t_eff=fmv_t_eff,
         fmv_valid=fmv_scale.valid,
         bmv_t_eff=bmv_t_eff,
         bmv_valid=bmv_scale.valid,
         oracle_effective_time_source=args.oracle_effective_time_source,
-    ).clamp(0.0, 1.0)
+    ).clip(0.0, 1.0)
+
+
+def save_oracle_t_eff_cache(cache_path: Path, oracle_t_eff: np.ndarray, cache_dtype: str) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    typed_oracle_t_eff = oracle_t_eff.astype(np.float16 if cache_dtype == "float16" else np.float32)
+    temp_path = cache_path.with_suffix(".tmp.npy")
+    np.save(temp_path, typed_oracle_t_eff)
+    temp_path.replace(cache_path)
+
+
+def ensure_oracle_effective_time_cache(
+    dataframe: Any,
+    dataset_root_dir: Path,
+    cache_dir: Path,
+    args: argparse.Namespace,
+    logger: Any,
+    split_name: str,
+) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    written_count = 0
+    skipped_count = 0
+    for row_index in range(len(dataframe)):
+        row = dataframe.iloc[row_index]
+        cache_path = build_oracle_cache_path(cache_dir, args, row)
+        if cache_path.is_file() and not args.rebuild_oracle_effective_time_cache:
+            skipped_count += 1
+            continue
+
+        bmv_60, fmv_60, bmv_30, fmv_30 = load_motion_for_oracle_cache(row, dataset_root_dir)
+        oracle_t_eff = calculate_oracle_t_eff_numpy(
+            args=args,
+            bmv_30=bmv_30,
+            fmv_30=fmv_30,
+            bmv_60=bmv_60,
+            fmv_60=fmv_60,
+        )
+        save_oracle_t_eff_cache(cache_path, oracle_t_eff, args.oracle_effective_time_cache_dtype)
+        written_count += 1
+        if written_count % 100 == 0:
+            logger.info(
+                "oracle_t_eff_cache split=%s written=%s skipped=%s current=%s",
+                split_name,
+                written_count,
+                skipped_count,
+                cache_path,
+            )
+
+    logger.info(
+        "oracle_t_eff_cache_ready split=%s cache_dir=%s written=%s skipped=%s total=%s",
+        split_name,
+        cache_dir,
+        written_count,
+        skipped_count,
+        len(dataframe),
+    )
+
+
+class CachedOracleEffectiveTimeTrainDataset(BaseDataset):
+    def __init__(
+        self,
+        dataframe: Any,
+        dataset_root_dir: str,
+        input_fps: int,
+        augment: bool,
+        include_source_depths: bool,
+        oracle_cache_dir: Path,
+        oracle_args: argparse.Namespace,
+    ) -> None:
+        super().__init__(dataframe, dataset_root_dir, input_fps, DEFAULT_MODALITY_CONFIG, None, None, None)
+        self.augment = augment
+        self.include_source_depths = include_source_depths
+        self.oracle_cache_dir = oracle_cache_dir
+        self.oracle_args = oracle_args
+
+    def __len__(self) -> int:
+        return len(self.dataframe)
+
+    def _load_oracle_t_eff(self, row: Any) -> np.ndarray:
+        cache_path = build_oracle_cache_path(self.oracle_cache_dir, self.oracle_args, row)
+        if not cache_path.is_file():
+            raise FileNotFoundError(
+                f"Missing offline oracle t_eff cache: path={cache_path} "
+                f"record={row['record']} mode={row['mode']} img0={row['img0']} img1={row['img1']} img2={row['img2']}"
+            )
+
+        oracle_t_eff = np.load(cache_path, mmap_mode="r")
+        if oracle_t_eff.ndim == 2:
+            oracle_t_eff = oracle_t_eff[:, :, None]
+        if oracle_t_eff.ndim != 3 or oracle_t_eff.shape[2] != 1:
+            raise ValueError(f"oracle_t_eff cache must have shape [H, W, 1], got {tuple(oracle_t_eff.shape)}")
+        return oracle_t_eff
+
+    def __getitem__(self, index: int) -> tuple[Any, ...]:
+        if self.df_fps == self.input_fps:
+            raise NotImplementedError("CachedOracleEffectiveTimeTrainDataset expects 30fps input against 60fps targets.")
+
+        row = self.dataframe.iloc[index]
+        frame_30_0_idx = int(row["img0"]) // 2
+        frame_30_1_idx = int(row["img2"]) // 2
+        frame_60_0_idx = int(row["img0"])
+        frame_60_1_idx = int(row["img1"])
+        frame_60_2_idx = int(row["img2"])
+        record = str(row["record"])
+        mode = str(row["mode"])
+        mode_30 = mode.replace("fps_60", "fps_30")
+
+        info = {
+            "record_name": f"{record}_{mode}",
+            "frame_range": f"frame_{frame_60_0_idx:04d}_{frame_60_2_idx:04d}",
+            "valid": bool(row["valid"]) if "valid" in row.index else True,
+            "distance_indexing": build_distance_indexing(row),
+        }
+
+        img_60_0_path = self._build_modality_path(record, mode, frame_60_0_idx, "colorNoScreenUI")
+        img_60_1_path = self._build_modality_path(record, mode, frame_60_1_idx, "colorNoScreenUI")
+        img_60_2_path = self._build_modality_path(record, mode, frame_60_2_idx, "colorNoScreenUI")
+        bmv_60_path = self._build_modality_path(record, mode, frame_60_1_idx, "backwardVel_Depth")
+        fmv_60_path = self._build_modality_path(record, mode, frame_60_1_idx, "forwardVel_Depth")
+        bmv_30_path = self._build_modality_path(record, mode_30, frame_30_1_idx, "backwardVel_Depth")
+        fmv_30_path = self._build_modality_path(record, mode_30, frame_30_0_idx, "forwardVel_Depth")
+
+        img0 = self._load_image(img_60_0_path)
+        imgt = self._load_image(img_60_1_path)
+        img1 = self._load_image(img_60_2_path)
+        bmv_60 = self._load_game_motion(bmv_60_path)
+        fmv_60 = self._load_game_motion(fmv_60_path)
+        oracle_t_eff = self._load_oracle_t_eff(row)
+        if self.include_source_depths:
+            bmv_30, source_depth1 = self._load_game_motion_and_depth(bmv_30_path)
+            fmv_30, source_depth0 = self._load_game_motion_and_depth(fmv_30_path)
+        else:
+            bmv_30 = self._load_game_motion(bmv_30_path)
+            fmv_30 = self._load_game_motion(fmv_30_path)
+            source_depth0 = None
+            source_depth1 = None
+
+        if self.augment:
+            flow_fields = (bmv_60, fmv_60, bmv_30, fmv_30, oracle_t_eff)
+            if self.include_source_depths:
+                flow_fields = (bmv_60, fmv_60, bmv_30, fmv_30, oracle_t_eff, source_depth0, source_depth1)
+
+            img0, imgt, img1, flow_fields = shared_random_crop(img0, imgt, img1, flow_fields, (224, 224))
+            img0, imgt, img1 = shared_random_reverse_channel(img0, imgt, img1, 0.5)
+            img0, imgt, img1, flow_fields = shared_random_vertical_flip(img0, imgt, img1, flow_fields, 0.3)
+            img0, imgt, img1, flow_fields = shared_random_horizontal_flip(img0, imgt, img1, flow_fields, 0.5)
+            img0, imgt, img1, flow_fields = shared_random_rotate(img0, imgt, img1, flow_fields, 0.05)
+            if self.include_source_depths:
+                bmv_60, fmv_60, bmv_30, fmv_30, oracle_t_eff, source_depth0, source_depth1 = flow_fields
+            else:
+                bmv_60, fmv_60, bmv_30, fmv_30, oracle_t_eff = flow_fields
+
+        img0_tensor = image_to_tensor(img0)
+        imgt_tensor = image_to_tensor(imgt)
+        img1_tensor = image_to_tensor(img1)
+        bmv_60_tensor = flow_to_tensor(bmv_60)
+        fmv_60_tensor = flow_to_tensor(fmv_60)
+        bmv_30_tensor = flow_to_tensor(bmv_30)
+        fmv_30_tensor = flow_to_tensor(fmv_30)
+        oracle_t_eff_tensor = depth_to_tensor(oracle_t_eff)
+        embt_tensor = build_embedding_tensor()
+
+        if self.include_source_depths:
+            info["source_depth0"] = depth_to_tensor(source_depth0)
+            info["source_depth1"] = depth_to_tensor(source_depth1)
+
+        return (
+            img0_tensor,
+            imgt_tensor,
+            img1_tensor,
+            bmv_60_tensor,
+            fmv_60_tensor,
+            bmv_30_tensor,
+            fmv_30_tensor,
+            oracle_t_eff_tensor,
+            embt_tensor,
+            info,
+        )
 
 
 def build_oracle_t_eff_stats(oracle_t_eff: Any) -> dict[str, list[float]]:
@@ -254,7 +516,7 @@ def run_oracle_training_batch(
     batch: Any,
     device: Any,
 ) -> OracleBatchStepOutput:
-    img0, imgt, img1, bmv_60, fmv_60, bmv_30, fmv_30, embt, info = batch
+    img0, imgt, img1, bmv_60, fmv_60, bmv_30, fmv_30, oracle_t_eff, embt, info = batch
     img0 = img0.to(device)
     imgt = imgt.to(device)
     img1 = img1.to(device)
@@ -262,6 +524,7 @@ def run_oracle_training_batch(
     fmv_60 = fmv_60.to(device)
     bmv_30 = bmv_30.to(device)
     fmv_30 = fmv_30.to(device)
+    oracle_t_eff = oracle_t_eff.to(device)
     embt = embt.to(device)
 
     source_depth0 = None
@@ -270,14 +533,6 @@ def run_oracle_training_batch(
         source_depth0 = info["source_depth0"].to(device)
         source_depth1 = info["source_depth1"].to(device)
 
-    oracle_t_eff = build_oracle_t_eff(
-        args=args,
-        embt=embt,
-        bmv_30=bmv_30,
-        fmv_30=fmv_30,
-        bmv_60=bmv_60,
-        fmv_60=fmv_60,
-    )
     flow_init = build_flow_init_result_with_fill_strategy(
         fmv_30=fmv_30,
         bmv_30=bmv_30,
@@ -533,6 +788,9 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
         "oracle_effective_time_epsilon": args.oracle_effective_time_epsilon,
         "oracle_effective_time_min_motion": args.oracle_effective_time_min_motion,
         "oracle_effective_time_invalid_flow_scale": args.oracle_effective_time_invalid_flow_scale,
+        "oracle_effective_time_cache_dir": args.oracle_effective_time_cache_dir,
+        "oracle_effective_time_cache_dtype": args.oracle_effective_time_cache_dtype,
+        "rebuild_oracle_effective_time_cache": args.rebuild_oracle_effective_time_cache,
         "pretrained_checkpoint_path": args.pretrained_checkpoint_path,
         "resume_path": args.resume_path,
         "metrics": dict(args.metric_config),
@@ -561,6 +819,12 @@ def run_training(args: argparse.Namespace) -> None:
         args.oracle_effective_time_min_motion,
         args.oracle_effective_time_invalid_flow_scale,
     )
+    logger.info(
+        "oracle_effective_time_cache_dir=%s oracle_effective_time_cache_dtype=%s rebuild_oracle_effective_time_cache=%s",
+        args.oracle_effective_time_cache_dir,
+        args.oracle_effective_time_cache_dtype,
+        args.rebuild_oracle_effective_time_cache,
+    )
 
     root_dir = Path(args.root_dir)
     train_df = build_merged_dataframe(root_dir, checkpoints_dir, args.train_preset, args.only_fps, logger)
@@ -573,21 +837,42 @@ def run_training(args: argparse.Namespace) -> None:
         logger.info("Valid Count %s in %s", test_df["valid"].value_counts().to_dict(), args.test_preset)
         test_df = test_df[test_df["valid"] == True]
 
-    train_dataset = build_training_dataset(
+    oracle_cache_dir = Path(args.oracle_effective_time_cache_dir)
+    ensure_oracle_effective_time_cache(
         train_df,
-        args.dataset_root_dir,
-        True,
-        args.input_fps,
-        args.model_name,
-        args.flow_approx_method,
+        Path(args.dataset_root_dir),
+        oracle_cache_dir,
+        args,
+        logger,
+        "train",
     )
-    test_dataset = build_training_dataset(
+    ensure_oracle_effective_time_cache(
         test_df,
+        Path(args.dataset_root_dir),
+        oracle_cache_dir,
+        args,
+        logger,
+        "test",
+    )
+
+    include_source_depths = is_splatting_flow_approx_method(flow_approx_method=args.flow_approx_method)
+    train_dataset = CachedOracleEffectiveTimeTrainDataset(
+        train_df.reset_index(drop=True),
         args.dataset_root_dir,
-        False,
         args.input_fps,
-        args.model_name,
-        args.flow_approx_method,
+        True,
+        include_source_depths,
+        oracle_cache_dir,
+        args,
+    )
+    test_dataset = CachedOracleEffectiveTimeTrainDataset(
+        test_df.reset_index(drop=True),
+        args.dataset_root_dir,
+        args.input_fps,
+        False,
+        include_source_depths,
+        oracle_cache_dir,
+        args,
     )
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
