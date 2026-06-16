@@ -5,8 +5,8 @@
         "init_flow_layer": 1
   },
   "flow_approx_method": "splatting",
-  "splatting_fill_strategy": "outside_in_8neighbor",
-  "init_flow_downscale_strategy": "masked_area",
+  "splatting_fill_strategy": "outside_in_4direction",
+  "init_flow_downscale_strategy": "bilinear",
   "init_flow_mask_epsilon": 1.0e-6,
   "root_dir": "data/Minor_0507/",
   "dataset_root_dir": "/workspace/datasets/Minor_0507/",
@@ -14,8 +14,8 @@
     "train_minor_0507",
     "test_minor_0507"
   ],
-  "checkpoint_path": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_8Neighbor_Minor_0605/checkpoints/best.pth",
-  "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_8Neighbor_Minor_0605/",
+  "checkpoint_path": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_Minor_0611_OracleTime/checkpoints/best.pth",
+  "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_Minor_0611_OracleTime/",
   "seed": 1234,
   "batch_size": 1,
   "only_fps": 60,

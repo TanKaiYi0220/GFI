@@ -35,13 +35,13 @@ from src.data.preprocess import remove_identical_frames
 from src.utils.io import ensure_directory
 
 
-DATASET_PRESET_NAME: str = "train_minor_0507"
-TEST_DATASET_PRESET_NAME: str = "test_minor_0507"
+DATASET_PRESET_NAME: str = "train_vfx_0416"
+TEST_DATASET_PRESET_NAME: str = "test_vfx_0416"
 DATASET_ROOT_DIR_OVERRIDE: str | None = None
 PATHS_CONFIG_PATH: str | None = None
-DATA_DIR: str = "./data/Minor_0507/"
-# MERGE_STRATEGY: str = "only-difficult"
-MERGE_STRATEGY: str = "ignore-easy"
+DATA_DIR: str = "./data/"
+MERGE_STRATEGY: str = "only-difficult"
+# MERGE_STRATEGY: str = "ignore-easy"
 ONLY_FPS: int = 60
 
 DRY_RUN: bool = False
