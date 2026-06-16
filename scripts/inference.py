@@ -56,6 +56,7 @@ INIT_FLOW_DOWNSCALE_STRATEGIES: tuple[str, ...] = ("bilinear", "masked_area")
 
 InferenceBatchResult = dict[str, Any]
 SplattingRegionMaps = dict[str, Any]
+EffectiveTimeStats = dict[str, list[float]]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -201,6 +202,31 @@ def build_splatting_region_maps(
         "many_to_one_any": many_to_one_any,
         "bmv_hit_count": bmv_hit_count,
         "fmv_hit_count": fmv_hit_count,
+    }
+
+
+def build_effective_time_stats(effective_time: Any | None, batch_size: int) -> EffectiveTimeStats:
+    if effective_time is None:
+        missing_values = [-1.0 for _index in range(batch_size)]
+        return {
+            "pred_t_eff_mean": missing_values,
+            "pred_t_eff_std": missing_values,
+            "pred_t_eff_min": missing_values,
+            "pred_t_eff_max": missing_values,
+        }
+
+    flat_effective_time = effective_time.detach().float().flatten(start_dim=1)
+    if int(flat_effective_time.shape[0]) != batch_size:
+        raise ValueError(
+            f"effective_time batch size must match inference batch size, got "
+            f"{int(flat_effective_time.shape[0])} and {batch_size}"
+        )
+
+    return {
+        "pred_t_eff_mean": [float(value) for value in flat_effective_time.mean(dim=1).cpu().tolist()],
+        "pred_t_eff_std": [float(value) for value in flat_effective_time.std(dim=1, unbiased=False).cpu().tolist()],
+        "pred_t_eff_min": [float(value) for value in flat_effective_time.min(dim=1).values.cpu().tolist()],
+        "pred_t_eff_max": [float(value) for value in flat_effective_time.max(dim=1).values.cpu().tolist()],
     }
 
 
@@ -370,6 +396,7 @@ def run_inference_batch_with_fill_strategy(
         return {
             "bmv": bmv,
             "embt": embt,
+            "effective_time": None,
             "fmv": fmv,
             "img0": img0,
             "img1": img1,
@@ -449,6 +476,7 @@ def run_inference_batch_with_fill_strategy(
         return {
             "bmv": bmv,
             "embt": embt,
+            "effective_time": effective_time,
             "fmv": fmv,
             "img0": img0,
             "img1": img1,
@@ -483,6 +511,7 @@ def run_inference_batch_with_fill_strategy(
         return {
             "bmv": bmv,
             "embt": embt,
+            "effective_time": None,
             "fmv": fmv,
             "img0": img0,
             "img1": img1,
@@ -884,6 +913,10 @@ def main(argv: list[str] | None = None) -> None:
                 up_flow0_1 = inference_result["up_flow0_1"]
                 up_flow1_1 = inference_result["up_flow1_1"]
                 batch_metric_values = calculate_batch_metrics(imgt.detach(), imgt_pred.detach(), metric_config, lpips_model)
+                effective_time_stats = build_effective_time_stats(
+                    inference_result.get("effective_time"),
+                    int(imgt_pred.shape[0]),
+                )
 
                 for batch_index in range(int(imgt_pred.shape[0])):
                     row = group_dataframe.iloc[sample_offset + batch_index]
@@ -927,6 +960,10 @@ def main(argv: list[str] | None = None) -> None:
                             "distance_index_mean": float(row["D_index Mean"]) if "D_index Mean" in row.index else -1.0,
                             "distance_index_median": float(row["D_index Median"]) if "D_index Median" in row.index else -1.0,
                             **sample_metric_values,
+                            "pred_t_eff_mean": effective_time_stats["pred_t_eff_mean"][batch_index],
+                            "pred_t_eff_std": effective_time_stats["pred_t_eff_std"][batch_index],
+                            "pred_t_eff_min": effective_time_stats["pred_t_eff_min"][batch_index],
+                            "pred_t_eff_max": effective_time_stats["pred_t_eff_max"][batch_index],
                             "flow_diff_1_to_0_mean": diff_1_to_0["diff_mag_mean"],
                             "flow_diff_1_to_0_max": diff_1_to_0["diff_mag_max"],
                             "flow_diff_1_to_0_changed_ratio": diff_1_to_0["diff_changed_ratio"],
