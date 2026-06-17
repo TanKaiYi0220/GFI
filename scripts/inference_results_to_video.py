@@ -326,6 +326,7 @@ def main(argv: list[str] | None = None) -> None:
                     input_fps,
                     False,
                     include_source_depths,
+                    False,
                 )
 
             loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)

@@ -19,6 +19,9 @@ from experiments.scratch.split_motion_psnr_buckets import KEY_COLUMNS
 DEFAULT_BASELINE_LABELED_CSV: Path = Path(
     r"C:\Users\User\Desktop\CGVLab\GFI\code\GFI\analysis_outputs\baseline_finetuning_motion_psnr\buckets\bucketed_samples.csv",
 )
+DEFAULT_BASELINE_JOINED_CSV: Path = Path(
+    r"C:\Users\User\Desktop\CGVLab\GFI\code\GFI\analysis_outputs\baseline_finetuning_motion_psnr\motion_psnr_joined.csv",
+)
 DEFAULT_CANDIDATE_CSV: Path = Path(
     r"C:\Users\User\Desktop\CGVLab\GFI\Meeting-2026\20260618 - Lab Meeting\DGX_inference_outputs\IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_MaskedArea_0611\motion_psnr_analysis\motion_psnr_joined.csv",
 )
@@ -59,6 +62,14 @@ DISPLAY_LABELS: dict[str, str] = {
     "other_artifacts": "other\nartifacts",
     "large_motion_high_psnr": "large motion\nhigh psnr",
 }
+BASELINE_METRIC_RENAME_MAP: dict[str, str] = {
+    "ssim": "baseline_ssim",
+    "lpips": "baseline_lpips",
+}
+CANDIDATE_METRIC_RENAME_MAP: dict[str, str] = {
+    "ssim": "candidate_ssim",
+    "lpips": "candidate_lpips",
+}
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -70,6 +81,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         type=Path,
         default=DEFAULT_BASELINE_LABELED_CSV,
         help="Path to baseline bucketed_samples.csv.",
+    )
+    parser.add_argument(
+        "--baseline-joined-csv",
+        type=Path,
+        default=DEFAULT_BASELINE_JOINED_CSV,
+        help="Path to baseline motion_psnr_joined.csv for optional SSIM/LPIPS columns.",
     )
     parser.add_argument(
         "--candidate-csv",
@@ -159,6 +176,35 @@ def build_baseline_frame(
     return baseline
 
 
+def build_metric_sidecar_frame(
+    dataframe: pd.DataFrame,
+    rename_map: dict[str, str],
+    label: str,
+) -> pd.DataFrame:
+    require_columns(dataframe=dataframe, required_columns=KEY_COLUMNS, label=label)
+    available_columns = [column for column in rename_map if column in dataframe.columns]
+    if len(available_columns) == 0:
+        return pd.DataFrame(columns=[*KEY_COLUMNS, *rename_map.values()])
+
+    metric_frame = dataframe[[*KEY_COLUMNS, *available_columns]].copy()
+    duplicate_mask = metric_frame.duplicated(subset=list(KEY_COLUMNS), keep=False)
+    if bool(duplicate_mask.any()):
+        duplicate_count = int(duplicate_mask.sum())
+        raise ValueError(f"{label} has duplicate key rows: {duplicate_count}")
+    return metric_frame.rename(columns={column: rename_map[column] for column in available_columns})
+
+
+def merge_baseline_metric_sidecar(
+    baseline: pd.DataFrame,
+    baseline_metrics: pd.DataFrame,
+) -> pd.DataFrame:
+    merged = baseline.merge(baseline_metrics, on=list(KEY_COLUMNS), how="left")
+    for metric_column in BASELINE_METRIC_RENAME_MAP.values():
+        if metric_column not in merged.columns:
+            merged[metric_column] = pd.NA
+    return merged
+
+
 def extract_thresholds(dataframe: pd.DataFrame) -> tuple[float | None, float | None]:
     motion_threshold = None
     psnr_threshold = None
@@ -189,11 +235,13 @@ def build_candidate_frame(dataframe: pd.DataFrame, candidate_psnr_column: str) -
         required_columns=[*KEY_COLUMNS, candidate_psnr_column, MOTION_COLUMN],
         label="candidate CSV",
     )
-    candidate = dataframe[[*KEY_COLUMNS, candidate_psnr_column, MOTION_COLUMN]].copy()
+    available_metric_columns = [column for column in CANDIDATE_METRIC_RENAME_MAP if column in dataframe.columns]
+    candidate = dataframe[[*KEY_COLUMNS, candidate_psnr_column, MOTION_COLUMN, *available_metric_columns]].copy()
     candidate = candidate.rename(
         columns={
             candidate_psnr_column: "candidate_psnr",
             MOTION_COLUMN: CANDIDATE_MOTION_COLUMN,
+            **{column: CANDIDATE_METRIC_RENAME_MAP[column] for column in available_metric_columns},
         }
     )
     duplicate_mask = candidate.duplicated(subset=list(KEY_COLUMNS), keep=False)
@@ -265,12 +313,26 @@ def build_improvement_flags(
             "delta_psnr",
             "baseline_psnr",
             "candidate_psnr",
+            *[
+                column
+                for column in (
+                    "baseline_ssim",
+                    "candidate_ssim",
+                    "baseline_lpips",
+                    "candidate_lpips",
+                )
+                if column in merged.columns
+            ],
             MOTION_COLUMN,
             ORACLE_FMV_T_EFF_COLUMN,
             ORACLE_BMV_T_EFF_COLUMN,
             ORACLE_T_EFF_GAP_COLUMN,
         ]
     ].copy()
+    if "baseline_ssim" in flags.columns and "candidate_ssim" in flags.columns:
+        flags["delta_ssim"] = flags["candidate_ssim"] - flags["baseline_ssim"]
+    if "baseline_lpips" in flags.columns and "candidate_lpips" in flags.columns:
+        flags["delta_lpips"] = flags["candidate_lpips"] - flags["baseline_lpips"]
     flags["baseline_motion_label"] = flags["baseline_label"]
     flags["baseline_oracle_fmv_t_eff_label"] = oracle_fmv_label.astype(bool)
     if psnr_threshold is None:
@@ -291,6 +353,18 @@ def build_improvement_flags(
         "delta_psnr",
         "baseline_psnr",
         "candidate_psnr",
+        *[
+            column
+            for column in (
+                "baseline_ssim",
+                "candidate_ssim",
+                "delta_ssim",
+                "baseline_lpips",
+                "candidate_lpips",
+                "delta_lpips",
+            )
+            if column in flags.columns
+        ],
         MOTION_COLUMN,
         ORACLE_FMV_T_EFF_COLUMN,
         ORACLE_BMV_T_EFF_COLUMN,
@@ -347,7 +421,7 @@ def write_plot(merged: pd.DataFrame, summary: pd.DataFrame, candidate_name: str,
     boxplot = boxplot_axis.boxplot(
         boxplot_data,
         patch_artist=True,
-        tick_labels=[DISPLAY_LABELS[bucket_name] for bucket_name in BUCKET_ORDER],
+        labels=[DISPLAY_LABELS[bucket_name] for bucket_name in BUCKET_ORDER],
     )
     for patch, bucket_name in zip(boxplot["boxes"], BUCKET_ORDER):
         patch.set_facecolor(BUCKET_COLORS[bucket_name])
@@ -586,6 +660,7 @@ def write_oracle_distribution_by_baseline_label(
 
 def run(args: argparse.Namespace) -> None:
     baseline_dataframe = load_csv(args.baseline_labeled_csv, "baseline labeled CSV")
+    baseline_joined_dataframe = load_csv(args.baseline_joined_csv, "baseline joined CSV")
     candidate_dataframe = load_csv(args.candidate_csv, "candidate CSV")
     motion_threshold, psnr_threshold = extract_thresholds(baseline_dataframe)
     oracle_left_threshold, oracle_right_threshold = load_oracle_thresholds(args.oracle_thresholds_csv)
@@ -593,6 +668,15 @@ def run(args: argparse.Namespace) -> None:
         dataframe=baseline_dataframe,
         baseline_psnr_column=args.baseline_psnr_column,
         baseline_label_column=args.baseline_label_column,
+    )
+    baseline_metric_sidecar = build_metric_sidecar_frame(
+        dataframe=baseline_joined_dataframe,
+        rename_map=BASELINE_METRIC_RENAME_MAP,
+        label="baseline joined CSV",
+    )
+    baseline = merge_baseline_metric_sidecar(
+        baseline=baseline,
+        baseline_metrics=baseline_metric_sidecar,
     )
     candidate = build_candidate_frame(
         dataframe=candidate_dataframe,

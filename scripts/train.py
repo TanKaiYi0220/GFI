@@ -19,6 +19,8 @@ from src.data.dataset_config import ACTIVE_DATASET_ROOT_KEY
 from src.data.dataset_config import get_dataset_preset
 from src.data.dataset_config import iter_dataset_configs
 from src.data.dataset_config import list_dataset_presets
+from src.data.preprocess import ORACLE_FMV_T_EFF_MEAN_COLUMN
+from src.data.preprocess import ORACLE_FMV_VALID_RATIO_COLUMN
 from src.engine.evaluation import AverageMeter
 from src.engine.evaluation import average_metric_values
 from src.engine.evaluation import build_lpips_model
@@ -73,6 +75,7 @@ class BatchStepOutput:
     loss_rec: Any
     loss_geo: Any
     loss_dis: Any
+    loss_t_eff: Any
 
 
 def uses_flow_approx_model(model_name: str) -> bool:
@@ -81,6 +84,10 @@ def uses_flow_approx_model(model_name: str) -> bool:
 
 def uses_effective_time_mode(effective_time_mode: str) -> bool:
     return effective_time_mode in ("manual", "learnable")
+
+
+def uses_oracle_effective_time_supervision(args: argparse.Namespace) -> bool:
+    return float(args.oracle_effective_time_loss_weight) > 0.0
 
 
 def read_raw_model_init_args(config_values: dict[str, Any]) -> dict[str, Any]:
@@ -240,13 +247,14 @@ def forward_model(
     source_depth1: Any | None,
     ground_truth_bmv: Any | None,
     ground_truth_fmv: Any | None,
-) -> Any:
+) -> tuple[Any, Any | None]:
     import torch
 
     init_bmv = source_bmv
     init_fmv = source_fmv
     init_bmv_mask = None
     init_fmv_mask = None
+    effective_time = None
 
     if uses_flow_approx_model(model_name):
         effective_time = build_effective_time_map(
@@ -285,18 +293,21 @@ def forward_model(
 
     if model_name == "IFRNet":
         flow = torch.cat([init_bmv, init_fmv], dim=1).float()
-        return model(img0, img1, embt, imgt, flow)
+        return model(img0, img1, embt, imgt, flow), effective_time
 
-    return model(
-        img0,
-        img1,
-        embt,
-        imgt,
-        init_flow0=init_bmv,
-        init_flow1=init_fmv,
-        init_flow0_mask=init_bmv_mask,
-        init_flow1_mask=init_fmv_mask,
-        init_flow_mask_epsilon=init_flow_mask_epsilon,
+    return (
+        model(
+            img0,
+            img1,
+            embt,
+            imgt,
+            init_flow0=init_bmv,
+            init_flow1=init_fmv,
+            init_flow0_mask=init_bmv_mask,
+            init_flow1_mask=init_fmv_mask,
+            init_flow_mask_epsilon=init_flow_mask_epsilon,
+        ),
+        effective_time,
     )
 
 
@@ -304,12 +315,14 @@ def build_loss_record(
     loss_rec: Any,
     loss_geo: Any,
     loss_dis: Any,
+    loss_t_eff: Any,
     total_loss: Any,
 ) -> dict[str, float]:
     return {
         "loss_rec": float(loss_rec.detach().cpu()),
         "loss_geo": float(loss_geo.detach().cpu()),
         "loss_dis": float(loss_dis.detach().cpu()),
+        "loss_t_eff": float(loss_t_eff.detach().cpu()),
         "loss_total": float(total_loss.detach().cpu()),
     }
 
@@ -343,7 +356,7 @@ def append_batch_metric_records(
 
 
 def build_record_name_summary(dataframe: Any, metric_config: dict[str, object]) -> Any:
-    summary_columns = [*get_enabled_metric_names(metric_config), "loss_rec", "loss_geo", "loss_dis", "loss_total"]
+    summary_columns = [*get_enabled_metric_names(metric_config), "loss_rec", "loss_geo", "loss_dis", "loss_t_eff", "loss_total"]
     return (
         dataframe.groupby(["record_name"], as_index=False)[summary_columns]
         .mean()
@@ -379,6 +392,7 @@ def build_training_dataset(
     input_fps: int,
     model_name: str,
     flow_approx_method: str,
+    include_oracle_effective_time: bool,
 ) -> Any:
     normalized_dataframe = dataframe.reset_index(drop=True)
 
@@ -386,7 +400,14 @@ def build_training_dataset(
         from src.data.dataset_loader import FlowEstimationTrainDataset
 
         include_source_depths = is_splatting_flow_approx_method(flow_approx_method=flow_approx_method)
-        return FlowEstimationTrainDataset(normalized_dataframe, dataset_root_dir, input_fps, augment, include_source_depths)
+        return FlowEstimationTrainDataset(
+            normalized_dataframe,
+            dataset_root_dir,
+            input_fps,
+            augment,
+            include_source_depths,
+            include_oracle_effective_time,
+        )
 
     from src.data.dataset_loader import VFITrainDataset
 
@@ -449,6 +470,7 @@ def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: 
                 args.input_fps,
                 args.model_name,
                 args.flow_approx_method,
+                uses_oracle_effective_time_supervision(args),
             )
             for frame_key, batch in zip(frame_keys, DataLoader(sample_dataset, batch_size=1, shuffle=False)):
                 save_dir = Path(args.output_dir) / "samples" / split_name / frame_key / f"epoch_{epoch + 1:04d}"
@@ -482,6 +504,9 @@ def run_training_batch(
     batch: Any,
     device: Any,
 ) -> BatchStepOutput:
+    import torch
+    import torch.nn.functional as functional
+
     if uses_flow_approx_model(args.model_name):
         img0, imgt, img1, bmv_60, fmv_60, bmv_30, fmv_30, embt, info = batch
         source_bmv = bmv_30.to(device)
@@ -508,7 +533,7 @@ def run_training_batch(
     imgt = imgt.to(device)
     embt = embt.to(device)
 
-    model_output = forward_model(
+    model_output, effective_time = forward_model(
         args.model_name,
         model,
         img0,
@@ -529,6 +554,43 @@ def run_training_batch(
         ground_truth_fmv,
     )
     imgt_pred, loss_rec, loss_geo, loss_dis, _up_flow0_1, _up_flow1_1, _up_mask_1 = model_output
+    loss_t_eff = torch.zeros((), device=device)
+    if uses_oracle_effective_time_supervision(args):
+        if effective_time is None:
+            raise RuntimeError("oracle_effective_time_loss_weight requires a predicted effective_time map.")
+        if ORACLE_FMV_T_EFF_MEAN_COLUMN not in info:
+            raise KeyError(
+                f"Missing oracle supervision column '{ORACLE_FMV_T_EFF_MEAN_COLUMN}' in training batch info. "
+                "Please rerun preprocess_dataset.py with ORACLE_EFFECTIVE_TIME enabled."
+            )
+        if ORACLE_FMV_VALID_RATIO_COLUMN not in info:
+            raise KeyError(
+                f"Missing oracle supervision column '{ORACLE_FMV_VALID_RATIO_COLUMN}' in training batch info. "
+                "Please rerun preprocess_dataset.py with ORACLE_EFFECTIVE_TIME enabled."
+            )
+
+        predicted_mean = effective_time.mean(dim=(1, 2, 3))
+        oracle_mean = torch.as_tensor(
+            info[ORACLE_FMV_T_EFF_MEAN_COLUMN],
+            device=device,
+            dtype=predicted_mean.dtype,
+        ).reshape(-1)
+        oracle_valid_ratio = torch.as_tensor(
+            info[ORACLE_FMV_VALID_RATIO_COLUMN],
+            device=device,
+            dtype=predicted_mean.dtype,
+        ).reshape(-1)
+        valid_mask = (
+            torch.isfinite(oracle_mean)
+            & torch.isfinite(oracle_valid_ratio)
+            & (oracle_mean >= 0.0)
+            & (oracle_mean <= 1.0)
+            & (oracle_valid_ratio >= args.oracle_effective_time_min_valid_ratio)
+        )
+        if bool(valid_mask.any().detach().cpu().item()):
+            oracle_loss = functional.l1_loss(predicted_mean[valid_mask], oracle_mean[valid_mask])
+            loss_t_eff = args.oracle_effective_time_loss_weight * oracle_loss
+
     return BatchStepOutput(
         imgt=imgt,
         imgt_pred=imgt_pred,
@@ -536,6 +598,7 @@ def run_training_batch(
         loss_rec=loss_rec,
         loss_geo=loss_geo,
         loss_dis=loss_dis,
+        loss_t_eff=loss_t_eff,
     )
 
 
@@ -558,11 +621,12 @@ def evaluate(
         pbar = tqdm(loader, desc="Evaluating")
         for batch in pbar:
             batch_output = run_training_batch(args, model, batch, device)
-            total_loss = batch_output.loss_rec + batch_output.loss_geo + batch_output.loss_dis
+            total_loss = batch_output.loss_rec + batch_output.loss_geo + batch_output.loss_dis + batch_output.loss_t_eff
             loss_record = build_loss_record(
                 batch_output.loss_rec,
                 batch_output.loss_geo,
                 batch_output.loss_dis,
+                batch_output.loss_t_eff,
                 total_loss,
             )
             append_batch_metric_records(
@@ -608,6 +672,7 @@ def train(
         train_loss_rec_meter = AverageMeter()
         train_loss_geo_meter = AverageMeter()
         train_loss_dis_meter = AverageMeter()
+        train_loss_t_eff_meter = AverageMeter()
         train_records: list[dict[str, object]] = []
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
 
@@ -617,7 +682,7 @@ def train(
             optimizer.zero_grad()
 
             batch_output = run_training_batch(args, model, batch, device)
-            total_loss = batch_output.loss_rec + batch_output.loss_geo + batch_output.loss_dis
+            total_loss = batch_output.loss_rec + batch_output.loss_geo + batch_output.loss_dis + batch_output.loss_t_eff
             total_loss.backward()
             optimizer.step()
 
@@ -626,6 +691,7 @@ def train(
             train_loss_rec_meter.update(float(batch_output.loss_rec.detach().cpu()), batch_size)
             train_loss_geo_meter.update(float(batch_output.loss_geo.detach().cpu()), batch_size)
             train_loss_dis_meter.update(float(batch_output.loss_dis.detach().cpu()), batch_size)
+            train_loss_t_eff_meter.update(float(batch_output.loss_t_eff.detach().cpu()), batch_size)
 
             global_step += 1
             pbar.set_postfix(
@@ -642,6 +708,7 @@ def train(
                 batch_output.loss_rec,
                 batch_output.loss_geo,
                 batch_output.loss_dis,
+                batch_output.loss_t_eff,
                 total_loss,
             )
             append_batch_metric_records(
@@ -661,22 +728,24 @@ def train(
             train_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}.csv", index=False)
             train_record_name_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}_record_name.csv", index=False)
             logger.info(
-                "Epoch %s train_loss_total=%.6f train_loss_rec=%.6f train_loss_geo=%.6f train_loss_dis=%.6f train_metrics=%s",
+                "Epoch %s train_loss_total=%.6f train_loss_rec=%.6f train_loss_geo=%.6f train_loss_dis=%.6f train_loss_t_eff=%.6f train_metrics=%s",
                 epoch + 1,
                 train_loss_total_meter.avg,
                 train_loss_rec_meter.avg,
                 train_loss_geo_meter.avg,
                 train_loss_dis_meter.avg,
+                train_loss_t_eff_meter.avg,
                 format_metric_averages(train_metric_meters),
             )
         else:
             logger.info(
-                "Epoch %s train_loss_total=%.6f train_loss_rec=%.6f train_loss_geo=%.6f train_loss_dis=%.6f",
+                "Epoch %s train_loss_total=%.6f train_loss_rec=%.6f train_loss_geo=%.6f train_loss_dis=%.6f train_loss_t_eff=%.6f",
                 epoch + 1,
                 train_loss_total_meter.avg,
                 train_loss_rec_meter.avg,
                 train_loss_geo_meter.avg,
                 train_loss_dis_meter.avg,
+                train_loss_t_eff_meter.avg,
             )
 
         if (epoch + 1) % args.eval_interval == 0:
@@ -773,6 +842,18 @@ def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.Argument
         type=float,
         help="Maximum learnable residual added around embt before clamping to [0, 1].",
     )
+    parser.add_argument(
+        "--oracle-effective-time-loss-weight",
+        default=config_defaults.get("oracle_effective_time_loss_weight", 0.0),
+        type=float,
+        help="Optional L1 supervision weight on predicted effective-time mean using offline oracle_fmv_t_eff_mean.",
+    )
+    parser.add_argument(
+        "--oracle-effective-time-min-valid-ratio",
+        default=config_defaults.get("oracle_effective_time_min_valid_ratio", 0.1),
+        type=float,
+        help="Minimum oracle_fmv_valid_ratio required before one sample contributes oracle effective-time supervision.",
+    )
     return parser
 
 
@@ -822,6 +903,15 @@ def resolve_effective_init_flow_downscale_strategy(args: argparse.Namespace) -> 
 def validate_flow_approx_runtime_args(args: argparse.Namespace) -> None:
     if args.init_flow_mask_epsilon <= 0:
         raise ValueError(f"init_flow_mask_epsilon must be positive, got {args.init_flow_mask_epsilon}")
+    if args.oracle_effective_time_loss_weight < 0:
+        raise ValueError(
+            f"oracle_effective_time_loss_weight must be non-negative, got {args.oracle_effective_time_loss_weight}"
+        )
+    if args.oracle_effective_time_min_valid_ratio < 0.0 or args.oracle_effective_time_min_valid_ratio > 1.0:
+        raise ValueError(
+            "oracle_effective_time_min_valid_ratio must be in [0, 1], "
+            f"got {args.oracle_effective_time_min_valid_ratio}"
+        )
     validate_effective_time_args(
         effective_time_mode=args.effective_time_mode,
         effective_time_hidden_channels=args.effective_time_hidden_channels,
@@ -838,6 +928,11 @@ def validate_flow_approx_runtime_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 "init_flow_downscale_strategy=masked_area requires a splatting flow approximation method."
             )
+    if uses_oracle_effective_time_supervision(args):
+        if not uses_flow_approx_model(args.model_name):
+            raise ValueError("oracle_effective_time_loss_weight requires model_name=IFRNet_Residual_FlowApprox.")
+        if args.effective_time_mode != "learnable":
+            raise ValueError("oracle_effective_time_loss_weight requires effective_time_mode=learnable.")
 
 
 def log_run_summary(
@@ -995,6 +1090,8 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
         summary["effective_time_mode"] = args.effective_time_mode
         summary["effective_time_hidden_channels"] = args.effective_time_hidden_channels
         summary["effective_time_radius"] = args.effective_time_radius
+        summary["oracle_effective_time_loss_weight"] = args.oracle_effective_time_loss_weight
+        summary["oracle_effective_time_min_valid_ratio"] = args.oracle_effective_time_min_valid_ratio
 
     return summary
 
@@ -1082,6 +1179,7 @@ def run_training(args: argparse.Namespace) -> None:
         args.input_fps,
         args.model_name,
         args.flow_approx_method,
+        uses_oracle_effective_time_supervision(args),
     )
     test_dataset = build_training_dataset(
         test_df,
@@ -1090,6 +1188,7 @@ def run_training(args: argparse.Namespace) -> None:
         args.input_fps,
         args.model_name,
         args.flow_approx_method,
+        uses_oracle_effective_time_supervision(args),
     )
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
@@ -1107,10 +1206,12 @@ def run_training(args: argparse.Namespace) -> None:
     if hasattr(model, "init_flow_layer"):
         logger.info("model_init_flow_layer=%s", model.init_flow_layer)
     logger.info(
-        "effective_time_mode=%s effective_time_hidden_channels=%s effective_time_radius=%s",
+        "effective_time_mode=%s effective_time_hidden_channels=%s effective_time_radius=%s oracle_effective_time_loss_weight=%s oracle_effective_time_min_valid_ratio=%s",
         args.effective_time_mode,
         args.effective_time_hidden_channels,
         args.effective_time_radius,
+        args.oracle_effective_time_loss_weight,
+        args.oracle_effective_time_min_valid_ratio,
     )
     optimizer = optim.AdamW(model.parameters(), lr=args.lr_start, weight_decay=0)
     training_state = load_training_state(args, model, optimizer, device, logger)

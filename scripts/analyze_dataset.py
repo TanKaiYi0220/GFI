@@ -901,6 +901,7 @@ def analyze_dataset(config: AnalysisConfig) -> None:
             input_fps=config.input_fps,
             augment=False,
             include_source_depths=True,
+            include_oracle_effective_time=False,
         )
         loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=False)
         sample_offset = 0

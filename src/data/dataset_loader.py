@@ -20,6 +20,11 @@ from src.data.augment import shared_random_rotate
 from src.data.augment import shared_random_vertical_flip
 from src.data.image_ops import load_backward_velocity
 from src.data.image_ops import load_png
+from src.data.preprocess import ORACLE_BMV_T_EFF_MEAN_COLUMN
+from src.data.preprocess import ORACLE_BMV_VALID_RATIO_COLUMN
+from src.data.preprocess import ORACLE_FMV_T_EFF_MEAN_COLUMN
+from src.data.preprocess import ORACLE_FMV_VALID_RATIO_COLUMN
+from src.data.preprocess import ORACLE_T_EFF_GAP_MEAN_COLUMN
 
 DEFAULT_MODALITY_CONFIG: dict[str, dict[str, str]] = {
     "colorNoScreenUI": {
@@ -47,6 +52,13 @@ DEFAULT_MODALITY_CONFIG: dict[str, dict[str, str]] = {
         "subdir": "",
     },
 }
+ORACLE_EFFECTIVE_TIME_INFO_COLUMNS: tuple[str, ...] = (
+    ORACLE_FMV_T_EFF_MEAN_COLUMN,
+    ORACLE_BMV_T_EFF_MEAN_COLUMN,
+    ORACLE_T_EFF_GAP_MEAN_COLUMN,
+    ORACLE_FMV_VALID_RATIO_COLUMN,
+    ORACLE_BMV_VALID_RATIO_COLUMN,
+)
 
 
 def build_distance_indexing(row: pd.Series) -> list[float]:
@@ -57,6 +69,18 @@ def build_distance_indexing(row: pd.Series) -> list[float]:
 
 def build_embedding_tensor() -> torch.Tensor:
     return torch.tensor([[[0.5]]], dtype=torch.float32)
+
+
+def read_row_float(row: pd.Series, column_name: str) -> float:
+    if column_name not in row.index:
+        raise KeyError(f"Missing required dataframe column '{column_name}'.")
+    return float(row[column_name])
+
+
+def validate_required_columns(dataframe: pd.DataFrame, required_columns: tuple[str, ...]) -> None:
+    missing_columns = [column_name for column_name in required_columns if column_name not in dataframe.columns]
+    if len(missing_columns) > 0:
+        raise KeyError(f"Dataframe is missing required columns: {missing_columns}")
 
 
 def image_to_tensor(image: np.ndarray) -> torch.Tensor:
@@ -277,12 +301,16 @@ class FlowEstimationTrainDataset(BaseDataset):
         input_fps: int,
         augment: bool,
         include_source_depths: bool,
+        include_oracle_effective_time: bool,
         modality_config: dict[str, dict[str, str]] = DEFAULT_MODALITY_CONFIG,
         transform: Any | None = None,
     ) -> None:
         super().__init__(dataframe, dataset_root_dir, input_fps, modality_config, transform, None, None)
         self.augment = augment
         self.include_source_depths = include_source_depths
+        self.include_oracle_effective_time = include_oracle_effective_time
+        if self.include_oracle_effective_time:
+            validate_required_columns(self.dataframe, ORACLE_EFFECTIVE_TIME_INFO_COLUMNS)
         
     def __len__(self) -> int:
         return len(self.dataframe)
@@ -307,6 +335,12 @@ class FlowEstimationTrainDataset(BaseDataset):
             "valid": bool(row["valid"]) if "valid" in row.index else True,
             "distance_indexing": build_distance_indexing(row),
         }
+        if self.include_oracle_effective_time:
+            info[ORACLE_FMV_T_EFF_MEAN_COLUMN] = read_row_float(row, ORACLE_FMV_T_EFF_MEAN_COLUMN)
+            info[ORACLE_BMV_T_EFF_MEAN_COLUMN] = read_row_float(row, ORACLE_BMV_T_EFF_MEAN_COLUMN)
+            info[ORACLE_T_EFF_GAP_MEAN_COLUMN] = read_row_float(row, ORACLE_T_EFF_GAP_MEAN_COLUMN)
+            info[ORACLE_FMV_VALID_RATIO_COLUMN] = read_row_float(row, ORACLE_FMV_VALID_RATIO_COLUMN)
+            info[ORACLE_BMV_VALID_RATIO_COLUMN] = read_row_float(row, ORACLE_BMV_VALID_RATIO_COLUMN)
 
         img_60_0_path = self._build_modality_path(record, mode, frame_60_0_idx, "colorNoScreenUI")
         img_60_1_path = self._build_modality_path(record, mode, frame_60_1_idx, "colorNoScreenUI")
