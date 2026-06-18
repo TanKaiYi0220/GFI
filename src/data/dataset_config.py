@@ -484,6 +484,26 @@ TEST_MINOR_0507_DATASET_PRESET: DatasetPreset = build_dataset_preset(
     },
 )
 
+TRAIN_MINOR_0507_DELTA_TIME_CLEAN_DATASET_PRESET: DatasetPreset = build_dataset_preset(
+    name="Minor_0507_DeltaTime_Clean_Train",
+    records=TRAIN_MINOR_0507_DATASET_PRESET.records,
+)
+
+TEST_MINOR_0507_DELTA_TIME_CLEAN_DATASET_PRESET: DatasetPreset = build_dataset_preset(
+    name="Minor_0507_DeltaTime_Clean_Test",
+    records=TEST_MINOR_0507_DATASET_PRESET.records,
+)
+
+TRAIN_MINOR_0507_ORACLE_TIME_CLEAN_DATASET_PRESET: DatasetPreset = build_dataset_preset(
+    name="Minor_0507_OracleTime_Clean_Train",
+    records=TRAIN_MINOR_0507_DATASET_PRESET.records,
+)
+
+TEST_MINOR_0507_ORACLE_TIME_CLEAN_DATASET_PRESET: DatasetPreset = build_dataset_preset(
+    name="Minor_0507_OracleTime_Clean_Test",
+    records=TEST_MINOR_0507_DATASET_PRESET.records,
+)
+
 TEST_MINOR_0604_DATASET_PRESET: DatasetPreset = build_dataset_preset(
     name="Minor_0604",
     records={
@@ -514,6 +534,10 @@ DATASET_PRESETS: dict[str, DatasetPreset] = {
     "smoke_arpg2_dual": SMOKE_ARPG2_DUAL_PRESET,
     "train_minor_0507": TRAIN_MINOR_0507_DATASET_PRESET,
     "test_minor_0507": TEST_MINOR_0507_DATASET_PRESET,
+    "train_minor_0507_deltaTime_clean": TRAIN_MINOR_0507_DELTA_TIME_CLEAN_DATASET_PRESET,
+    "test_minor_0507_deltaTime_clean": TEST_MINOR_0507_DELTA_TIME_CLEAN_DATASET_PRESET,
+    "train_minor_0507_oracleTime_clean": TRAIN_MINOR_0507_ORACLE_TIME_CLEAN_DATASET_PRESET,
+    "test_minor_0507_oracleTime_clean": TEST_MINOR_0507_ORACLE_TIME_CLEAN_DATASET_PRESET,
     "test_minor_0604": TEST_MINOR_0604_DATASET_PRESET,
 }
 

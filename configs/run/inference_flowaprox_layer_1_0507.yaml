@@ -1,21 +1,24 @@
 {
   "mode": "infer",
   "model_name": "IFRNet_Residual_FlowApprox",
-    "model_init_args": {
-        "init_flow_layer": 1
+  "model_init_args": {
+    "init_flow_layer": 1
   },
   "flow_approx_method": "splatting",
   "splatting_fill_strategy": "outside_in_4direction",
   "init_flow_downscale_strategy": "bilinear",
   "init_flow_mask_epsilon": 1.0e-6,
+  "effective_time_mode": "learnable",
+  "effective_time_hidden_channels": 32,
+  "effective_time_radius": 0.5,
   "root_dir": "data/Minor_0507/",
   "dataset_root_dir": "/workspace/datasets/Minor_0507/",
   "inference_preset": [
     "train_minor_0507",
     "test_minor_0507"
   ],
-  "checkpoint_path": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_Minor_0611_OracleTime/checkpoints/best.pth",
-  "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_Minor_0611_OracleTime/",
+  "checkpoint_path": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_Minor_0611_OracleTimeSupervised/checkpoints/best.pth",
+  "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_Minor_0611_OracleTimeSupervised/",
   "seed": 1234,
   "batch_size": 1,
   "only_fps": 60,
@@ -27,95 +30,69 @@
     "lpips_net": "alex"
   },
   "scale_factor": 1.0,
-  "flow_approx_method": "splatting",
   "flow_diff_threshold": 1.0,
   "flow_diff_percentile": 99.0,
   "save_topk_worst_psnr": 10,
   "save_topk_best_psnr": 5,
   "save_topk_largest_flow_diff": 10,
   "save_train_frames": [
-    "ARPG_2_4_Medium_5_0518",
-    "ARPG_3_1_Medium_5_0058",
-    "ARPG_3_2_Medium_5_0462",
-    "ARPG_3_1_Medium_5_0018",
-    "ARPG_2_4_Medium_5_0406",
-    "ARPG_3_1_Medium_5_0324",
-    "ARPG_3_2_Medium_5_0464",
-    "ARPG_3_0_Medium_5_0794",
-    "ARPG_2_4_Medium_5_0562",
-    "ARPG_3_0_Medium_5_0460",
-    "ARPG_3_2_Medium_5_0604",
-    "ARPG_3_1_Medium_5_0042",
-    "ARPG_3_2_Medium_5_0592",
-    "ARPG_2_4_Medium_5_0408",
-    "ARPG_3_1_Medium_5_0432",
-    "ARPG_2_4_Medium_5_0680",
-    "ARPG_3_0_Medium_5_0408",
-    "ARPG_2_4_Medium_5_0400",
-    "ARPG_2_4_Medium_5_0396",
-    "ARPG_2_4_Medium_5_0392",
-    "ARPG_2_4_Medium_5_0322",
-    "ARPG_2_4_Medium_5_0712",
-    "ARPG_2_4_Medium_5_0082"
+    "ARPG_2_4_Medium_5_0500",
+    "ARPG_2_4_Medium_5_0502",
+    "ARPG_2_4_Medium_5_0504",
+    "ARPG_2_4_Medium_5_0506",
+    "ARPG_3_1_Easy_5_0254",
+    "ARPG_3_1_Easy_5_0292",
+    "ARPG_3_1_Easy_5_0294",
+    "ARPG_3_1_Easy_5_0408",
+    "ARPG_3_1_Easy_5_0410",
+    "ARPG_3_1_Easy_5_0412",
+    "ARPG_3_1_Easy_5_0754",
+    "ARPG_3_1_Medium_5_0254",
+    "ARPG_3_1_Medium_5_0292",
+    "ARPG_3_1_Medium_5_0294",
+    "ARPG_3_1_Medium_5_0408",
+    "ARPG_3_1_Medium_5_0410",
+    "ARPG_3_1_Medium_5_0412",
+    "ARPG_3_1_Medium_5_0754",
+    "ARPG_3_0_Medium_5_0032"
   ],
   "save_test_frames": [
+    "ARPG_3_3_Easy_5_0546",
+    "ARPG_3_3_Easy_5_0552",
     "ARPG_3_3_Medium_5_0588"
   ],
   "save_train_frame_groups": {
-    "large_motion_artifacts__improve_true": [
-      "ARPG_2_4_Medium_5_0518",
-      "ARPG_3_1_Medium_5_0058",
-      "ARPG_3_2_Medium_5_0462"
-    ],
-    "large_motion_artifacts__improve_false": [
-      "ARPG_3_1_Medium_5_0018",
-      "ARPG_2_4_Medium_5_0406"
-    ],
-    "not_large_motion_high_psnr__improve_true": [
-      "ARPG_3_1_Medium_5_0324",
-      "ARPG_3_2_Medium_5_0464",
-      "ARPG_3_0_Medium_5_0794"
-    ],
-    "not_large_motion_high_psnr__improve_false": [
-      "ARPG_2_4_Medium_5_0562",
-      "ARPG_3_0_Medium_5_0460",
-      "ARPG_3_2_Medium_5_0604"
-    ],
-    "other_artifacts__improve_true": [
-      "ARPG_3_1_Medium_5_0042",
-      "ARPG_3_2_Medium_5_0592",
-      "ARPG_2_4_Medium_5_0408"
-    ],
-    "other_artifacts__improve_false": [
-      "ARPG_3_1_Medium_5_0432",
-      "ARPG_2_4_Medium_5_0680",
-      "ARPG_3_0_Medium_5_0408"
-    ],
-    "large_motion_high_psnr__improve_true": [
-      "ARPG_2_4_Medium_5_0400",
-      "ARPG_2_4_Medium_5_0396",
-      "ARPG_2_4_Medium_5_0392"
-    ],
-    "large_motion_high_psnr__improve_false": [
-      "ARPG_2_4_Medium_5_0322",
-      "ARPG_2_4_Medium_5_0712",
-      "ARPG_2_4_Medium_5_0082"
+    "oracle_time_supervised_selected_train": [
+      "ARPG_2_4_Medium_5_0500",
+      "ARPG_2_4_Medium_5_0502",
+      "ARPG_2_4_Medium_5_0504",
+      "ARPG_2_4_Medium_5_0506",
+      "ARPG_3_1_Easy_5_0254",
+      "ARPG_3_1_Easy_5_0292",
+      "ARPG_3_1_Easy_5_0294",
+      "ARPG_3_1_Easy_5_0408",
+      "ARPG_3_1_Easy_5_0410",
+      "ARPG_3_1_Easy_5_0412",
+      "ARPG_3_1_Easy_5_0754",
+      "ARPG_3_1_Medium_5_0254",
+      "ARPG_3_1_Medium_5_0292",
+      "ARPG_3_1_Medium_5_0294",
+      "ARPG_3_1_Medium_5_0408",
+      "ARPG_3_1_Medium_5_0410",
+      "ARPG_3_1_Medium_5_0412",
+      "ARPG_3_1_Medium_5_0754",
+      "ARPG_3_0_Medium_5_0032"
     ]
   },
   "save_test_frame_groups": {
-    "large_motion_artifacts__improve_true": [],
-    "large_motion_artifacts__improve_false": [
+    "oracle_time_supervised_selected_test": [
+      "ARPG_3_3_Easy_5_0546",
+      "ARPG_3_3_Easy_5_0552",
       "ARPG_3_3_Medium_5_0588"
-    ],
-    "not_large_motion_high_psnr__improve_true": [],
-    "not_large_motion_high_psnr__improve_false": [],
-    "other_artifacts__improve_true": [],
-    "other_artifacts__improve_false": [],
-    "large_motion_high_psnr__improve_true": [],
-    "large_motion_high_psnr__improve_false": []
+    ]
   },
   "video": {
-    "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_ZeroSplat_Minor_0603/videos",
+    "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_Minor_0611_OracleTimeSupervised/videos",
     "fps": 60,
     "ignore_valid": true,
     "record_filter": null,

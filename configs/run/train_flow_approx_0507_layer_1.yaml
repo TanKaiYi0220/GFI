@@ -5,9 +5,14 @@
   "splatting_fill_strategy": "outside_in_4direction",
   "init_flow_downscale_strategy": "bilinear",
   "init_flow_mask_epsilon": 1.0e-6,
-    "model_init_args": {
-        "init_flow_layer": 1
+  "model_init_args": {
+    "init_flow_layer": 1
   },
+  "effective_time_mode": "learnable",
+  "effective_time_hidden_channels": 32,
+  "effective_time_radius": 0.5,
+  "oracle_effective_time_loss_weight": 0.1,
+  "oracle_effective_time_min_valid_ratio": 0.1,
   "root_dir": "data/Minor_0507/",
   "dataset_root_dir": "/workspace/datasets/Minor_0507/",
   "train_preset": "train_minor_0507",
@@ -18,7 +23,7 @@
   "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 16,
-  "output_dir": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_Minor_0611",
+  "output_dir": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_Minor_0611_OracleTimeSupervised",
   "only_fps": 60,
   "input_fps": 30,
   "metrics": {
@@ -30,11 +35,14 @@
   "resume_path": null,
   "pretrained_checkpoint_path": "outputs/IFRNet_Residual_0416/checkpoints/best.pth",
   "sample_train_frames": [
-    "ARPG_3_0_Medium_5_0404",
-    "ARPG_3_1_Medium_5_0452"
+    "ARPG_2_4_Medium_5_0500",
+    "ARPG_2_4_Medium_5_0502",
+    "ARPG_3_1_Medium_5_0254",
+    "ARPG_3_1_Medium_5_0292",
+    "ARPG_3_0_Medium_5_0032"
   ],
   "sample_test_frames": [
-    "ARPG_3_3_Medium_5_0654"
+    "ARPG_3_3_Medium_5_0588"
   ],
   "sample_interval_epoch": 5
 }
