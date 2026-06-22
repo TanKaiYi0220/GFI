@@ -45,7 +45,9 @@ from scripts.inference import RESIDUAL_MODEL_NAME
 from scripts.inference import run_inference_batch
 from scripts.inference import save_selected_sample_artifacts
 from scripts.train import read_model_init_args
+from scripts.train import read_optional_bool
 from scripts.train import resolve_model_class
+from scripts.train import set_model_convex_upsampling
 
 
 class SamplePreset(TypedDict):
@@ -291,6 +293,13 @@ def load_inference_model(config_path_text: str, device: torch.device) -> Inferen
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     model.load_state_dict(state_dict)
+    eval_convex_upsampling = read_optional_bool(config, "eval_convex_upsampling")
+    if eval_convex_upsampling is not None:
+        set_model_convex_upsampling(
+            model=model,
+            enabled=eval_convex_upsampling,
+            context="prediction-region comparison",
+        )
     model.eval()
     return {
         "config_path": str(config_path),

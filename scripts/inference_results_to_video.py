@@ -15,8 +15,10 @@ from scripts.inference import run_inference_batch
 from src.engine.flow_approx import SPLATTING_FLOW_APPROX_METHODS
 from scripts.train import build_merged_dataframe
 from scripts.train import read_model_init_args
+from scripts.train import read_optional_bool
 from scripts.train import resolve_model_class
 from scripts.train import set_seed
+from scripts.train import set_model_convex_upsampling
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
 
@@ -207,6 +209,7 @@ def main(argv: list[str] | None = None) -> None:
     mode = str(config["mode"])
     model_name = str(config["model_name"])
     model_init_args = read_model_init_args(config)
+    eval_convex_upsampling = read_optional_bool(config, "eval_convex_upsampling")
     inference_preset = str(config["inference_preset"])
     flow_approx_method = str(config.get("flow_approx_method", "combination"))
     scale_factor = float(config.get("scale_factor", 1.0))
@@ -257,6 +260,8 @@ def main(argv: list[str] | None = None) -> None:
         "export_all": export_all,
         "export_vfi60": export_vfi60,
     }
+    if eval_convex_upsampling is not None:
+        summary["eval_convex_upsampling"] = eval_convex_upsampling
     if len(model_init_args) > 0:
         summary["model_init_args"] = model_init_args
     if mode == "dry-run":
@@ -296,6 +301,12 @@ def main(argv: list[str] | None = None) -> None:
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     model.load_state_dict(state_dict)
+    if eval_convex_upsampling is not None:
+        set_model_convex_upsampling(
+            model=model,
+            enabled=eval_convex_upsampling,
+            context="video inference",
+        )
     model.eval()
 
     if len(single_files) == 0:

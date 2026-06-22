@@ -1,9 +1,11 @@
 {
   "mode": "infer",
   "model_name": "IFRNet_Residual_FlowApprox",
-    "model_init_args": {
-        "init_flow_layer": 1
+  "model_init_args": {
+    "init_flow_layer": 1,
+    "convex_upsampling": false
   },
+  "eval_convex_upsampling": false,
   "flow_approx_method": "splatting",
   "splatting_fill_strategy": "outside_in_8neighbor",
   "init_flow_downscale_strategy": "masked_area",

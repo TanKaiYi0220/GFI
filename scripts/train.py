@@ -77,6 +77,40 @@ def read_model_init_args(config_values: dict[str, Any]) -> dict[str, Any]:
     return dict(raw_model_init_args)
 
 
+def parse_bool_value(value: Any, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized_value = value.strip().lower()
+        if normalized_value in ("true", "1", "yes", "on"):
+            return True
+        if normalized_value in ("false", "0", "no", "off"):
+            return False
+    raise TypeError(f"{key} must be a boolean, got {value!r}")
+
+
+def parse_eval_convex_upsampling_arg(value: str) -> bool:
+    return parse_bool_value(value, "eval_convex_upsampling")
+
+
+def read_optional_bool(config_values: dict[str, Any], key: str) -> bool | None:
+    if key not in config_values or config_values[key] is None:
+        return None
+    return parse_bool_value(config_values[key], key)
+
+
+def set_model_convex_upsampling(model: Any, enabled: bool, context: str) -> bool:
+    setter = getattr(model, "set_convex_upsampling", None)
+    if not callable(setter):
+        raise TypeError(
+            f"{context} requested eval_convex_upsampling={enabled}, "
+            f"but model type {type(model).__name__} does not support it."
+        )
+    previous_value = bool(getattr(model, "convex_upsampling"))
+    setter(enabled)
+    return previous_value
+
+
 def resolve_model_class(model_name: str) -> type[Any]:
     if model_name == "IFRNet":
         from src.models.IFRNet import Model as IFRNetModel
@@ -375,35 +409,50 @@ def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: 
     if (epoch + 1) % args.sample_interval_epoch != 0:
         return
 
-    model.eval()
-    with torch.no_grad():
-        for split_name, frame_keys in frame_groups.items():
-            if len(frame_keys) == 0:
-                continue
-            sample_dataframe = select_sample_rows(sample_dataframes[split_name], list(frame_keys))
-            sample_dataset = build_training_dataset(
-                sample_dataframe,
-                args.dataset_root_dir,
-                False,
-                args.input_fps,
-                args.model_name,
-                args.flow_approx_method,
-            )
-            for frame_key, batch in zip(frame_keys, DataLoader(sample_dataset, batch_size=1, shuffle=False)):
-                save_dir = Path(args.output_dir) / "samples" / split_name / frame_key / f"epoch_{epoch + 1:04d}"
-                inference_result = run_inference_batch_with_fill_strategy(
-                    batch,
-                    device,
-                    args.flow_approx_method,
-                    args.splatting_fill_strategy,
-                    args.init_flow_downscale_strategy,
-                    args.init_flow_mask_epsilon,
-                    model,
+    previous_convex_upsampling = None
+    if args.eval_convex_upsampling is not None:
+        previous_convex_upsampling = set_model_convex_upsampling(
+            model=model,
+            enabled=args.eval_convex_upsampling,
+            context="sample evaluation",
+        )
+    try:
+        model.eval()
+        with torch.no_grad():
+            for split_name, frame_keys in frame_groups.items():
+                if len(frame_keys) == 0:
+                    continue
+                sample_dataframe = select_sample_rows(sample_dataframes[split_name], list(frame_keys))
+                sample_dataset = build_training_dataset(
+                    sample_dataframe,
+                    args.dataset_root_dir,
+                    False,
+                    args.input_fps,
                     args.model_name,
-                    1.0,
+                    args.flow_approx_method,
                 )
-                save_selected_sample_artifacts(cv2, 99.0, 1.0, flow_to_image, inference_result, np, save_dir, save_image)
-                logger.info("Saved sample frame split=%s frame=%s epoch=%s dir=%s", split_name, frame_key, epoch + 1, save_dir)
+                for frame_key, batch in zip(frame_keys, DataLoader(sample_dataset, batch_size=1, shuffle=False)):
+                    save_dir = Path(args.output_dir) / "samples" / split_name / frame_key / f"epoch_{epoch + 1:04d}"
+                    inference_result = run_inference_batch_with_fill_strategy(
+                        batch,
+                        device,
+                        args.flow_approx_method,
+                        args.splatting_fill_strategy,
+                        args.init_flow_downscale_strategy,
+                        args.init_flow_mask_epsilon,
+                        model,
+                        args.model_name,
+                        1.0,
+                    )
+                    save_selected_sample_artifacts(cv2, 99.0, 1.0, flow_to_image, inference_result, np, save_dir, save_image)
+                    logger.info("Saved sample frame split=%s frame=%s epoch=%s dir=%s", split_name, frame_key, epoch + 1, save_dir)
+    finally:
+        if previous_convex_upsampling is not None:
+            set_model_convex_upsampling(
+                model=model,
+                enabled=previous_convex_upsampling,
+                context="sample evaluation restore",
+            )
 
 
 def resolve_dataset_class_name(model_name: str) -> str:
@@ -485,32 +534,48 @@ def evaluate(
     import torch
     from tqdm import tqdm
 
-    model.eval()
+    previous_convex_upsampling = None
+    if args.eval_convex_upsampling is not None:
+        previous_convex_upsampling = set_model_convex_upsampling(
+            model=model,
+            enabled=args.eval_convex_upsampling,
+            context="training evaluation",
+        )
+
     metric_meters = build_metric_meters(args.metric_config)
     eval_records: list[dict[str, object]] = []
 
-    with torch.no_grad():
-        pbar = tqdm(loader, desc="Evaluating")
-        for batch in pbar:
-            batch_output = run_training_batch(args, model, batch, device)
-            total_loss = batch_output.loss_rec + batch_output.loss_geo + batch_output.loss_dis
-            loss_record = build_loss_record(
-                batch_output.loss_rec,
-                batch_output.loss_geo,
-                batch_output.loss_dis,
-                total_loss,
+    try:
+        model.eval()
+        with torch.no_grad():
+            pbar = tqdm(loader, desc="Evaluating")
+            for batch in pbar:
+                batch_output = run_training_batch(args, model, batch, device)
+                total_loss = batch_output.loss_rec + batch_output.loss_geo + batch_output.loss_dis
+                loss_record = build_loss_record(
+                    batch_output.loss_rec,
+                    batch_output.loss_geo,
+                    batch_output.loss_dis,
+                    total_loss,
+                )
+                append_batch_metric_records(
+                    eval_records,
+                    metric_meters,
+                    batch_output.info,
+                    batch_output.imgt_pred,
+                    batch_output.imgt,
+                    loss_record,
+                    args.metric_config,
+                    lpips_model,
+                )
+                pbar.set_postfix({"eval_psnr": f"{metric_meters['psnr'].avg:.6f}"})
+    finally:
+        if previous_convex_upsampling is not None:
+            set_model_convex_upsampling(
+                model=model,
+                enabled=previous_convex_upsampling,
+                context="training evaluation restore",
             )
-            append_batch_metric_records(
-                eval_records,
-                metric_meters,
-                batch_output.info,
-                batch_output.imgt_pred,
-                batch_output.imgt,
-                loss_record,
-                args.metric_config,
-                lpips_model,
-            )
-            pbar.set_postfix({"eval_psnr": f"{metric_meters['psnr'].avg:.6f}"})
 
     eval_df = pd.DataFrame(eval_records)
     record_name_df = build_record_name_summary(eval_df, args.metric_config)
@@ -667,6 +732,12 @@ def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.Argument
     parser.add_argument("--sample-test-frames", default=config_defaults.get("sample_test_frames", []), nargs="*", help="Testing sample frame keys such as ARPG_2_4_2_052.")
     parser.add_argument("--sample-interval-epoch", default=config_defaults.get("sample_interval_epoch", config_defaults.get("eval_interval", 1)), type=int, help="Save configured sample frames every N epochs.")
     parser.add_argument(
+        "--eval-convex-upsampling",
+        default=config_defaults.get("eval_convex_upsampling"),
+        type=parse_eval_convex_upsampling_arg,
+        help="Optional evaluation-only override for residual-model convex flow upsampling.",
+    )
+    parser.add_argument(
         "--flow-approx-method",
         default=config_defaults.get("flow_approx_method", "combination"),
         choices=FLOW_APPROX_METHOD_CHOICES,
@@ -704,6 +775,11 @@ def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     args.model_init_args = read_model_init_args(config_defaults)
     args.metric_config = read_metric_config(config_defaults)
+    args.eval_convex_upsampling = (
+        None
+        if args.eval_convex_upsampling is None
+        else parse_bool_value(args.eval_convex_upsampling, "eval_convex_upsampling")
+    )
     require_psnr_enabled(args.metric_config, "training")
     args.input_config = config_defaults
     validate_flow_approx_runtime_args(args)
@@ -857,6 +933,8 @@ def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
         "dataset_class": resolve_dataset_class_name(args.model_name),
         "metrics": dict(args.metric_config),
     }
+    if args.eval_convex_upsampling is not None:
+        summary["eval_convex_upsampling"] = args.eval_convex_upsampling
 
     if len(args.model_init_args) > 0:
         summary["model_init_args"] = dict(args.model_init_args)
@@ -917,6 +995,8 @@ def run_training(args: argparse.Namespace) -> None:
         args.output_dir,
     )
     logger.info("metrics=%s", args.metric_config)
+    if args.eval_convex_upsampling is not None:
+        logger.info("eval_convex_upsampling=%s", args.eval_convex_upsampling)
     if uses_flow_approx_model(args.model_name):
         logger.info("flow_approx_method=%s", args.flow_approx_method)
         logger.info(

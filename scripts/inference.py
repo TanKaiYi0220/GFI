@@ -12,8 +12,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.train import build_merged_dataframe
 from scripts.train import read_model_init_args
+from scripts.train import read_optional_bool
 from scripts.train import resolve_model_class
 from scripts.train import set_seed
+from scripts.train import set_model_convex_upsampling
 from src.engine.evaluation import average_metric_values
 from src.engine.evaluation import build_lpips_model
 from src.engine.evaluation import build_metric_meters
@@ -642,6 +644,7 @@ def main(argv: list[str] | None = None) -> None:
     mode = str(config["mode"])
     model_name = str(config["model_name"])
     model_init_args = read_model_init_args(config)
+    eval_convex_upsampling = read_optional_bool(config, "eval_convex_upsampling")
     inference_presets = read_inference_presets(config)
     flow_approx_method = str(config["flow_approx_method"])
     splatting_fill_strategy = str(config.get("splatting_fill_strategy", DEFAULT_SPLATTING_FILL_STRATEGY))
@@ -723,6 +726,8 @@ def main(argv: list[str] | None = None) -> None:
         "save_topk_largest_flow_diff": save_topk_largest_flow_diff,
         "metrics": dict(metric_config),
     }
+    if eval_convex_upsampling is not None:
+        summary["eval_convex_upsampling"] = eval_convex_upsampling
     if len(model_init_args) > 0:
         summary["model_init_args"] = model_init_args
     if mode == "dry-run":
@@ -748,6 +753,8 @@ def main(argv: list[str] | None = None) -> None:
     lpips_model = build_lpips_model(metric_config, device)
     logger.info("device=%s model=%s", device, model_name)
     logger.info("metrics=%s", metric_config)
+    if eval_convex_upsampling is not None:
+        logger.info("eval_convex_upsampling=%s", eval_convex_upsampling)
     logger.info(
         "flow_approx_method=%s splatting_fill_strategy=%s init_flow_downscale_strategy=%s init_flow_mask_epsilon=%s",
         flow_approx_method,
@@ -774,6 +781,12 @@ def main(argv: list[str] | None = None) -> None:
     # print("Load Pretrained Weights from IFRNet_Vimeo90K.pth as Baseline")
     # state_dict = torch.load("src/models/external/IFRNet/checkpoints/IFRNet/IFRNet_Vimeo90K.pth", map_location=device)
     model.load_state_dict(state_dict)
+    if eval_convex_upsampling is not None:
+        set_model_convex_upsampling(
+            model=model,
+            enabled=eval_convex_upsampling,
+            context="inference",
+        )
     model.eval()
 
     metric_meters = build_metric_meters(metric_config)

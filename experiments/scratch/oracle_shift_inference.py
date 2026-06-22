@@ -26,8 +26,10 @@ from scripts.inference import RESIDUAL_MODEL_NAME
 from scripts.inference import run_inference_batch
 from scripts.train import build_merged_dataframe
 from scripts.train import read_model_init_args
+from scripts.train import read_optional_bool
 from scripts.train import resolve_model_class
 from scripts.train import set_seed
+from scripts.train import set_model_convex_upsampling
 from src.data.dataset_loader import FlowEstimationTrainDataset
 from src.data.dataset_loader import VFITrainDataset
 from src.engine.flow_approx import SPLATTING_FLOW_APPROX_METHODS
@@ -362,6 +364,13 @@ def load_model(inference_config: dict[str, Any], project_root: Path, device: tor
     checkpoint = torch.load(str(checkpoint_path), map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     model.load_state_dict(state_dict)
+    eval_convex_upsampling = read_optional_bool(inference_config, "eval_convex_upsampling")
+    if eval_convex_upsampling is not None:
+        set_model_convex_upsampling(
+            model=model,
+            enabled=eval_convex_upsampling,
+            context="oracle-shift inference",
+        )
     model.eval()
     return model
 
