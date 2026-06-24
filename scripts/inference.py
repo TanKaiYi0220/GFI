@@ -19,6 +19,7 @@ from scripts.train import set_seed
 from scripts.train import set_model_convex_upsampling
 from src.engine.evaluation import average_metric_values
 from src.engine.evaluation import build_flip_evaluator
+from src.engine.evaluation import build_flolpips_model
 from src.engine.evaluation import build_lpips_model
 from src.engine.evaluation import build_metric_meters
 from src.engine.evaluation import calculate_batch_metrics
@@ -763,6 +764,7 @@ def main(argv: list[str] | None = None) -> None:
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lpips_model = build_lpips_model(metric_config, device)
+    flolpips_model = build_flolpips_model(metric_config, device)
     build_flip_evaluator(metric_config)
     logger.info("device=%s model=%s", device, model_name)
     logger.info("metrics=%s", metric_config)
@@ -853,7 +855,15 @@ def main(argv: list[str] | None = None) -> None:
                 splatting_region_maps = inference_result.get("splatting_region_maps")
                 up_flow0_1 = inference_result["up_flow0_1"]
                 up_flow1_1 = inference_result["up_flow1_1"]
-                batch_metric_values = calculate_batch_metrics(imgt.detach(), imgt_pred.detach(), metric_config, lpips_model)
+                batch_metric_values = calculate_batch_metrics(
+                    target=imgt.detach(),
+                    prediction=imgt_pred.detach(),
+                    metric_config=metric_config,
+                    lpips_model=lpips_model,
+                    flolpips_model=flolpips_model,
+                    img0=inference_result["img0"].detach(),
+                    img1=inference_result["img1"].detach(),
+                )
 
                 for batch_index in range(int(imgt_pred.shape[0])):
                     row = group_dataframe.iloc[sample_offset + batch_index]

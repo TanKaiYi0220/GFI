@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from math import exp
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -12,6 +14,7 @@ LPIPS_NET_CHOICES: tuple[str, ...] = ("alex", "vgg", "squeeze")
 FLIP_DYNAMIC_RANGE_CHOICES: tuple[str, ...] = ("LDR", "HDR")
 FLIP_TONEMAPPER_CHOICES: tuple[str, ...] = ("ACES", "Hable", "Reinhard")
 PSNR_DIV_METRIC_NAME: str = "psnr_div"
+FLOLPIPS_METRIC_NAME: str = "flolpips"
 
 
 def calculate_psnr(img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
@@ -120,6 +123,16 @@ def parse_metric_string(raw_config: dict[str, object], key: str, fallback: str) 
     return value
 
 
+def parse_metric_optional_string(raw_config: dict[str, object], key: str) -> str | None:
+    if key not in raw_config or raw_config[key] is None:
+        return None
+
+    value = raw_config[key]
+    if not isinstance(value, str):
+        raise TypeError(f"metrics.{key} must be a string or null, got {type(value).__name__}")
+    return value
+
+
 def parse_metric_float(raw_config: dict[str, object], key: str, fallback: float) -> float:
     if key not in raw_config:
         return fallback
@@ -177,11 +190,13 @@ def read_metric_config(config_values: dict[str, Any]) -> dict[str, object]:
         "enable_lpips": parse_metric_bool(raw_config, "enable_lpips", False),
         "enable_flip": parse_metric_bool(raw_config, "enable_flip", False),
         "enable_psnr_div": parse_metric_bool(raw_config, "enable_psnr_div", False),
+        "enable_flolpips": parse_metric_bool(raw_config, "enable_flolpips", False),
         "lpips_net": lpips_net,
         "flip_dynamic_range": parse_flip_dynamic_range(raw_config),
         "flip_pixels_per_degree": flip_pixels_per_degree,
         "flip_tonemapper": parse_flip_tonemapper(raw_config),
         "psnr_div_divergence_threshold": psnr_divergence_threshold,
+        "flolpips_repo_path": parse_metric_optional_string(raw_config, "flolpips_repo_path"),
     }
 
 
@@ -204,6 +219,16 @@ def require_psnr_div_disabled(metric_config: dict[str, object], pipeline_name: s
     )
 
 
+def require_flolpips_disabled(metric_config: dict[str, object], pipeline_name: str) -> None:
+    if not bool(metric_config["enable_flolpips"]):
+        return
+
+    raise ValueError(
+        f"{pipeline_name} does not support metrics.enable_flolpips=true. "
+        "FloLPIPS requires image triplets: previous frame, interpolated prediction, and next frame."
+    )
+
+
 def get_enabled_metric_names(metric_config: dict[str, object]) -> tuple[str, ...]:
     metric_names = []
     if bool(metric_config["enable_psnr"]):
@@ -216,6 +241,8 @@ def get_enabled_metric_names(metric_config: dict[str, object]) -> tuple[str, ...
         metric_names.append("flip")
     if bool(metric_config["enable_psnr_div"]):
         metric_names.append(PSNR_DIV_METRIC_NAME)
+    if bool(metric_config["enable_flolpips"]):
+        metric_names.append(FLOLPIPS_METRIC_NAME)
     return tuple(metric_names)
 
 
@@ -261,6 +288,52 @@ def build_flip_evaluator(metric_config: dict[str, object]) -> Any | None:
     return import_flip_evaluator()
 
 
+def import_flolpips_module(metric_config: dict[str, object]) -> Any:
+    repo_path = metric_config["flolpips_repo_path"]
+    if repo_path is not None:
+        resolved_path = Path(str(repo_path)).expanduser().resolve()
+        if not resolved_path.is_dir():
+            raise FileNotFoundError(f"metrics.flolpips_repo_path does not exist or is not a directory: {resolved_path}")
+        resolved_path_text = str(resolved_path)
+        if resolved_path_text not in sys.path:
+            sys.path.insert(0, resolved_path_text)
+
+    try:
+        import flolpips
+    except ImportError as error:
+        raise ImportError(
+            "FloLPIPS metric is enabled, but the official FloLPIPS module could not be imported. "
+            "Clone https://github.com/danier97/FloLPIPS and set metrics.flolpips_repo_path to that directory, "
+            "or make its flolpips.py importable through PYTHONPATH."
+        ) from error
+
+    return flolpips
+
+
+def build_flolpips_model(metric_config: dict[str, object], device: torch.device) -> Any | None:
+    if not bool(metric_config["enable_flolpips"]):
+        return None
+    if device.type != "cuda":
+        raise RuntimeError(
+            "metrics.enable_flolpips=true requires a CUDA device because the official FloLPIPS PWCNet "
+            "implementation uses CUDA/CuPy correlation kernels."
+        )
+
+    flolpips_module = import_flolpips_module(metric_config=metric_config)
+    try:
+        model = flolpips_module.Flolpips().to(device)
+    except Exception as error:
+        raise RuntimeError(
+            "Failed to initialize FloLPIPS. Ensure the official FloLPIPS dependencies are installed "
+            "(torchvision, cupy for your CUDA version, opencv-python) and that PWCNet weights can be loaded."
+        ) from error
+
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
+
+
 def calculate_psnr_batch(target: torch.Tensor, prediction: torch.Tensor) -> list[float]:
     batch_target = normalize_metric_batch(target)
     batch_prediction = normalize_metric_batch(prediction)
@@ -287,6 +360,49 @@ def calculate_lpips_batch(target: torch.Tensor, prediction: torch.Tensor, lpips_
     normalized_target = normalize_lpips_batch(target)
     normalized_prediction = normalize_lpips_batch(prediction)
     values = lpips_model(normalized_prediction, normalized_target)
+    return [float(value) for value in values.detach().cpu().reshape(-1).tolist()]
+
+
+def normalize_flolpips_batch(image: torch.Tensor) -> torch.Tensor:
+    batch = normalize_metric_batch(image).detach().float()
+    if int(batch.shape[1]) != 3:
+        raise ValueError(f"FloLPIPS expects RGB images with 3 channels, got shape={tuple(batch.shape)}")
+    return batch.clamp(0.0, 1.0)
+
+
+def calculate_flolpips_batch(
+    img0: torch.Tensor,
+    img1: torch.Tensor,
+    target: torch.Tensor,
+    prediction: torch.Tensor,
+    flolpips_model: Any,
+) -> list[float]:
+    normalized_img0 = normalize_flolpips_batch(img0)
+    normalized_img1 = normalize_flolpips_batch(img1)
+    normalized_target = normalize_flolpips_batch(target)
+    normalized_prediction = normalize_flolpips_batch(prediction)
+    if tuple(normalized_img0.shape) != tuple(normalized_img1.shape):
+        raise ValueError(
+            f"FloLPIPS endpoint shapes must match, got img0={tuple(normalized_img0.shape)} "
+            f"img1={tuple(normalized_img1.shape)}"
+        )
+    if tuple(normalized_target.shape) != tuple(normalized_prediction.shape):
+        raise ValueError(
+            f"FloLPIPS target and prediction shapes must match, got target={tuple(normalized_target.shape)} "
+            f"prediction={tuple(normalized_prediction.shape)}"
+        )
+    if tuple(normalized_img0.shape) != tuple(normalized_target.shape):
+        raise ValueError(
+            f"FloLPIPS endpoint and target shapes must match, got endpoint={tuple(normalized_img0.shape)} "
+            f"target={tuple(normalized_target.shape)}"
+        )
+
+    values = flolpips_model(
+        normalized_img0,
+        normalized_img1,
+        normalized_prediction,
+        normalized_target,
+    )
     return [float(value) for value in values.detach().cpu().reshape(-1).tolist()]
 
 
@@ -461,6 +577,9 @@ def calculate_batch_metrics(
     prediction: torch.Tensor,
     metric_config: dict[str, object],
     lpips_model: Any | None,
+    flolpips_model: Any | None,
+    img0: torch.Tensor | None,
+    img1: torch.Tensor | None,
 ) -> dict[str, list[float]]:
     batch_values: dict[str, list[float]] = {}
 
@@ -474,6 +593,19 @@ def calculate_batch_metrics(
         if lpips_model is None:
             raise RuntimeError("metrics.enable_lpips=true requires a loaded LPIPS model.")
         batch_values["lpips"] = calculate_lpips_batch(target, prediction, lpips_model)
+
+    if bool(metric_config["enable_flolpips"]):
+        if flolpips_model is None:
+            raise RuntimeError("metrics.enable_flolpips=true requires a loaded FloLPIPS model.")
+        if img0 is None or img1 is None:
+            raise RuntimeError("metrics.enable_flolpips=true requires img0 and img1 endpoint tensors.")
+        batch_values[FLOLPIPS_METRIC_NAME] = calculate_flolpips_batch(
+            img0=img0,
+            img1=img1,
+            target=target,
+            prediction=prediction,
+            flolpips_model=flolpips_model,
+        )
 
     if bool(metric_config["enable_flip"]):
         batch_values["flip"] = calculate_flip_batch(target, prediction, metric_config)

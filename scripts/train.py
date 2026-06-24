@@ -22,6 +22,7 @@ from src.data.dataset_config import list_dataset_presets
 from src.engine.evaluation import AverageMeter
 from src.engine.evaluation import average_metric_values
 from src.engine.evaluation import build_flip_evaluator
+from src.engine.evaluation import build_flolpips_model
 from src.engine.evaluation import build_lpips_model
 from src.engine.evaluation import build_metric_meters
 from src.engine.evaluation import calculate_batch_metrics
@@ -57,6 +58,8 @@ class TrainingState:
 
 @dataclass(frozen=True)
 class BatchStepOutput:
+    img0: Any
+    img1: Any
     imgt: Any
     imgt_pred: Any
     info: dict[str, Any]
@@ -294,14 +297,25 @@ def append_batch_metric_records(
     metric_meters: dict[str, AverageMeter],
     info: dict[str, Any],
     imgt_pred: Any,
+    img0: Any,
+    img1: Any,
     imgt: Any,
     loss_record: dict[str, float],
     metric_config: dict[str, object],
     lpips_model: Any | None,
+    flolpips_model: Any | None,
 ) -> None:
     batch_size = int(imgt_pred.shape[0])
     normalized_loss_record = {metric_name: float(metric_value) for metric_name, metric_value in loss_record.items()}
-    batch_metric_values = calculate_batch_metrics(imgt.detach(), imgt_pred.detach(), metric_config, lpips_model)
+    batch_metric_values = calculate_batch_metrics(
+        target=imgt.detach(),
+        prediction=imgt_pred.detach(),
+        metric_config=metric_config,
+        lpips_model=lpips_model,
+        flolpips_model=flolpips_model,
+        img0=img0.detach(),
+        img1=img1.detach(),
+    )
 
     for batch_index in range(batch_size):
         sample_metric_values = {metric_name: float(metric_values[batch_index]) for metric_name, metric_values in batch_metric_values.items()}
@@ -516,6 +530,8 @@ def run_training_batch(
     )
     imgt_pred, loss_rec, loss_geo, loss_dis, _up_flow0_1, _up_flow1_1, _up_mask_1 = model_output
     return BatchStepOutput(
+        img0=img0,
+        img1=img1,
         imgt=imgt,
         imgt_pred=imgt_pred,
         info=info,
@@ -531,6 +547,7 @@ def evaluate(
     loader: Any,
     device: Any,
     lpips_model: Any | None,
+    flolpips_model: Any | None,
 ) -> tuple[float, Any, Any, dict[str, float]]:
     import pandas as pd
     import torch
@@ -565,10 +582,13 @@ def evaluate(
                     metric_meters,
                     batch_output.info,
                     batch_output.imgt_pred,
+                    batch_output.img0,
+                    batch_output.img1,
                     batch_output.imgt,
                     loss_record,
                     args.metric_config,
                     lpips_model,
+                    flolpips_model,
                 )
                 pbar.set_postfix({"eval_psnr": f"{metric_meters['psnr'].avg:.6f}"})
     finally:
@@ -595,6 +615,7 @@ def train(
     training_state: TrainingState,
     sample_dataframes: dict[str, Any],
     lpips_model: Any | None,
+    flolpips_model: Any | None,
 ) -> None:
     import pandas as pd
     from tqdm import tqdm
@@ -651,10 +672,13 @@ def train(
                 train_metric_meters,
                 batch_output.info,
                 batch_output.imgt_pred,
+                batch_output.img0,
+                batch_output.img1,
                 batch_output.imgt,
                 loss_record,
                 args.metric_config,
                 lpips_model,
+                flolpips_model,
             )
 
         if (epoch + 1) % args.eval_interval == 0:
@@ -682,7 +706,14 @@ def train(
             )
 
         if (epoch + 1) % args.eval_interval == 0:
-            test_psnr, test_df, test_record_name_df, test_metric_values = evaluate(args, model, test_loader, device, lpips_model)
+            test_psnr, test_df, test_record_name_df, test_metric_values = evaluate(
+                args,
+                model,
+                test_loader,
+                device,
+                lpips_model,
+                flolpips_model,
+            )
             test_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}.csv", index=False)
             test_record_name_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}_record_name.csv", index=False)
             logger.info("Epoch %s test_metrics=%s", epoch + 1, format_metric_values(test_metric_values))
@@ -973,6 +1004,7 @@ def run_training(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lpips_model = build_lpips_model(args.metric_config, device)
+    flolpips_model = build_flolpips_model(args.metric_config, device)
     build_flip_evaluator(args.metric_config)
     logger.info("device=%s", device)
     logger.info("model_name=%s model_init_args=%s", args.model_name, args.model_init_args)
@@ -1070,6 +1102,7 @@ def run_training(args: argparse.Namespace) -> None:
         training_state,
         {"train": train_df, "test": test_df},
         lpips_model,
+        flolpips_model,
     )
 
 

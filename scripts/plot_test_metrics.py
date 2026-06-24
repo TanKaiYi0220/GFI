@@ -12,7 +12,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 REQUIRED_METRIC_NAMES: tuple[str, ...] = ("psnr", "loss_rec", "loss_geo", "loss_dis", "loss_total")
-PREFERRED_METRIC_NAMES: tuple[str, ...] = ("psnr", "ssim", "lpips", "loss_rec", "loss_geo", "loss_dis", "loss_total")
+PREFERRED_METRIC_NAMES: tuple[str, ...] = (
+    "psnr",
+    "ssim",
+    "lpips",
+    "flolpips",
+    "loss_rec",
+    "loss_geo",
+    "loss_dis",
+    "loss_total",
+)
 NUMERIC_PATTERN: re.Pattern[str] = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 TRAIN_EPOCH_PATTERN: re.Pattern[str] = re.compile(r"train_epoch_(\d+)\.csv$")
 TEST_EPOCH_PATTERN: re.Pattern[str] = re.compile(r"test_epoch_(\d+)\.csv$")

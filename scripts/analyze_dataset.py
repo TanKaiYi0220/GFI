@@ -18,6 +18,7 @@ from src.engine.evaluation import build_lpips_model
 from src.engine.evaluation import calculate_batch_metrics
 from src.engine.evaluation import calculate_psnr_batch
 from src.engine.evaluation import read_metric_config
+from src.engine.evaluation import require_flolpips_disabled
 from src.engine.evaluation import require_psnr_div_disabled
 from src.engine.evaluation import require_psnr_enabled
 from src.engine.flow_approx import build_linear_splatting_flow_init_with_fill_strategy
@@ -160,6 +161,7 @@ def build_analysis_config(config_payload: dict[str, Any]) -> AnalysisConfig:
     metric_config = read_metric_config(config_values=config_payload)
     require_psnr_enabled(metric_config=metric_config, pipeline_name="dataset analysis")
     require_psnr_div_disabled(metric_config=metric_config, pipeline_name="dataset analysis")
+    require_flolpips_disabled(metric_config=metric_config, pipeline_name="dataset analysis")
     return AnalysisConfig(
         mode=str(config_payload["mode"]),
         root_dir=resolve_project_path(str(config_payload["root_dir"])),
@@ -331,6 +333,9 @@ def calculate_warp_metrics(
         prediction=prediction.detach(),
         metric_config=metric_config,
         lpips_model=lpips_model,
+        flolpips_model=None,
+        img0=None,
+        img1=None,
     )
 
 
