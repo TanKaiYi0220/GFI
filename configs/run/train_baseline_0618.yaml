@@ -1,0 +1,29 @@
+{
+  "mode": "train",
+  "model_name": "IFRNet",
+  "root_dir": "data/Minor_0507_deltaTime_clean/",
+  "dataset_root_dir": "/workspace/datasets/Minor_0507/",
+  "train_preset": "train_minor_0507",
+  "test_preset": "test_minor_0507",
+  "model_init_args": {
+    "convex_upsampling": true
+  },
+  "eval_convex_upsampling": true,
+  "epochs": 100,
+  "eval_interval": 5,
+  "lr_start": 2e-5,
+  "lr_end": 1e-5,
+  "seed": 1234,
+  "batch_size": 16,
+  "output_dir": "outputs/IFRNet_FineTuning_0618_oracleTime_convex/",
+  "only_fps": 60,
+  "input_fps": 30,
+  "metrics": {
+    "enable_psnr": true,
+    "enable_ssim": true,
+    "enable_lpips": true,
+    "lpips_net": "alex"
+  },
+  "resume_path": null,
+  "pretrained_checkpoint_path": "src/models/external/IFRNet/checkpoints/IFRNet/IFRNet_Vimeo90K.pth"
+}

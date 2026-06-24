@@ -1,0 +1,60 @@
+{
+  "mode": "infer",
+  "model_name": "IFRNet_Residual_FlowApprox",
+  "model_init_args": {
+    "init_flow_layer": 1
+  },
+  "flow_approx_method": "splatting",
+  "splatting_fill_strategy": "outside_in_4direction",
+  "init_flow_downscale_strategy": "bilinear",
+  "init_flow_mask_epsilon": 1.0e-6,
+  "root_dir": "data/Minor_0507_deltaTime_oracleTime_shared_clean/",
+  "dataset_root_dir": "/workspace/datasets/Minor_0507/",
+  "inference_preset": [
+    "train_minor_0507",
+    "test_minor_0507"
+  ],
+  "checkpoint_path": "/workspace/output/0611/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_Minor_0618_OracleTime/checkpoints/best.pth",
+  "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_Minor_0618_oracleTime/",
+  "seed": 1234,
+  "batch_size": 1,
+  "only_fps": 60,
+  "input_fps": 30,
+  "metrics": {
+    "enable_psnr": true,
+    "enable_ssim": true,
+    "enable_lpips": true,
+    "lpips_net": "alex"
+  },
+  "scale_factor": 1.0,
+  "flow_diff_threshold": 1.0,
+  "flow_diff_percentile": 99.0,
+
+  "save_sample_selection": "all",
+  "save_artifact_mode": "rgb_png",
+
+  "save_topk_worst_psnr": 10,
+  "save_topk_best_psnr": 5,
+  "save_topk_largest_flow_diff": 10,
+  "save_train_frames": [
+    "ARPG_2_4_Medium_5_0502",
+    "ARPG_2_4_Medium_5_0504"
+  ],
+  "save_test_frames": [
+    "ARPG_3_3_Easy_5_0546",
+    "ARPG_3_3_Easy_5_0552"
+  ],
+  "video": {
+    "output_dir": "inference_outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_Minor_0618_deltaTime/videos",
+    "fps": 60,
+    "ignore_valid": true,
+    "record_filter": null,
+    "mode_filter": null,
+    "export_grid": true,
+    "tile_scale": 0.5,
+    "pad": 8,
+    "export_all": false,
+    "export_vfi60": true,
+    "single_files": []
+  }
+}
