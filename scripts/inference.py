@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,10 @@ from src.engine.evaluation import build_flip_evaluator
 from src.engine.evaluation import build_lpips_model
 from src.engine.evaluation import build_metric_meters
 from src.engine.evaluation import calculate_batch_metrics
+from src.engine.evaluation import calculate_psnr_div_sample
 from src.engine.evaluation import format_metric_averages
+from src.engine.evaluation import prepare_psnr_div_sample
+from src.engine.evaluation import PSNR_DIV_METRIC_NAME
 from src.engine.evaluation import read_metric_config
 from src.engine.evaluation import require_psnr_enabled
 from src.engine.flow_approx import build_flow_init_result_with_fill_strategy
@@ -49,6 +53,13 @@ INIT_FLOW_DOWNSCALE_STRATEGIES: tuple[str, ...] = ("bilinear", "masked_area")
 
 InferenceBatchResult = dict[str, Any]
 SplattingRegionMaps = dict[str, Any]
+
+
+def update_metric_meter(metric_meters: dict[str, Any], metric_name: str, metric_value: float) -> None:
+    if metric_name == PSNR_DIV_METRIC_NAME and not math.isfinite(metric_value):
+        return
+
+    metric_meters[metric_name].update(metric_value, 1)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -815,6 +826,13 @@ def main(argv: list[str] | None = None) -> None:
             progress = tqdm(loader, desc=f"{inference_preset}_{record}_{mode_name}", leave=True)
             sample_offset = 0
             group_rows: list[dict[str, object]] = []
+            psnr_div_enabled = bool(metric_config["enable_psnr_div"])
+            psnr_div_threshold = float(metric_config["psnr_div_divergence_threshold"])
+            previous_psnr_div_prediction_rgb = None
+            pending_psnr_div_row = None
+            pending_psnr_div_target_y = None
+            pending_psnr_div_prediction_y = None
+            pending_psnr_div_prediction_rgb = None
 
             for batch in progress:
                 inference_result = run_inference_batch_with_fill_strategy(
@@ -842,8 +860,8 @@ def main(argv: list[str] | None = None) -> None:
                     frame_range = f"frame_{int(row['img0']):04d}_{int(row['img2']):04d}"
                     sample_metric_values = {metric_name: float(metric_values[batch_index]) for metric_name, metric_values in batch_metric_values.items()}
                     for metric_name, metric_value in sample_metric_values.items():
-                        metric_meters[metric_name].update(metric_value, 1)
-                        record_metric_meters[metric_name].update(metric_value, 1)
+                        update_metric_meter(metric_meters, metric_name, metric_value)
+                        update_metric_meter(record_metric_meters, metric_name, metric_value)
 
                     diff_1_to_0 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
                     diff_1_to_2 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
@@ -867,31 +885,70 @@ def main(argv: list[str] | None = None) -> None:
                             "diff_percentile_value": float(max(np.percentile(diff_mag_1_to_2_np, flow_diff_percentile), 1e-6)),
                         }
 
-                    group_rows.append(
-                        {
-                            "sample_index": int(sample_offset + batch_index),
-                            "inference_preset": str(inference_preset),
-                            "record": str(record),
-                            "mode": str(mode_name),
-                            "record_name": f"{record}_{mode_name}",
-                            "frame_range": frame_range,
-                            "valid": bool(row["valid"]) if "valid" in row.index else True,
-                            "distance_index_mean": float(row["D_index Mean"]) if "D_index Mean" in row.index else -1.0,
-                            "distance_index_median": float(row["D_index Median"]) if "D_index Median" in row.index else -1.0,
-                            **sample_metric_values,
-                            "flow_diff_1_to_0_mean": diff_1_to_0["diff_mag_mean"],
-                            "flow_diff_1_to_0_max": diff_1_to_0["diff_mag_max"],
-                            "flow_diff_1_to_0_changed_ratio": diff_1_to_0["diff_changed_ratio"],
-                            "flow_diff_1_to_0_percentile_value": diff_1_to_0["diff_percentile_value"],
-                            "flow_diff_1_to_2_mean": diff_1_to_2["diff_mag_mean"],
-                            "flow_diff_1_to_2_max": diff_1_to_2["diff_mag_max"],
-                            "flow_diff_1_to_2_changed_ratio": diff_1_to_2["diff_changed_ratio"],
-                            "flow_diff_1_to_2_percentile_value": diff_1_to_2["diff_percentile_value"],
-                        }
-                    )
+                    sample_row = {
+                        "sample_index": int(sample_offset + batch_index),
+                        "inference_preset": str(inference_preset),
+                        "record": str(record),
+                        "mode": str(mode_name),
+                        "record_name": f"{record}_{mode_name}",
+                        "frame_range": frame_range,
+                        "valid": bool(row["valid"]) if "valid" in row.index else True,
+                        "distance_index_mean": float(row["D_index Mean"]) if "D_index Mean" in row.index else -1.0,
+                        "distance_index_median": float(row["D_index Median"]) if "D_index Median" in row.index else -1.0,
+                        **sample_metric_values,
+                        "flow_diff_1_to_0_mean": diff_1_to_0["diff_mag_mean"],
+                        "flow_diff_1_to_0_max": diff_1_to_0["diff_mag_max"],
+                        "flow_diff_1_to_0_changed_ratio": diff_1_to_0["diff_changed_ratio"],
+                        "flow_diff_1_to_0_percentile_value": diff_1_to_0["diff_percentile_value"],
+                        "flow_diff_1_to_2_mean": diff_1_to_2["diff_mag_mean"],
+                        "flow_diff_1_to_2_max": diff_1_to_2["diff_mag_max"],
+                        "flow_diff_1_to_2_changed_ratio": diff_1_to_2["diff_changed_ratio"],
+                        "flow_diff_1_to_2_percentile_value": diff_1_to_2["diff_percentile_value"],
+                    }
+                    if psnr_div_enabled:
+                        target_y, prediction_y, prediction_rgb = prepare_psnr_div_sample(
+                            target=imgt[batch_index],
+                            prediction=imgt_pred[batch_index],
+                        )
+                        if pending_psnr_div_row is not None:
+                            psnr_div_value = calculate_psnr_div_sample(
+                                target_y=pending_psnr_div_target_y,
+                                prediction_y=pending_psnr_div_prediction_y,
+                                flow_start_prediction_rgb=pending_psnr_div_prediction_rgb,
+                                flow_end_prediction_rgb=prediction_rgb,
+                                divergence_threshold=psnr_div_threshold,
+                            )
+                            pending_psnr_div_row[PSNR_DIV_METRIC_NAME] = psnr_div_value
+                            update_metric_meter(metric_meters, PSNR_DIV_METRIC_NAME, psnr_div_value)
+                            update_metric_meter(record_metric_meters, PSNR_DIV_METRIC_NAME, psnr_div_value)
+                            group_rows.append(pending_psnr_div_row)
+                            previous_psnr_div_prediction_rgb = pending_psnr_div_prediction_rgb
+
+                        pending_psnr_div_row = sample_row
+                        pending_psnr_div_target_y = target_y
+                        pending_psnr_div_prediction_y = prediction_y
+                        pending_psnr_div_prediction_rgb = prediction_rgb
+                    else:
+                        group_rows.append(sample_row)
 
                 sample_offset += int(imgt_pred.shape[0])
                 progress.set_postfix({"mean_psnr": f"{record_metric_meters['psnr'].avg:.6f}"})
+
+            if psnr_div_enabled and pending_psnr_div_row is not None:
+                if previous_psnr_div_prediction_rgb is None:
+                    psnr_div_value = float("nan")
+                else:
+                    psnr_div_value = calculate_psnr_div_sample(
+                        target_y=pending_psnr_div_target_y,
+                        prediction_y=pending_psnr_div_prediction_y,
+                        flow_start_prediction_rgb=previous_psnr_div_prediction_rgb,
+                        flow_end_prediction_rgb=pending_psnr_div_prediction_rgb,
+                        divergence_threshold=psnr_div_threshold,
+                    )
+                pending_psnr_div_row[PSNR_DIV_METRIC_NAME] = psnr_div_value
+                update_metric_meter(metric_meters, PSNR_DIV_METRIC_NAME, psnr_div_value)
+                update_metric_meter(record_metric_meters, PSNR_DIV_METRIC_NAME, psnr_div_value)
+                group_rows.append(pending_psnr_div_row)
 
             group_metrics_df = pd.DataFrame(group_rows)
             record_metric_values = average_metric_values(record_metric_meters)

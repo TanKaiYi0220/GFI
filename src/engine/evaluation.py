@@ -11,6 +11,7 @@ import torch.nn.functional as F
 LPIPS_NET_CHOICES: tuple[str, ...] = ("alex", "vgg", "squeeze")
 FLIP_DYNAMIC_RANGE_CHOICES: tuple[str, ...] = ("LDR", "HDR")
 FLIP_TONEMAPPER_CHOICES: tuple[str, ...] = ("ACES", "Hable", "Reinhard")
+PSNR_DIV_METRIC_NAME: str = "psnr_div"
 
 
 def calculate_psnr(img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
@@ -164,15 +165,23 @@ def read_metric_config(config_values: dict[str, Any]) -> dict[str, object]:
     if flip_pixels_per_degree <= 0.0:
         raise ValueError(f"metrics.flip_pixels_per_degree must be positive, got {flip_pixels_per_degree}")
 
+    psnr_divergence_threshold = parse_metric_float(raw_config, "psnr_div_divergence_threshold", 0.01)
+    if psnr_divergence_threshold <= 0.0:
+        raise ValueError(
+            f"metrics.psnr_div_divergence_threshold must be positive, got {psnr_divergence_threshold}"
+        )
+
     return {
         "enable_psnr": parse_metric_bool(raw_config, "enable_psnr", True),
         "enable_ssim": parse_metric_bool(raw_config, "enable_ssim", True),
         "enable_lpips": parse_metric_bool(raw_config, "enable_lpips", False),
         "enable_flip": parse_metric_bool(raw_config, "enable_flip", False),
+        "enable_psnr_div": parse_metric_bool(raw_config, "enable_psnr_div", False),
         "lpips_net": lpips_net,
         "flip_dynamic_range": parse_flip_dynamic_range(raw_config),
         "flip_pixels_per_degree": flip_pixels_per_degree,
         "flip_tonemapper": parse_flip_tonemapper(raw_config),
+        "psnr_div_divergence_threshold": psnr_divergence_threshold,
     }
 
 
@@ -182,6 +191,16 @@ def require_psnr_enabled(metric_config: dict[str, object], pipeline_name: str) -
 
     raise ValueError(
         f"{pipeline_name} requires metrics.enable_psnr=true because checkpoint selection and top-k sample selection use PSNR."
+    )
+
+
+def require_psnr_div_disabled(metric_config: dict[str, object], pipeline_name: str) -> None:
+    if not bool(metric_config["enable_psnr_div"]):
+        return
+
+    raise ValueError(
+        f"{pipeline_name} does not support metrics.enable_psnr_div=true. "
+        "PSNR-DIV is a temporal sequence metric and must be computed on ordered inference clips."
     )
 
 
@@ -195,6 +214,8 @@ def get_enabled_metric_names(metric_config: dict[str, object]) -> tuple[str, ...
         metric_names.append("lpips")
     if bool(metric_config["enable_flip"]):
         metric_names.append("flip")
+    if bool(metric_config["enable_psnr_div"]):
+        metric_names.append(PSNR_DIV_METRIC_NAME)
     return tuple(metric_names)
 
 
@@ -329,6 +350,110 @@ def calculate_flip_batch(
 
         values.append(float(mean_flip_error))
     return values
+
+
+def tensor_to_uint8_rgb(image: torch.Tensor) -> np.ndarray:
+    batch = normalize_metric_batch(image).detach().float()
+    if int(batch.shape[0]) != 1:
+        raise ValueError(f"Expected a single image for PSNR-DIV conversion, got shape={tuple(batch.shape)}")
+    if int(batch.shape[1]) != 3:
+        raise ValueError(f"PSNR-DIV expects RGB images with 3 channels, got shape={tuple(batch.shape)}")
+
+    image_rgb = batch[0].clamp(0.0, 1.0).permute(1, 2, 0).contiguous().cpu().numpy()
+    return np.round(image_rgb * 255.0).astype(np.uint8)
+
+
+def convert_rgb_to_y_bt709(rgb_image: np.ndarray) -> np.ndarray:
+    red = rgb_image[:, :, 0].astype(np.float32)
+    green = rgb_image[:, :, 1].astype(np.float32)
+    blue = rgb_image[:, :, 2].astype(np.float32)
+    luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    return luminance.astype(np.uint8)
+
+
+def prepare_psnr_div_sample(target: torch.Tensor, prediction: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    target_rgb = tensor_to_uint8_rgb(target)
+    prediction_rgb = tensor_to_uint8_rgb(prediction)
+    return convert_rgb_to_y_bt709(target_rgb), convert_rgb_to_y_bt709(prediction_rgb), prediction_rgb
+
+
+def calculate_psnr_divergence(motion_field: np.ndarray) -> np.ndarray:
+    horizontal_motion = motion_field[..., 0]
+    vertical_motion = motion_field[..., 1]
+    horizontal_axis0_gradient, _horizontal_axis1_gradient = np.gradient(horizontal_motion)
+    _vertical_axis0_gradient, vertical_axis1_gradient = np.gradient(vertical_motion)
+    divergence = np.abs(horizontal_axis0_gradient + vertical_axis1_gradient)
+    max_divergence = float(np.max(divergence))
+    if max_divergence <= 0.0:
+        return np.zeros_like(divergence, dtype=np.float32)
+    return (divergence / max_divergence).astype(np.float32)
+
+
+def compute_psnr_div_farneback_flow(previous_rgb: np.ndarray, next_rgb: np.ndarray) -> np.ndarray:
+    import cv2
+
+    previous_gray = cv2.cvtColor(previous_rgb, cv2.COLOR_RGB2GRAY)
+    next_gray = cv2.cvtColor(next_rgb, cv2.COLOR_RGB2GRAY)
+    return cv2.calcOpticalFlowFarneback(
+        previous_gray,
+        next_gray,
+        None,
+        0.5,
+        3,
+        15,
+        3,
+        5,
+        1.2,
+        cv2.OPTFLOW_FARNEBACK_GAUSSIAN,
+    )
+
+
+def calculate_psnr_div_value(
+    target_y: np.ndarray,
+    prediction_y: np.ndarray,
+    motion_field: np.ndarray,
+    divergence_threshold: float,
+) -> float:
+    if tuple(target_y.shape) != tuple(prediction_y.shape):
+        raise ValueError(
+            f"PSNR-DIV luminance input shapes must match, got target={tuple(target_y.shape)} "
+            f"prediction={tuple(prediction_y.shape)}"
+        )
+    if tuple(motion_field.shape[:2]) != tuple(target_y.shape):
+        raise ValueError(
+            f"PSNR-DIV motion field shape must match image shape, got motion={tuple(motion_field.shape)} "
+            f"image={tuple(target_y.shape)}"
+        )
+
+    divergence = calculate_psnr_divergence(motion_field=motion_field)
+    mask = divergence > divergence_threshold
+    if int(mask.sum()) == 0:
+        return float("nan")
+
+    error = target_y.astype(np.float32) - prediction_y.astype(np.float32)
+    weighted_mse = float(np.mean((error[mask]) ** 2))
+    if weighted_mse <= 0.0:
+        return float("nan")
+    return float(20.0 * np.log10(255.0 / np.sqrt(weighted_mse)))
+
+
+def calculate_psnr_div_sample(
+    target_y: np.ndarray,
+    prediction_y: np.ndarray,
+    flow_start_prediction_rgb: np.ndarray,
+    flow_end_prediction_rgb: np.ndarray,
+    divergence_threshold: float,
+) -> float:
+    motion_field = compute_psnr_div_farneback_flow(
+        previous_rgb=flow_start_prediction_rgb,
+        next_rgb=flow_end_prediction_rgb,
+    )
+    return calculate_psnr_div_value(
+        target_y=target_y,
+        prediction_y=prediction_y,
+        motion_field=motion_field,
+        divergence_threshold=divergence_threshold,
+    )
 
 
 def calculate_batch_metrics(

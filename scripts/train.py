@@ -29,6 +29,7 @@ from src.engine.evaluation import format_metric_averages
 from src.engine.evaluation import format_metric_values
 from src.engine.evaluation import get_enabled_metric_names
 from src.engine.evaluation import read_metric_config
+from src.engine.evaluation import require_psnr_div_disabled
 from src.engine.evaluation import require_psnr_enabled
 from src.engine.flow_approx import build_flow_init_result_with_fill_strategy
 from src.engine.flow_approx import DEFAULT_SPLATTING_FILL_STRATEGY
@@ -782,6 +783,7 @@ def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
         else parse_bool_value(args.eval_convex_upsampling, "eval_convex_upsampling")
     )
     require_psnr_enabled(args.metric_config, "training")
+    require_psnr_div_disabled(args.metric_config, "training")
     args.input_config = config_defaults
     validate_flow_approx_runtime_args(args)
     return args
