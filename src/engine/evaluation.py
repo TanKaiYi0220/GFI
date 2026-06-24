@@ -4,10 +4,13 @@ from dataclasses import dataclass
 from math import exp
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 LPIPS_NET_CHOICES: tuple[str, ...] = ("alex", "vgg", "squeeze")
+FLIP_DYNAMIC_RANGE_CHOICES: tuple[str, ...] = ("LDR", "HDR")
+FLIP_TONEMAPPER_CHOICES: tuple[str, ...] = ("ACES", "Hable", "Reinhard")
 
 
 def calculate_psnr(img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
@@ -116,6 +119,35 @@ def parse_metric_string(raw_config: dict[str, object], key: str, fallback: str) 
     return value
 
 
+def parse_metric_float(raw_config: dict[str, object], key: str, fallback: float) -> float:
+    if key not in raw_config:
+        return fallback
+
+    value = raw_config[key]
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError(f"metrics.{key} must be a number, got {type(value).__name__}")
+    return float(value)
+
+
+def parse_flip_dynamic_range(raw_config: dict[str, object]) -> str:
+    dynamic_range = parse_metric_string(raw_config, "flip_dynamic_range", "LDR").upper()
+    if dynamic_range not in FLIP_DYNAMIC_RANGE_CHOICES:
+        raise ValueError(
+            f"metrics.flip_dynamic_range must be one of {FLIP_DYNAMIC_RANGE_CHOICES}, got {dynamic_range}"
+        )
+    return dynamic_range
+
+
+def parse_flip_tonemapper(raw_config: dict[str, object]) -> str:
+    raw_tonemapper = parse_metric_string(raw_config, "flip_tonemapper", "ACES").lower()
+    tonemapper_by_key = {tonemapper.lower(): tonemapper for tonemapper in FLIP_TONEMAPPER_CHOICES}
+    if raw_tonemapper not in tonemapper_by_key:
+        raise ValueError(
+            f"metrics.flip_tonemapper must be one of {FLIP_TONEMAPPER_CHOICES}, got {raw_tonemapper}"
+        )
+    return tonemapper_by_key[raw_tonemapper]
+
+
 def read_metric_config(config_values: dict[str, Any]) -> dict[str, object]:
     if "metrics" not in config_values or config_values["metrics"] is None:
         raw_config: dict[str, object] = {}
@@ -128,11 +160,19 @@ def read_metric_config(config_values: dict[str, Any]) -> dict[str, object]:
     if lpips_net not in LPIPS_NET_CHOICES:
         raise ValueError(f"metrics.lpips_net must be one of {LPIPS_NET_CHOICES}, got {lpips_net}")
 
+    flip_pixels_per_degree = parse_metric_float(raw_config, "flip_pixels_per_degree", 67.0)
+    if flip_pixels_per_degree <= 0.0:
+        raise ValueError(f"metrics.flip_pixels_per_degree must be positive, got {flip_pixels_per_degree}")
+
     return {
         "enable_psnr": parse_metric_bool(raw_config, "enable_psnr", True),
         "enable_ssim": parse_metric_bool(raw_config, "enable_ssim", True),
         "enable_lpips": parse_metric_bool(raw_config, "enable_lpips", False),
+        "enable_flip": parse_metric_bool(raw_config, "enable_flip", False),
         "lpips_net": lpips_net,
+        "flip_dynamic_range": parse_flip_dynamic_range(raw_config),
+        "flip_pixels_per_degree": flip_pixels_per_degree,
+        "flip_tonemapper": parse_flip_tonemapper(raw_config),
     }
 
 
@@ -153,6 +193,8 @@ def get_enabled_metric_names(metric_config: dict[str, object]) -> tuple[str, ...
         metric_names.append("ssim")
     if bool(metric_config["enable_lpips"]):
         metric_names.append("lpips")
+    if bool(metric_config["enable_flip"]):
+        metric_names.append("flip")
     return tuple(metric_names)
 
 
@@ -177,6 +219,25 @@ def build_lpips_model(metric_config: dict[str, object], device: torch.device) ->
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     return model
+
+
+def import_flip_evaluator() -> Any:
+    try:
+        import flip_evaluator
+    except ImportError as error:
+        raise ImportError(
+            "NVIDIA FLIP metric is enabled, but the 'flip-evaluator' package is not installed or cannot be imported. "
+            "Install it in the project environment first, then rerun with metrics.enable_flip=true."
+        ) from error
+
+    return flip_evaluator
+
+
+def build_flip_evaluator(metric_config: dict[str, object]) -> Any | None:
+    if not bool(metric_config["enable_flip"]):
+        return None
+
+    return import_flip_evaluator()
 
 
 def calculate_psnr_batch(target: torch.Tensor, prediction: torch.Tensor) -> list[float]:
@@ -208,6 +269,68 @@ def calculate_lpips_batch(target: torch.Tensor, prediction: torch.Tensor, lpips_
     return [float(value) for value in values.detach().cpu().reshape(-1).tolist()]
 
 
+def normalize_flip_batch(image: torch.Tensor, dynamic_range: str) -> np.ndarray:
+    batch = normalize_metric_batch(image).detach().float()
+    if int(batch.shape[1]) != 3:
+        raise ValueError(f"NVIDIA FLIP expects RGB images with 3 channels, got shape={tuple(batch.shape)}")
+
+    if dynamic_range == "LDR":
+        batch = batch.clamp(0.0, 1.0)
+    elif dynamic_range == "HDR":
+        batch = batch.clamp_min(0.0)
+    else:
+        raise ValueError(f"Unsupported NVIDIA FLIP dynamic range: {dynamic_range}")
+
+    return batch.permute(0, 2, 3, 1).contiguous().cpu().numpy().astype(np.float32, copy=False)
+
+
+def build_flip_parameters(metric_config: dict[str, object]) -> dict[str, object]:
+    parameters: dict[str, object] = {
+        "ppd": float(metric_config["flip_pixels_per_degree"]),
+    }
+    if str(metric_config["flip_dynamic_range"]) == "HDR":
+        parameters["tonemapper"] = str(metric_config["flip_tonemapper"])
+    return parameters
+
+
+def calculate_flip_batch(
+    target: torch.Tensor,
+    prediction: torch.Tensor,
+    metric_config: dict[str, object],
+) -> list[float]:
+    dynamic_range = str(metric_config["flip_dynamic_range"])
+    batch_target = normalize_flip_batch(target, dynamic_range)
+    batch_prediction = normalize_flip_batch(prediction, dynamic_range)
+    if tuple(batch_target.shape) != tuple(batch_prediction.shape):
+        raise ValueError(
+            f"NVIDIA FLIP input shapes must match, got target={tuple(batch_target.shape)} "
+            f"prediction={tuple(batch_prediction.shape)}"
+        )
+
+    flip_evaluator = import_flip_evaluator()
+    parameters = build_flip_parameters(metric_config)
+    values: list[float] = []
+    for batch_index in range(int(batch_prediction.shape[0])):
+        try:
+            _error_map, mean_flip_error, _used_parameters = flip_evaluator.evaluate(
+                batch_target[batch_index],
+                batch_prediction[batch_index],
+                dynamic_range,
+                inputsRGB=True,
+                applyMagma=False,
+                computeMeanError=True,
+                parameters=dict(parameters),
+            )
+        except SystemExit as error:
+            raise RuntimeError(
+                f"NVIDIA FLIP evaluator rejected inputs or parameters: dynamic_range={dynamic_range} "
+                f"parameters={parameters}"
+            ) from error
+
+        values.append(float(mean_flip_error))
+    return values
+
+
 def calculate_batch_metrics(
     target: torch.Tensor,
     prediction: torch.Tensor,
@@ -226,6 +349,9 @@ def calculate_batch_metrics(
         if lpips_model is None:
             raise RuntimeError("metrics.enable_lpips=true requires a loaded LPIPS model.")
         batch_values["lpips"] = calculate_lpips_batch(target, prediction, lpips_model)
+
+    if bool(metric_config["enable_flip"]):
+        batch_values["flip"] = calculate_flip_batch(target, prediction, metric_config)
 
     if len(batch_values) == 0:
         raise ValueError("At least one metric must be enabled.")

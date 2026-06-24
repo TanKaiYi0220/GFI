@@ -17,6 +17,7 @@ dependencies = [
     "scikit-learn",
     "tqdm",
     "imageio",
+    "flip-evaluator",
 ]
 
 [tool.hatch.build.targets.wheel]

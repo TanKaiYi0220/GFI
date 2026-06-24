@@ -21,6 +21,7 @@ from src.data.dataset_config import iter_dataset_configs
 from src.data.dataset_config import list_dataset_presets
 from src.engine.evaluation import AverageMeter
 from src.engine.evaluation import average_metric_values
+from src.engine.evaluation import build_flip_evaluator
 from src.engine.evaluation import build_lpips_model
 from src.engine.evaluation import build_metric_meters
 from src.engine.evaluation import calculate_batch_metrics
@@ -970,6 +971,7 @@ def run_training(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lpips_model = build_lpips_model(args.metric_config, device)
+    build_flip_evaluator(args.metric_config)
     logger.info("device=%s", device)
     logger.info("model_name=%s model_init_args=%s", args.model_name, args.model_init_args)
     logger.info(

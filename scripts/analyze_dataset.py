@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.train import build_merged_dataframe
 from scripts.train import set_seed
+from src.engine.evaluation import build_flip_evaluator
 from src.engine.evaluation import build_lpips_model
 from src.engine.evaluation import calculate_batch_metrics
 from src.engine.evaluation import calculate_psnr_batch
@@ -852,6 +853,17 @@ def save_layer_analysis_outputs(
                 title="Warped RGB LPIPS by Record and Layer",
                 output_path=config.output_dir / f"{analysis_preset}_record_layer_lpips.png",
             )
+        if bool(config.metric_config["enable_flip"]):
+            plot_record_metric_by_layer(
+                layer_dataframe=layer_dataframe,
+                analysis_preset=analysis_preset,
+                layer_scales=config.layer_scales,
+                methods=config.layer_bar_methods,
+                metric="warp_flip_mean",
+                ylabel="Mean warped RGB NVIDIA FLIP (lower is better)",
+                title="Warped RGB NVIDIA FLIP by Record and Layer",
+                output_path=config.output_dir / f"{analysis_preset}_record_layer_flip.png",
+            )
 
 
 def analyze_dataset(config: AnalysisConfig) -> None:
@@ -868,6 +880,7 @@ def analyze_dataset(config: AnalysisConfig) -> None:
     set_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lpips_model = build_lpips_model(metric_config=config.metric_config, device=device)
+    build_flip_evaluator(metric_config=config.metric_config)
     logger.info("device=%s analysis_presets=%s", device, config.analysis_presets)
     logger.info("metrics=%s", config.metric_config)
 

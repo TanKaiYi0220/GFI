@@ -27,7 +27,11 @@
     "enable_psnr": true,
     "enable_ssim": true,
     "enable_lpips": true,
-    "lpips_net": "alex"
+    "enable_flip": false,
+    "lpips_net": "alex",
+    "flip_dynamic_range": "LDR",
+    "flip_pixels_per_degree": 67.0,
+    "flip_tonemapper": "ACES"
   },
   "resume_path": null,
   "pretrained_checkpoint_path": "outputs/IFRNet_Residual_0416/checkpoints/best.pth"

@@ -22,7 +22,11 @@
     "enable_psnr": true,
     "enable_ssim": true,
     "enable_lpips": true,
-    "lpips_net": "alex"
+    "enable_flip": false,
+    "lpips_net": "alex",
+    "flip_dynamic_range": "LDR",
+    "flip_pixels_per_degree": 67.0,
+    "flip_tonemapper": "ACES"
   },
   "resume_path": null,
   "pretrained_checkpoint_path": "src/models/external/IFRNet/checkpoints/IFRNet/IFRNet_Vimeo90K.pth"

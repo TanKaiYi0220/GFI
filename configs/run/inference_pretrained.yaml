@@ -14,6 +14,16 @@
   "batch_size": 1,
   "only_fps": 60,
   "input_fps": 30,
+  "metrics": {
+    "enable_psnr": true,
+    "enable_ssim": true,
+    "enable_lpips": false,
+    "enable_flip": false,
+    "lpips_net": "alex",
+    "flip_dynamic_range": "LDR",
+    "flip_pixels_per_degree": 67.0,
+    "flip_tonemapper": "ACES"
+  },
   "scale_factor": 1.0,
   "flow_approx_method": "combination",
   "flow_diff_threshold": 1.0,
