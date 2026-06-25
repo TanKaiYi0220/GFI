@@ -21,6 +21,7 @@ from src.engine.evaluation import read_metric_config
 from src.engine.evaluation import require_flolpips_disabled
 from src.engine.evaluation import require_psnr_div_disabled
 from src.engine.evaluation import require_psnr_enabled
+from src.engine.evaluation import require_vfips_disabled
 from src.engine.flow_approx import build_linear_splatting_flow_init_with_fill_strategy
 from src.engine.flow_approx import build_flow_init_result
 from src.engine.flow_approx import FLOW_APPROX_METHODS
@@ -162,6 +163,7 @@ def build_analysis_config(config_payload: dict[str, Any]) -> AnalysisConfig:
     require_psnr_enabled(metric_config=metric_config, pipeline_name="dataset analysis")
     require_psnr_div_disabled(metric_config=metric_config, pipeline_name="dataset analysis")
     require_flolpips_disabled(metric_config=metric_config, pipeline_name="dataset analysis")
+    require_vfips_disabled(metric_config=metric_config, pipeline_name="dataset analysis")
     return AnalysisConfig(
         mode=str(config_payload["mode"]),
         root_dir=resolve_project_path(str(config_payload["root_dir"])),

@@ -32,6 +32,7 @@ from src.engine.evaluation import get_enabled_metric_names
 from src.engine.evaluation import read_metric_config
 from src.engine.evaluation import require_psnr_div_disabled
 from src.engine.evaluation import require_psnr_enabled
+from src.engine.evaluation import require_vfips_disabled
 from src.engine.flow_approx import build_flow_init_result_with_fill_strategy
 from src.engine.flow_approx import DEFAULT_SPLATTING_FILL_STRATEGY
 from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
@@ -815,6 +816,7 @@ def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     require_psnr_enabled(args.metric_config, "training")
     require_psnr_div_disabled(args.metric_config, "training")
+    require_vfips_disabled(args.metric_config, "training")
     args.input_config = config_defaults
     validate_flow_approx_runtime_args(args)
     return args

@@ -17,6 +17,7 @@ PREFERRED_METRIC_NAMES: tuple[str, ...] = (
     "ssim",
     "lpips",
     "flolpips",
+    "vfips",
     "loss_rec",
     "loss_geo",
     "loss_dis",

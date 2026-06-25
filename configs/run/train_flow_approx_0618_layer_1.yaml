@@ -28,12 +28,17 @@
     "enable_flip": false,
     "enable_psnr_div": false,
     "enable_flolpips": false,
+    "enable_vfips": false,
     "lpips_net": "alex",
     "flip_dynamic_range": "LDR",
     "flip_pixels_per_degree": 67.0,
     "flip_tonemapper": "ACES",
     "psnr_div_divergence_threshold": 0.01,
-    "flolpips_repo_path": null
+    "flolpips_repo_path": null,
+    "vfips_repo_path": null,
+    "vfips_checkpoint_path": null,
+    "vfips_clip_length": 12,
+    "vfips_stride": 12
   },
   "resume_path": null,
   "pretrained_checkpoint_path": "outputs/IFRNet_Residual_0416/checkpoints/best.pth"
