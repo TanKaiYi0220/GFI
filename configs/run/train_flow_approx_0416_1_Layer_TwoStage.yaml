@@ -1,0 +1,30 @@
+{
+  "mode": "train",
+  "model_name": "IFRNet_Residual_FlowApprox",
+    "model_init_args": {
+        "init_flow_layer": 1
+  },
+  "root_dir": "data/",
+  "dataset_root_dir": "/workspace/datasets/",
+  "train_preset": "train_vfx_0416",
+  "test_preset": "test_vfx_0416",
+  "epochs": 100,
+  "eval_interval": 5,
+  "lr_start": 1e-4,
+  "lr_end": 7e-5,
+  "seed": 1234,
+  "batch_size": 16,
+  "output_dir": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_0603/",
+  "only_fps": 60,
+  "input_fps": 30,
+  "flow_approx_method": "splatting",
+  "pretrained_checkpoint_path": "outputs/IFRNet_Residual_0416/checkpoints/best.pth",
+  "sample_train_frames": [
+    "ARPG_3_0_Difficult_5_0404",
+    "ARPG_3_1_Difficult_5_0452"
+  ],
+  "sample_test_frames": [
+    "ARPG_3_3_Difficult_5_0654"
+  ],
+  "sample_interval_epoch": 2
+}

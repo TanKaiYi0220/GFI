@@ -1,0 +1,19 @@
+{
+  "dataset_preset": "train_minor_0507",
+  "root_dir": "data/Minor_0507/",
+  "dataset_root_dir": "/workspace/datasets/Minor_0507/",
+
+  "candidate_inference_config": "configs/run/inference_residual_layer_1_0507.yaml",
+  "baseline_inference_config": "configs/run/inference_finetuning_0507.yaml",
+
+  "candidate_name": "Splat Training",
+  "baseline_name": "Residual",
+
+  "save_overlay_images": true,
+  "save_selected_cases_only": true,
+  "selected_cases_per_bucket": 20,
+
+  "kernel_size": 9,
+  "confidence_threshold": 0.08,
+  "output_path": "compare_outputs/GFI_prediction_region_compare_residual/train_minor_0507_residual_0608/"
+}
