@@ -13,11 +13,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.train import build_merged_dataframe
 from scripts.train import set_seed
+from src.engine.evaluation import build_flip_evaluator
 from src.engine.evaluation import build_lpips_model
 from src.engine.evaluation import calculate_batch_metrics
 from src.engine.evaluation import calculate_psnr_batch
 from src.engine.evaluation import read_metric_config
+from src.engine.evaluation import require_flolpips_disabled
+from src.engine.evaluation import require_psnr_div_disabled
 from src.engine.evaluation import require_psnr_enabled
+from src.engine.evaluation import require_vfips_disabled
 from src.engine.flow_approx import build_linear_splatting_flow_init_with_fill_strategy
 from src.engine.flow_approx import build_flow_init_result
 from src.engine.flow_approx import FLOW_APPROX_METHODS
@@ -157,6 +161,9 @@ def parse_layer_methods(config_payload: dict[str, Any], config_key: str) -> tupl
 def build_analysis_config(config_payload: dict[str, Any]) -> AnalysisConfig:
     metric_config = read_metric_config(config_values=config_payload)
     require_psnr_enabled(metric_config=metric_config, pipeline_name="dataset analysis")
+    require_psnr_div_disabled(metric_config=metric_config, pipeline_name="dataset analysis")
+    require_flolpips_disabled(metric_config=metric_config, pipeline_name="dataset analysis")
+    require_vfips_disabled(metric_config=metric_config, pipeline_name="dataset analysis")
     return AnalysisConfig(
         mode=str(config_payload["mode"]),
         root_dir=resolve_project_path(str(config_payload["root_dir"])),
@@ -328,6 +335,9 @@ def calculate_warp_metrics(
         prediction=prediction.detach(),
         metric_config=metric_config,
         lpips_model=lpips_model,
+        flolpips_model=None,
+        img0=None,
+        img1=None,
     )
 
 
@@ -868,6 +878,7 @@ def analyze_dataset(config: AnalysisConfig) -> None:
     set_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lpips_model = build_lpips_model(metric_config=config.metric_config, device=device)
+    build_flip_evaluator(metric_config=config.metric_config)
     logger.info("device=%s analysis_presets=%s", device, config.analysis_presets)
     logger.info("metrics=%s", config.metric_config)
 

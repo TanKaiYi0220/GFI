@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from math import exp
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 LPIPS_NET_CHOICES: tuple[str, ...] = ("alex", "vgg", "squeeze")
+FLIP_DYNAMIC_RANGE_CHOICES: tuple[str, ...] = ("LDR", "HDR")
+FLIP_TONEMAPPER_CHOICES: tuple[str, ...] = ("ACES", "Hable", "Reinhard")
+PSNR_DIV_METRIC_NAME: str = "psnr_div"
+FLOLPIPS_METRIC_NAME: str = "flolpips"
+VFIPS_METRIC_NAME: str = "vfips"
+VFIPS_MODEL_NAME: str = "multiscale_v33"
+VFIPS_CLIP_LENGTH: int = 12
 
 
 def calculate_psnr(img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
@@ -116,6 +126,55 @@ def parse_metric_string(raw_config: dict[str, object], key: str, fallback: str) 
     return value
 
 
+def parse_metric_optional_string(raw_config: dict[str, object], key: str) -> str | None:
+    if key not in raw_config or raw_config[key] is None:
+        return None
+
+    value = raw_config[key]
+    if not isinstance(value, str):
+        raise TypeError(f"metrics.{key} must be a string or null, got {type(value).__name__}")
+    return value
+
+
+def parse_metric_float(raw_config: dict[str, object], key: str, fallback: float) -> float:
+    if key not in raw_config:
+        return fallback
+
+    value = raw_config[key]
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError(f"metrics.{key} must be a number, got {type(value).__name__}")
+    return float(value)
+
+
+def parse_metric_int(raw_config: dict[str, object], key: str, fallback: int) -> int:
+    if key not in raw_config:
+        return fallback
+
+    value = raw_config[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"metrics.{key} must be an integer, got {type(value).__name__}")
+    return int(value)
+
+
+def parse_flip_dynamic_range(raw_config: dict[str, object]) -> str:
+    dynamic_range = parse_metric_string(raw_config, "flip_dynamic_range", "LDR").upper()
+    if dynamic_range not in FLIP_DYNAMIC_RANGE_CHOICES:
+        raise ValueError(
+            f"metrics.flip_dynamic_range must be one of {FLIP_DYNAMIC_RANGE_CHOICES}, got {dynamic_range}"
+        )
+    return dynamic_range
+
+
+def parse_flip_tonemapper(raw_config: dict[str, object]) -> str:
+    raw_tonemapper = parse_metric_string(raw_config, "flip_tonemapper", "ACES").lower()
+    tonemapper_by_key = {tonemapper.lower(): tonemapper for tonemapper in FLIP_TONEMAPPER_CHOICES}
+    if raw_tonemapper not in tonemapper_by_key:
+        raise ValueError(
+            f"metrics.flip_tonemapper must be one of {FLIP_TONEMAPPER_CHOICES}, got {raw_tonemapper}"
+        )
+    return tonemapper_by_key[raw_tonemapper]
+
+
 def read_metric_config(config_values: dict[str, Any]) -> dict[str, object]:
     if "metrics" not in config_values or config_values["metrics"] is None:
         raw_config: dict[str, object] = {}
@@ -128,11 +187,45 @@ def read_metric_config(config_values: dict[str, Any]) -> dict[str, object]:
     if lpips_net not in LPIPS_NET_CHOICES:
         raise ValueError(f"metrics.lpips_net must be one of {LPIPS_NET_CHOICES}, got {lpips_net}")
 
+    flip_pixels_per_degree = parse_metric_float(raw_config, "flip_pixels_per_degree", 67.0)
+    if flip_pixels_per_degree <= 0.0:
+        raise ValueError(f"metrics.flip_pixels_per_degree must be positive, got {flip_pixels_per_degree}")
+
+    psnr_divergence_threshold = parse_metric_float(raw_config, "psnr_div_divergence_threshold", 0.01)
+    if psnr_divergence_threshold <= 0.0:
+        raise ValueError(
+            f"metrics.psnr_div_divergence_threshold must be positive, got {psnr_divergence_threshold}"
+        )
+
+    vfips_clip_length = parse_metric_int(raw_config, "vfips_clip_length", VFIPS_CLIP_LENGTH)
+    if vfips_clip_length != VFIPS_CLIP_LENGTH:
+        raise ValueError(
+            f"metrics.vfips_clip_length must be {VFIPS_CLIP_LENGTH} because the official VFIPS "
+            f"{VFIPS_MODEL_NAME} model is trained for 12-frame clips."
+        )
+
+    vfips_stride = parse_metric_int(raw_config, "vfips_stride", VFIPS_CLIP_LENGTH)
+    if vfips_stride <= 0:
+        raise ValueError(f"metrics.vfips_stride must be positive, got {vfips_stride}")
+
     return {
         "enable_psnr": parse_metric_bool(raw_config, "enable_psnr", True),
         "enable_ssim": parse_metric_bool(raw_config, "enable_ssim", True),
         "enable_lpips": parse_metric_bool(raw_config, "enable_lpips", False),
+        "enable_flip": parse_metric_bool(raw_config, "enable_flip", False),
+        "enable_psnr_div": parse_metric_bool(raw_config, "enable_psnr_div", False),
+        "enable_flolpips": parse_metric_bool(raw_config, "enable_flolpips", False),
+        "enable_vfips": parse_metric_bool(raw_config, "enable_vfips", False),
         "lpips_net": lpips_net,
+        "flip_dynamic_range": parse_flip_dynamic_range(raw_config),
+        "flip_pixels_per_degree": flip_pixels_per_degree,
+        "flip_tonemapper": parse_flip_tonemapper(raw_config),
+        "psnr_div_divergence_threshold": psnr_divergence_threshold,
+        "flolpips_repo_path": parse_metric_optional_string(raw_config, "flolpips_repo_path"),
+        "vfips_repo_path": parse_metric_optional_string(raw_config, "vfips_repo_path"),
+        "vfips_checkpoint_path": parse_metric_optional_string(raw_config, "vfips_checkpoint_path"),
+        "vfips_clip_length": vfips_clip_length,
+        "vfips_stride": vfips_stride,
     }
 
 
@@ -145,6 +238,36 @@ def require_psnr_enabled(metric_config: dict[str, object], pipeline_name: str) -
     )
 
 
+def require_psnr_div_disabled(metric_config: dict[str, object], pipeline_name: str) -> None:
+    if not bool(metric_config["enable_psnr_div"]):
+        return
+
+    raise ValueError(
+        f"{pipeline_name} does not support metrics.enable_psnr_div=true. "
+        "PSNR-DIV is a temporal sequence metric and must be computed on ordered inference clips."
+    )
+
+
+def require_flolpips_disabled(metric_config: dict[str, object], pipeline_name: str) -> None:
+    if not bool(metric_config["enable_flolpips"]):
+        return
+
+    raise ValueError(
+        f"{pipeline_name} does not support metrics.enable_flolpips=true. "
+        "FloLPIPS requires image triplets: previous frame, interpolated prediction, and next frame."
+    )
+
+
+def require_vfips_disabled(metric_config: dict[str, object], pipeline_name: str) -> None:
+    if not bool(metric_config["enable_vfips"]):
+        return
+
+    raise ValueError(
+        f"{pipeline_name} does not support metrics.enable_vfips=true. "
+        "VFIPS requires ordered 12-frame reference and distorted video clips."
+    )
+
+
 def get_enabled_metric_names(metric_config: dict[str, object]) -> tuple[str, ...]:
     metric_names = []
     if bool(metric_config["enable_psnr"]):
@@ -153,6 +276,14 @@ def get_enabled_metric_names(metric_config: dict[str, object]) -> tuple[str, ...
         metric_names.append("ssim")
     if bool(metric_config["enable_lpips"]):
         metric_names.append("lpips")
+    if bool(metric_config["enable_flip"]):
+        metric_names.append("flip")
+    if bool(metric_config["enable_psnr_div"]):
+        metric_names.append(PSNR_DIV_METRIC_NAME)
+    if bool(metric_config["enable_flolpips"]):
+        metric_names.append(FLOLPIPS_METRIC_NAME)
+    if bool(metric_config["enable_vfips"]):
+        metric_names.append(VFIPS_METRIC_NAME)
     return tuple(metric_names)
 
 
@@ -173,6 +304,149 @@ def build_lpips_model(metric_config: dict[str, object], device: torch.device) ->
         ) from error
 
     model = lpips.LPIPS(net=str(metric_config["lpips_net"])).to(device)
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
+
+
+def import_flip_evaluator() -> Any:
+    try:
+        import flip_evaluator
+    except ImportError as error:
+        raise ImportError(
+            "NVIDIA FLIP metric is enabled, but the 'flip-evaluator' package is not installed or cannot be imported. "
+            "Install it in the project environment first, then rerun with metrics.enable_flip=true."
+        ) from error
+
+    return flip_evaluator
+
+
+def build_flip_evaluator(metric_config: dict[str, object]) -> Any | None:
+    if not bool(metric_config["enable_flip"]):
+        return None
+
+    return import_flip_evaluator()
+
+
+def import_flolpips_module(metric_config: dict[str, object]) -> Any:
+    repo_path = metric_config["flolpips_repo_path"]
+    if repo_path is not None:
+        resolved_path = Path(str(repo_path)).expanduser().resolve()
+        if not resolved_path.is_dir():
+            raise FileNotFoundError(f"metrics.flolpips_repo_path does not exist or is not a directory: {resolved_path}")
+        resolved_path_text = str(resolved_path)
+        if resolved_path_text not in sys.path:
+            sys.path.insert(0, resolved_path_text)
+
+    try:
+        import flolpips
+    except ImportError as error:
+        raise ImportError(
+            "FloLPIPS metric is enabled, but the official FloLPIPS module could not be imported. "
+            "Clone https://github.com/danier97/FloLPIPS and set metrics.flolpips_repo_path to that directory, "
+            "or make its flolpips.py importable through PYTHONPATH."
+        ) from error
+
+    return flolpips
+
+
+def build_flolpips_model(metric_config: dict[str, object], device: torch.device) -> Any | None:
+    if not bool(metric_config["enable_flolpips"]):
+        return None
+    if device.type != "cuda":
+        raise RuntimeError(
+            "metrics.enable_flolpips=true requires a CUDA device because the official FloLPIPS PWCNet "
+            "implementation uses CUDA/CuPy correlation kernels."
+        )
+
+    flolpips_module = import_flolpips_module(metric_config=metric_config)
+    try:
+        model = flolpips_module.Flolpips().to(device)
+    except Exception as error:
+        raise RuntimeError(
+            "Failed to initialize FloLPIPS. Ensure the official FloLPIPS dependencies are installed "
+            "(torchvision, cupy for your CUDA version, opencv-python) and that PWCNet weights can be loaded."
+        ) from error
+
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
+
+
+def import_vfips_networks(metric_config: dict[str, object]) -> Any:
+    repo_path = metric_config["vfips_repo_path"]
+    if repo_path is not None:
+        resolved_path = Path(str(repo_path)).expanduser().resolve()
+        if not resolved_path.is_dir():
+            raise FileNotFoundError(f"metrics.vfips_repo_path does not exist or is not a directory: {resolved_path}")
+        resolved_path_text = str(resolved_path)
+        if resolved_path_text not in sys.path:
+            sys.path.insert(0, resolved_path_text)
+
+    try:
+        import networks
+    except ImportError as error:
+        raise ImportError(
+            "VFIPS metric is enabled, but the official VFIPS networks package could not be imported. "
+            "Clone https://github.com/hqqxyy/VFIPS and set metrics.vfips_repo_path to that directory, "
+            "or make its networks package importable through PYTHONPATH. The official implementation also "
+            "requires dependencies such as timm and torchvision."
+        ) from error
+
+    return networks
+
+
+def resolve_vfips_checkpoint_path(metric_config: dict[str, object]) -> Path:
+    checkpoint_path = metric_config["vfips_checkpoint_path"]
+    if checkpoint_path is None:
+        repo_path = metric_config["vfips_repo_path"]
+        if repo_path is None:
+            raise ValueError(
+                "metrics.enable_vfips=true requires metrics.vfips_checkpoint_path when "
+                "metrics.vfips_repo_path is not set."
+            )
+        resolved_path = (
+            Path(str(repo_path)).expanduser().resolve()
+            / "exp"
+            / "eccv_ms_multiscale_v33"
+            / "model.pytorch"
+        )
+    else:
+        resolved_path = Path(str(checkpoint_path)).expanduser().resolve()
+
+    if not resolved_path.is_file():
+        raise FileNotFoundError(f"metrics.vfips_checkpoint_path does not exist or is not a file: {resolved_path}")
+    return resolved_path
+
+
+def build_vfips_model(metric_config: dict[str, object], device: torch.device) -> Any | None:
+    if not bool(metric_config["enable_vfips"]):
+        return None
+    if device.type != "cuda":
+        raise RuntimeError(
+            "metrics.enable_vfips=true requires a CUDA device because the official VFIPS implementation "
+            "constructs CUDA modules and the README recommends at least 12 GB GPU memory."
+        )
+
+    vfips_networks = import_vfips_networks(metric_config=metric_config)
+    checkpoint_path = resolve_vfips_checkpoint_path(metric_config=metric_config)
+    try:
+        model = vfips_networks.get_model(VFIPS_MODEL_NAME, depth_ksize=1, opt=None)
+    except Exception as error:
+        raise RuntimeError(
+            "Failed to initialize VFIPS. Ensure the official VFIPS dependencies are installed "
+            "(timm, torchvision, scipy, opencv-python) and that CUDA is available."
+        ) from error
+
+    try:
+        state_dict = torch.load(str(checkpoint_path), map_location=device)
+        model.load_state_dict(state_dict)
+    except Exception as error:
+        raise RuntimeError(f"Failed to load VFIPS checkpoint: path={checkpoint_path}") from error
+
+    model.to(device)
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
@@ -208,11 +482,336 @@ def calculate_lpips_batch(target: torch.Tensor, prediction: torch.Tensor, lpips_
     return [float(value) for value in values.detach().cpu().reshape(-1).tolist()]
 
 
+def normalize_flolpips_batch(image: torch.Tensor) -> torch.Tensor:
+    batch = normalize_metric_batch(image).detach().float()
+    if int(batch.shape[1]) != 3:
+        raise ValueError(f"FloLPIPS expects RGB images with 3 channels, got shape={tuple(batch.shape)}")
+    return batch.clamp(0.0, 1.0)
+
+
+def calculate_flolpips_batch(
+    img0: torch.Tensor,
+    img1: torch.Tensor,
+    target: torch.Tensor,
+    prediction: torch.Tensor,
+    flolpips_model: Any,
+) -> list[float]:
+    normalized_img0 = normalize_flolpips_batch(img0)
+    normalized_img1 = normalize_flolpips_batch(img1)
+    normalized_target = normalize_flolpips_batch(target)
+    normalized_prediction = normalize_flolpips_batch(prediction)
+    if tuple(normalized_img0.shape) != tuple(normalized_img1.shape):
+        raise ValueError(
+            f"FloLPIPS endpoint shapes must match, got img0={tuple(normalized_img0.shape)} "
+            f"img1={tuple(normalized_img1.shape)}"
+        )
+    if tuple(normalized_target.shape) != tuple(normalized_prediction.shape):
+        raise ValueError(
+            f"FloLPIPS target and prediction shapes must match, got target={tuple(normalized_target.shape)} "
+            f"prediction={tuple(normalized_prediction.shape)}"
+        )
+    if tuple(normalized_img0.shape) != tuple(normalized_target.shape):
+        raise ValueError(
+            f"FloLPIPS endpoint and target shapes must match, got endpoint={tuple(normalized_img0.shape)} "
+            f"target={tuple(normalized_target.shape)}"
+        )
+
+    values = flolpips_model(
+        normalized_img0,
+        normalized_img1,
+        normalized_prediction,
+        normalized_target,
+    )
+    return [float(value) for value in values.detach().cpu().reshape(-1).tolist()]
+
+
+def get_model_device(model: Any) -> torch.device:
+    try:
+        return next(model.parameters()).device
+    except StopIteration as error:
+        raise RuntimeError(f"Metric model {type(model).__name__} has no parameters to infer its device.") from error
+
+
+def normalize_vfips_clip(
+    frames: list[torch.Tensor],
+    clip_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if len(frames) != clip_length:
+        raise ValueError(f"VFIPS clip must contain {clip_length} frames, got {len(frames)}")
+
+    normalized_frames: list[torch.Tensor] = []
+    expected_shape: tuple[int, ...] | None = None
+    for frame_index, frame in enumerate(frames):
+        batch = normalize_metric_batch(frame).detach().float()
+        if int(batch.shape[0]) != 1:
+            raise ValueError(f"VFIPS expects single-frame tensors, got frame_index={frame_index} shape={tuple(batch.shape)}")
+        if int(batch.shape[1]) != 3:
+            raise ValueError(f"VFIPS expects RGB images with 3 channels, got frame_index={frame_index} shape={tuple(batch.shape)}")
+
+        image = batch[0].clamp(0.0, 1.0)
+        image_shape = tuple(image.shape)
+        if expected_shape is None:
+            expected_shape = image_shape
+        elif image_shape != expected_shape:
+            raise ValueError(
+                f"VFIPS clip frames must share one shape, got expected={expected_shape} "
+                f"frame_index={frame_index} shape={image_shape}"
+            )
+        normalized_frames.append(image)
+
+    clip = torch.stack(normalized_frames, dim=0).unsqueeze(0)
+    return (clip.to(device=device, non_blocking=True) * 2.0) - 1.0
+
+
+def calculate_vfips_clip(
+    reference_frames: list[torch.Tensor],
+    prediction_frames: list[torch.Tensor],
+    vfips_model: Any,
+) -> float:
+    if len(reference_frames) != len(prediction_frames):
+        raise ValueError(
+            f"VFIPS reference and prediction clips must have the same length, got "
+            f"reference={len(reference_frames)} prediction={len(prediction_frames)}"
+        )
+
+    device = get_model_device(model=vfips_model)
+    reference_clip = normalize_vfips_clip(reference_frames, len(reference_frames), device)
+    prediction_clip = normalize_vfips_clip(prediction_frames, len(prediction_frames), device)
+    if tuple(reference_clip.shape) != tuple(prediction_clip.shape):
+        raise ValueError(
+            f"VFIPS reference and prediction clip shapes must match, got "
+            f"reference={tuple(reference_clip.shape)} prediction={tuple(prediction_clip.shape)}"
+        )
+
+    values = vfips_model(reference_clip, prediction_clip)
+    flattened_values = values.detach().cpu().reshape(-1).tolist()
+    if len(flattened_values) != 1:
+        raise ValueError(f"VFIPS expected one score for one clip, got values={flattened_values}")
+    return float(flattened_values[0])
+
+
+def calculate_vfips_sequence_sample_values(
+    reference_frames: list[torch.Tensor],
+    prediction_frames: list[torch.Tensor],
+    sample_indices: list[int],
+    sample_frame_positions: list[int],
+    vfips_model: Any,
+    clip_length: int,
+    stride: int,
+) -> dict[int, float]:
+    if clip_length != VFIPS_CLIP_LENGTH:
+        raise ValueError(f"VFIPS clip_length must be {VFIPS_CLIP_LENGTH}, got {clip_length}")
+    if stride <= 0:
+        raise ValueError(f"VFIPS stride must be positive, got {stride}")
+    if len(reference_frames) != len(prediction_frames):
+        raise ValueError(
+            f"VFIPS reference and prediction sequences must have the same length, got "
+            f"reference={len(reference_frames)} prediction={len(prediction_frames)}"
+        )
+    if len(sample_indices) != len(sample_frame_positions):
+        raise ValueError(
+            f"VFIPS sample_indices and sample_frame_positions must have the same length, got "
+            f"indices={len(sample_indices)} positions={len(sample_frame_positions)}"
+        )
+
+    score_lists = {int(sample_index): [] for sample_index in sample_indices}
+    frame_count = len(reference_frames)
+    if frame_count < clip_length:
+        return {sample_index: float("nan") for sample_index in score_lists}
+
+    last_start_index = frame_count - clip_length
+    for start_index in range(0, last_start_index + 1, stride):
+        end_index = start_index + clip_length
+        score = calculate_vfips_clip(
+            reference_frames=reference_frames[start_index:end_index],
+            prediction_frames=prediction_frames[start_index:end_index],
+            vfips_model=vfips_model,
+        )
+        for sample_index, sample_frame_position in zip(sample_indices, sample_frame_positions):
+            if start_index <= sample_frame_position < end_index:
+                score_lists[int(sample_index)].append(score)
+
+    return {
+        sample_index: float(np.mean(scores)) if len(scores) > 0 else float("nan")
+        for sample_index, scores in score_lists.items()
+    }
+
+
+def normalize_flip_batch(image: torch.Tensor, dynamic_range: str) -> np.ndarray:
+    batch = normalize_metric_batch(image).detach().float()
+    if int(batch.shape[1]) != 3:
+        raise ValueError(f"NVIDIA FLIP expects RGB images with 3 channels, got shape={tuple(batch.shape)}")
+
+    if dynamic_range == "LDR":
+        batch = batch.clamp(0.0, 1.0)
+    elif dynamic_range == "HDR":
+        batch = batch.clamp_min(0.0)
+    else:
+        raise ValueError(f"Unsupported NVIDIA FLIP dynamic range: {dynamic_range}")
+
+    return batch.permute(0, 2, 3, 1).contiguous().cpu().numpy().astype(np.float32, copy=False)
+
+
+def build_flip_parameters(metric_config: dict[str, object]) -> dict[str, object]:
+    parameters: dict[str, object] = {
+        "ppd": float(metric_config["flip_pixels_per_degree"]),
+    }
+    if str(metric_config["flip_dynamic_range"]) == "HDR":
+        parameters["tonemapper"] = str(metric_config["flip_tonemapper"])
+    return parameters
+
+
+def calculate_flip_batch(
+    target: torch.Tensor,
+    prediction: torch.Tensor,
+    metric_config: dict[str, object],
+) -> list[float]:
+    dynamic_range = str(metric_config["flip_dynamic_range"])
+    batch_target = normalize_flip_batch(target, dynamic_range)
+    batch_prediction = normalize_flip_batch(prediction, dynamic_range)
+    if tuple(batch_target.shape) != tuple(batch_prediction.shape):
+        raise ValueError(
+            f"NVIDIA FLIP input shapes must match, got target={tuple(batch_target.shape)} "
+            f"prediction={tuple(batch_prediction.shape)}"
+        )
+
+    flip_evaluator = import_flip_evaluator()
+    parameters = build_flip_parameters(metric_config)
+    values: list[float] = []
+    for batch_index in range(int(batch_prediction.shape[0])):
+        try:
+            _error_map, mean_flip_error, _used_parameters = flip_evaluator.evaluate(
+                batch_target[batch_index],
+                batch_prediction[batch_index],
+                dynamic_range,
+                inputsRGB=True,
+                applyMagma=False,
+                computeMeanError=True,
+                parameters=dict(parameters),
+            )
+        except SystemExit as error:
+            raise RuntimeError(
+                f"NVIDIA FLIP evaluator rejected inputs or parameters: dynamic_range={dynamic_range} "
+                f"parameters={parameters}"
+            ) from error
+
+        values.append(float(mean_flip_error))
+    return values
+
+
+def tensor_to_uint8_rgb(image: torch.Tensor) -> np.ndarray:
+    batch = normalize_metric_batch(image).detach().float()
+    if int(batch.shape[0]) != 1:
+        raise ValueError(f"Expected a single image for PSNR-DIV conversion, got shape={tuple(batch.shape)}")
+    if int(batch.shape[1]) != 3:
+        raise ValueError(f"PSNR-DIV expects RGB images with 3 channels, got shape={tuple(batch.shape)}")
+
+    image_rgb = batch[0].clamp(0.0, 1.0).permute(1, 2, 0).contiguous().cpu().numpy()
+    return np.round(image_rgb * 255.0).astype(np.uint8)
+
+
+def convert_rgb_to_y_bt709(rgb_image: np.ndarray) -> np.ndarray:
+    red = rgb_image[:, :, 0].astype(np.float32)
+    green = rgb_image[:, :, 1].astype(np.float32)
+    blue = rgb_image[:, :, 2].astype(np.float32)
+    luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    return luminance.astype(np.uint8)
+
+
+def prepare_psnr_div_sample(target: torch.Tensor, prediction: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    target_rgb = tensor_to_uint8_rgb(target)
+    prediction_rgb = tensor_to_uint8_rgb(prediction)
+    return convert_rgb_to_y_bt709(target_rgb), convert_rgb_to_y_bt709(prediction_rgb), prediction_rgb
+
+
+def calculate_psnr_divergence(motion_field: np.ndarray) -> np.ndarray:
+    horizontal_motion = motion_field[..., 0]
+    vertical_motion = motion_field[..., 1]
+    horizontal_axis0_gradient, _horizontal_axis1_gradient = np.gradient(horizontal_motion)
+    _vertical_axis0_gradient, vertical_axis1_gradient = np.gradient(vertical_motion)
+    divergence = np.abs(horizontal_axis0_gradient + vertical_axis1_gradient)
+    max_divergence = float(np.max(divergence))
+    if max_divergence <= 0.0:
+        return np.zeros_like(divergence, dtype=np.float32)
+    return (divergence / max_divergence).astype(np.float32)
+
+
+def compute_psnr_div_farneback_flow(previous_rgb: np.ndarray, next_rgb: np.ndarray) -> np.ndarray:
+    import cv2
+
+    previous_gray = cv2.cvtColor(previous_rgb, cv2.COLOR_RGB2GRAY)
+    next_gray = cv2.cvtColor(next_rgb, cv2.COLOR_RGB2GRAY)
+    return cv2.calcOpticalFlowFarneback(
+        previous_gray,
+        next_gray,
+        None,
+        0.5,
+        3,
+        15,
+        3,
+        5,
+        1.2,
+        cv2.OPTFLOW_FARNEBACK_GAUSSIAN,
+    )
+
+
+def calculate_psnr_div_value(
+    target_y: np.ndarray,
+    prediction_y: np.ndarray,
+    motion_field: np.ndarray,
+    divergence_threshold: float,
+) -> float:
+    if tuple(target_y.shape) != tuple(prediction_y.shape):
+        raise ValueError(
+            f"PSNR-DIV luminance input shapes must match, got target={tuple(target_y.shape)} "
+            f"prediction={tuple(prediction_y.shape)}"
+        )
+    if tuple(motion_field.shape[:2]) != tuple(target_y.shape):
+        raise ValueError(
+            f"PSNR-DIV motion field shape must match image shape, got motion={tuple(motion_field.shape)} "
+            f"image={tuple(target_y.shape)}"
+        )
+
+    divergence = calculate_psnr_divergence(motion_field=motion_field)
+    mask = divergence > divergence_threshold
+    if int(mask.sum()) == 0:
+        return float("nan")
+
+    error = target_y.astype(np.float32) - prediction_y.astype(np.float32)
+    weighted_mse = float(np.mean((error[mask]) ** 2))
+    if weighted_mse <= 0.0:
+        return float("nan")
+    return float(20.0 * np.log10(255.0 / np.sqrt(weighted_mse)))
+
+
+def calculate_psnr_div_sample(
+    target_y: np.ndarray,
+    prediction_y: np.ndarray,
+    flow_start_prediction_rgb: np.ndarray,
+    flow_end_prediction_rgb: np.ndarray,
+    divergence_threshold: float,
+) -> float:
+    motion_field = compute_psnr_div_farneback_flow(
+        previous_rgb=flow_start_prediction_rgb,
+        next_rgb=flow_end_prediction_rgb,
+    )
+    return calculate_psnr_div_value(
+        target_y=target_y,
+        prediction_y=prediction_y,
+        motion_field=motion_field,
+        divergence_threshold=divergence_threshold,
+    )
+
+
 def calculate_batch_metrics(
     target: torch.Tensor,
     prediction: torch.Tensor,
     metric_config: dict[str, object],
     lpips_model: Any | None,
+    flolpips_model: Any | None,
+    img0: torch.Tensor | None,
+    img1: torch.Tensor | None,
 ) -> dict[str, list[float]]:
     batch_values: dict[str, list[float]] = {}
 
@@ -226,6 +825,22 @@ def calculate_batch_metrics(
         if lpips_model is None:
             raise RuntimeError("metrics.enable_lpips=true requires a loaded LPIPS model.")
         batch_values["lpips"] = calculate_lpips_batch(target, prediction, lpips_model)
+
+    if bool(metric_config["enable_flolpips"]):
+        if flolpips_model is None:
+            raise RuntimeError("metrics.enable_flolpips=true requires a loaded FloLPIPS model.")
+        if img0 is None or img1 is None:
+            raise RuntimeError("metrics.enable_flolpips=true requires img0 and img1 endpoint tensors.")
+        batch_values[FLOLPIPS_METRIC_NAME] = calculate_flolpips_batch(
+            img0=img0,
+            img1=img1,
+            target=target,
+            prediction=prediction,
+            flolpips_model=flolpips_model,
+        )
+
+    if bool(metric_config["enable_flip"]):
+        batch_values["flip"] = calculate_flip_batch(target, prediction, metric_config)
 
     if len(batch_values) == 0:
         raise ValueError("At least one metric must be enabled.")

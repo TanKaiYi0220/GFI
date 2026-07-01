@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -15,12 +16,20 @@ from scripts.train import read_model_init_args
 from scripts.train import resolve_model_class
 from scripts.train import set_seed
 from src.engine.evaluation import average_metric_values
+from src.engine.evaluation import build_flip_evaluator
+from src.engine.evaluation import build_flolpips_model
 from src.engine.evaluation import build_lpips_model
 from src.engine.evaluation import build_metric_meters
+from src.engine.evaluation import build_vfips_model
 from src.engine.evaluation import calculate_batch_metrics
+from src.engine.evaluation import calculate_psnr_div_sample
+from src.engine.evaluation import calculate_vfips_sequence_sample_values
 from src.engine.evaluation import format_metric_averages
+from src.engine.evaluation import prepare_psnr_div_sample
+from src.engine.evaluation import PSNR_DIV_METRIC_NAME
 from src.engine.evaluation import read_metric_config
 from src.engine.evaluation import require_psnr_enabled
+from src.engine.evaluation import VFIPS_METRIC_NAME
 from src.engine.flow_approx import build_flow_init_result_with_fill_strategy
 from src.engine.flow_approx import DEFAULT_SPLATTING_FILL_STRATEGY
 from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
@@ -46,6 +55,94 @@ INIT_FLOW_DOWNSCALE_STRATEGIES: tuple[str, ...] = ("bilinear", "masked_area")
 
 InferenceBatchResult = dict[str, Any]
 SplattingRegionMaps = dict[str, Any]
+VfipsSegment = dict[str, Any]
+
+
+def update_metric_meter(metric_meters: dict[str, Any], metric_name: str, metric_value: float) -> None:
+    if metric_name in (PSNR_DIV_METRIC_NAME, VFIPS_METRIC_NAME) and not math.isfinite(metric_value):
+        return
+
+    metric_meters[metric_name].update(metric_value, 1)
+
+
+def start_vfips_segment(frame_index: int, frame: Any) -> VfipsSegment:
+    source_frame = frame.detach().cpu()
+    return {
+        "last_frame_index": frame_index,
+        "reference_frames": [source_frame],
+        "prediction_frames": [source_frame],
+        "sample_indices": [],
+        "sample_frame_positions": [],
+    }
+
+
+def append_vfips_sample(
+    vfips_segments: list[VfipsSegment],
+    sample_index: int,
+    frame_0_index: int,
+    frame_2_index: int,
+    img0: Any,
+    imgt: Any,
+    img1: Any,
+    imgt_pred: Any,
+) -> None:
+    if len(vfips_segments) == 0 or int(vfips_segments[-1]["last_frame_index"]) != frame_0_index:
+        vfips_segments.append(start_vfips_segment(frame_index=frame_0_index, frame=img0))
+
+    current_segment = vfips_segments[-1]
+    reference_frames = current_segment["reference_frames"]
+    prediction_frames = current_segment["prediction_frames"]
+    sample_frame_positions = current_segment["sample_frame_positions"]
+    sample_indices = current_segment["sample_indices"]
+
+    sample_frame_positions.append(len(reference_frames))
+    sample_indices.append(sample_index)
+    reference_frames.append(imgt.detach().cpu())
+    prediction_frames.append(imgt_pred.detach().cpu())
+    endpoint_frame = img1.detach().cpu()
+    reference_frames.append(endpoint_frame)
+    prediction_frames.append(endpoint_frame)
+    current_segment["last_frame_index"] = frame_2_index
+
+
+def calculate_group_vfips_values(
+    vfips_segments: list[VfipsSegment],
+    metric_config: dict[str, object],
+    vfips_model: Any | None,
+) -> dict[int, float]:
+    if not bool(metric_config["enable_vfips"]):
+        return {}
+    if vfips_model is None:
+        raise RuntimeError("metrics.enable_vfips=true requires a loaded VFIPS model.")
+
+    values_by_sample: dict[int, float] = {}
+    for vfips_segment in vfips_segments:
+        segment_values = calculate_vfips_sequence_sample_values(
+            reference_frames=vfips_segment["reference_frames"],
+            prediction_frames=vfips_segment["prediction_frames"],
+            sample_indices=vfips_segment["sample_indices"],
+            sample_frame_positions=vfips_segment["sample_frame_positions"],
+            vfips_model=vfips_model,
+            clip_length=int(metric_config["vfips_clip_length"]),
+            stride=int(metric_config["vfips_stride"]),
+        )
+        values_by_sample.update(segment_values)
+
+    return values_by_sample
+
+
+def apply_vfips_values_to_group_rows(
+    group_rows: list[dict[str, object]],
+    values_by_sample: dict[int, float],
+    metric_meters: dict[str, Any],
+    record_metric_meters: dict[str, Any],
+) -> None:
+    for sample_row in group_rows:
+        sample_index = int(sample_row["sample_index"])
+        vfips_value = float(values_by_sample.get(sample_index, float("nan")))
+        sample_row[VFIPS_METRIC_NAME] = vfips_value
+        update_metric_meter(metric_meters, VFIPS_METRIC_NAME, vfips_value)
+        update_metric_meter(record_metric_meters, VFIPS_METRIC_NAME, vfips_value)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -746,6 +843,9 @@ def main(argv: list[str] | None = None) -> None:
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lpips_model = build_lpips_model(metric_config, device)
+    flolpips_model = build_flolpips_model(metric_config, device)
+    vfips_model = build_vfips_model(metric_config, device)
+    build_flip_evaluator(metric_config)
     logger.info("device=%s model=%s", device, model_name)
     logger.info("metrics=%s", metric_config)
     logger.info(
@@ -800,6 +900,15 @@ def main(argv: list[str] | None = None) -> None:
             progress = tqdm(loader, desc=f"{inference_preset}_{record}_{mode_name}", leave=True)
             sample_offset = 0
             group_rows: list[dict[str, object]] = []
+            psnr_div_enabled = bool(metric_config["enable_psnr_div"])
+            psnr_div_threshold = float(metric_config["psnr_div_divergence_threshold"])
+            vfips_enabled = bool(metric_config["enable_vfips"])
+            vfips_segments: list[VfipsSegment] = []
+            previous_psnr_div_prediction_rgb = None
+            pending_psnr_div_row = None
+            pending_psnr_div_target_y = None
+            pending_psnr_div_prediction_y = None
+            pending_psnr_div_prediction_rgb = None
 
             for batch in progress:
                 inference_result = run_inference_batch_with_fill_strategy(
@@ -820,15 +929,23 @@ def main(argv: list[str] | None = None) -> None:
                 splatting_region_maps = inference_result.get("splatting_region_maps")
                 up_flow0_1 = inference_result["up_flow0_1"]
                 up_flow1_1 = inference_result["up_flow1_1"]
-                batch_metric_values = calculate_batch_metrics(imgt.detach(), imgt_pred.detach(), metric_config, lpips_model)
+                batch_metric_values = calculate_batch_metrics(
+                    target=imgt.detach(),
+                    prediction=imgt_pred.detach(),
+                    metric_config=metric_config,
+                    lpips_model=lpips_model,
+                    flolpips_model=flolpips_model,
+                    img0=inference_result["img0"].detach(),
+                    img1=inference_result["img1"].detach(),
+                )
 
                 for batch_index in range(int(imgt_pred.shape[0])):
                     row = group_dataframe.iloc[sample_offset + batch_index]
                     frame_range = f"frame_{int(row['img0']):04d}_{int(row['img2']):04d}"
                     sample_metric_values = {metric_name: float(metric_values[batch_index]) for metric_name, metric_values in batch_metric_values.items()}
                     for metric_name, metric_value in sample_metric_values.items():
-                        metric_meters[metric_name].update(metric_value, 1)
-                        record_metric_meters[metric_name].update(metric_value, 1)
+                        update_metric_meter(metric_meters, metric_name, metric_value)
+                        update_metric_meter(record_metric_meters, metric_name, metric_value)
 
                     diff_1_to_0 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
                     diff_1_to_2 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
@@ -852,31 +969,94 @@ def main(argv: list[str] | None = None) -> None:
                             "diff_percentile_value": float(max(np.percentile(diff_mag_1_to_2_np, flow_diff_percentile), 1e-6)),
                         }
 
-                    group_rows.append(
-                        {
-                            "sample_index": int(sample_offset + batch_index),
-                            "inference_preset": str(inference_preset),
-                            "record": str(record),
-                            "mode": str(mode_name),
-                            "record_name": f"{record}_{mode_name}",
-                            "frame_range": frame_range,
-                            "valid": bool(row["valid"]) if "valid" in row.index else True,
-                            "distance_index_mean": float(row["D_index Mean"]) if "D_index Mean" in row.index else -1.0,
-                            "distance_index_median": float(row["D_index Median"]) if "D_index Median" in row.index else -1.0,
-                            **sample_metric_values,
-                            "flow_diff_1_to_0_mean": diff_1_to_0["diff_mag_mean"],
-                            "flow_diff_1_to_0_max": diff_1_to_0["diff_mag_max"],
-                            "flow_diff_1_to_0_changed_ratio": diff_1_to_0["diff_changed_ratio"],
-                            "flow_diff_1_to_0_percentile_value": diff_1_to_0["diff_percentile_value"],
-                            "flow_diff_1_to_2_mean": diff_1_to_2["diff_mag_mean"],
-                            "flow_diff_1_to_2_max": diff_1_to_2["diff_mag_max"],
-                            "flow_diff_1_to_2_changed_ratio": diff_1_to_2["diff_changed_ratio"],
-                            "flow_diff_1_to_2_percentile_value": diff_1_to_2["diff_percentile_value"],
-                        }
-                    )
+                    sample_row = {
+                        "sample_index": int(sample_offset + batch_index),
+                        "inference_preset": str(inference_preset),
+                        "record": str(record),
+                        "mode": str(mode_name),
+                        "record_name": f"{record}_{mode_name}",
+                        "frame_range": frame_range,
+                        "valid": bool(row["valid"]) if "valid" in row.index else True,
+                        "distance_index_mean": float(row["D_index Mean"]) if "D_index Mean" in row.index else -1.0,
+                        "distance_index_median": float(row["D_index Median"]) if "D_index Median" in row.index else -1.0,
+                        **sample_metric_values,
+                        "flow_diff_1_to_0_mean": diff_1_to_0["diff_mag_mean"],
+                        "flow_diff_1_to_0_max": diff_1_to_0["diff_mag_max"],
+                        "flow_diff_1_to_0_changed_ratio": diff_1_to_0["diff_changed_ratio"],
+                        "flow_diff_1_to_0_percentile_value": diff_1_to_0["diff_percentile_value"],
+                        "flow_diff_1_to_2_mean": diff_1_to_2["diff_mag_mean"],
+                        "flow_diff_1_to_2_max": diff_1_to_2["diff_mag_max"],
+                        "flow_diff_1_to_2_changed_ratio": diff_1_to_2["diff_changed_ratio"],
+                        "flow_diff_1_to_2_percentile_value": diff_1_to_2["diff_percentile_value"],
+                    }
+                    if vfips_enabled:
+                        append_vfips_sample(
+                            vfips_segments=vfips_segments,
+                            sample_index=int(sample_row["sample_index"]),
+                            frame_0_index=int(row["img0"]),
+                            frame_2_index=int(row["img2"]),
+                            img0=inference_result["img0"][batch_index],
+                            imgt=imgt[batch_index],
+                            img1=inference_result["img1"][batch_index],
+                            imgt_pred=imgt_pred[batch_index],
+                        )
+                    if psnr_div_enabled:
+                        target_y, prediction_y, prediction_rgb = prepare_psnr_div_sample(
+                            target=imgt[batch_index],
+                            prediction=imgt_pred[batch_index],
+                        )
+                        if pending_psnr_div_row is not None:
+                            psnr_div_value = calculate_psnr_div_sample(
+                                target_y=pending_psnr_div_target_y,
+                                prediction_y=pending_psnr_div_prediction_y,
+                                flow_start_prediction_rgb=pending_psnr_div_prediction_rgb,
+                                flow_end_prediction_rgb=prediction_rgb,
+                                divergence_threshold=psnr_div_threshold,
+                            )
+                            pending_psnr_div_row[PSNR_DIV_METRIC_NAME] = psnr_div_value
+                            update_metric_meter(metric_meters, PSNR_DIV_METRIC_NAME, psnr_div_value)
+                            update_metric_meter(record_metric_meters, PSNR_DIV_METRIC_NAME, psnr_div_value)
+                            group_rows.append(pending_psnr_div_row)
+                            previous_psnr_div_prediction_rgb = pending_psnr_div_prediction_rgb
+
+                        pending_psnr_div_row = sample_row
+                        pending_psnr_div_target_y = target_y
+                        pending_psnr_div_prediction_y = prediction_y
+                        pending_psnr_div_prediction_rgb = prediction_rgb
+                    else:
+                        group_rows.append(sample_row)
 
                 sample_offset += int(imgt_pred.shape[0])
                 progress.set_postfix({"mean_psnr": f"{record_metric_meters['psnr'].avg:.6f}"})
+
+            if psnr_div_enabled and pending_psnr_div_row is not None:
+                if previous_psnr_div_prediction_rgb is None:
+                    psnr_div_value = float("nan")
+                else:
+                    psnr_div_value = calculate_psnr_div_sample(
+                        target_y=pending_psnr_div_target_y,
+                        prediction_y=pending_psnr_div_prediction_y,
+                        flow_start_prediction_rgb=previous_psnr_div_prediction_rgb,
+                        flow_end_prediction_rgb=pending_psnr_div_prediction_rgb,
+                        divergence_threshold=psnr_div_threshold,
+                    )
+                pending_psnr_div_row[PSNR_DIV_METRIC_NAME] = psnr_div_value
+                update_metric_meter(metric_meters, PSNR_DIV_METRIC_NAME, psnr_div_value)
+                update_metric_meter(record_metric_meters, PSNR_DIV_METRIC_NAME, psnr_div_value)
+                group_rows.append(pending_psnr_div_row)
+
+            if vfips_enabled:
+                vfips_values_by_sample = calculate_group_vfips_values(
+                    vfips_segments=vfips_segments,
+                    metric_config=metric_config,
+                    vfips_model=vfips_model,
+                )
+                apply_vfips_values_to_group_rows(
+                    group_rows=group_rows,
+                    values_by_sample=vfips_values_by_sample,
+                    metric_meters=metric_meters,
+                    record_metric_meters=record_metric_meters,
+                )
 
             group_metrics_df = pd.DataFrame(group_rows)
             record_metric_values = average_metric_values(record_metric_meters)
