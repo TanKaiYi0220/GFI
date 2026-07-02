@@ -19,6 +19,9 @@ from src.data.dataset_config import list_dataset_presets
 from src.engine.dataset_runs import build_merged_dataframe
 from src.engine.dataset_runs import build_training_dataset
 from src.engine.dataset_runs import resolve_dataset_class_name
+from src.engine.checkpoints import load_training_state
+from src.engine.checkpoints import save_checkpoint
+from src.engine.checkpoints import TrainingState
 from src.engine.evaluation import AverageMeter
 from src.engine.evaluation import average_metric_values
 from src.engine.evaluation import build_flip_evaluator
@@ -47,14 +50,6 @@ from src.engine.run_config import INIT_FLOW_DOWNSCALE_STRATEGIES
 from src.engine.run_config import parse_eval_convex_upsampling_arg
 from src.engine.run_config import TrainRunConfig
 from src.utils.config import load_yaml_file
-
-@dataclass(frozen=True)
-class TrainingState:
-    start_epoch: int
-    global_step: int
-    best_psnr: float
-    mode: str
-
 
 @dataclass(frozen=True)
 class BatchStepOutput:
@@ -235,26 +230,6 @@ def build_record_name_summary(dataframe: Any, metric_config: dict[str, object]) 
         .mean()
         .sort_values(["record_name"])
         .reset_index(drop=True)
-    )
-
-
-def save_checkpoint(
-    checkpoint_path: Path,
-    model: Any,
-    optimizer: Any,
-    epoch: int,
-    best_psnr: float,
-) -> None:
-    import torch
-
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "epoch": epoch,
-            "best_psnr": best_psnr,
-        },
-        str(checkpoint_path),
     )
 
 
@@ -743,74 +718,6 @@ def log_run_summary(
     )
 
 
-def is_raw_model_state_dict(checkpoint: Any, torch_module: Any) -> bool:
-    if not isinstance(checkpoint, dict) or len(checkpoint) == 0:
-        return False
-
-    return all(isinstance(key, str) and torch_module.is_tensor(value) for key, value in checkpoint.items())
-
-
-def extract_pretrained_state_dict(checkpoint: Any, checkpoint_path: Path, torch_module: Any) -> Any:
-    if isinstance(checkpoint, dict) and "model" in checkpoint:
-        return checkpoint["model"]
-
-    if is_raw_model_state_dict(checkpoint, torch_module):
-        return checkpoint
-
-    available_keys = sorted(checkpoint.keys()) if isinstance(checkpoint, dict) else []
-    raise KeyError(
-        "pretrained_checkpoint_path must point to either a raw model state_dict or a full training checkpoint "
-        f"containing a 'model' key: path={checkpoint_path}, keys={available_keys}"
-    )
-
-
-def load_training_state(
-    args: argparse.Namespace,
-    model: Any,
-    optimizer: Any,
-    device: Any,
-    logger: logging.Logger,
-) -> TrainingState:
-    import torch
-
-    if args.resume_path is not None:
-        checkpoint = torch.load(args.resume_path, map_location=device)
-        if "model" not in checkpoint or "optimizer" not in checkpoint or "epoch" not in checkpoint:
-            raise KeyError(f"resume_path must point to a full training checkpoint with model, optimizer, and epoch: {args.resume_path}")
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-
-        start_epoch = int(checkpoint["epoch"]) + 1
-        logger.info("Resumed from %s at epoch %s", args.resume_path, start_epoch)
-        return TrainingState(
-            start_epoch=start_epoch,
-            global_step=start_epoch * args.iters_per_epoch,
-            best_psnr=float(checkpoint.get("best_psnr", 0.0)),
-            mode="resume",
-        )
-
-    pretrained_path = args.pretrained_checkpoint_path
-    if pretrained_path is not None:
-        pretrained_path = Path(pretrained_path)
-        logger.info("Loading pretrained checkpoint from %s", pretrained_path)
-        checkpoint = torch.load(str(pretrained_path), map_location=device)
-        model.load_state_dict(extract_pretrained_state_dict(checkpoint, pretrained_path, torch))
-        return TrainingState(
-            start_epoch=0,
-            global_step=0,
-            best_psnr=0.0,
-            mode="pretrained",
-        )
-
-    logger.info("Training %s from scratch", args.model_name)
-    return TrainingState(
-        start_epoch=0,
-        global_step=0,
-        best_psnr=0.0,
-        mode="scratch",
-    )
-
-
 def save_input_config(target_dir: Path, input_config: dict[str, Any]) -> Path:
     config_path = target_dir / "input_config.json"
     config_path.write_text(json.dumps(input_config, indent=2), encoding="utf-8")
@@ -911,7 +818,16 @@ def run_training(args: argparse.Namespace) -> None:
     if hasattr(model, "init_flow_layer"):
         logger.info("model_init_flow_layer=%s", model.init_flow_layer)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr_start, weight_decay=0)
-    training_state = load_training_state(args, model, optimizer, device, logger)
+    training_state = load_training_state(
+        resume_path=args.resume_path,
+        pretrained_checkpoint_path=args.pretrained_checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        device=device,
+        logger=logger,
+        iters_per_epoch=args.iters_per_epoch,
+        model_name=args.model_name,
+    )
 
     log_run_summary(args, train_dataset, test_dataset, training_state, device, logger)
     logger.info("run_log_dir=%s", run_dir)

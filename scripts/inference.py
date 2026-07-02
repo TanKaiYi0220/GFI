@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.train import set_seed
+from src.engine.checkpoints import load_inference_state_dict
 from src.engine.dataset_runs import build_inference_dataset
 from src.engine.dataset_runs import build_merged_dataframe
 from src.engine.dataset_runs import filter_valid_dataframe
@@ -781,11 +782,9 @@ def main(argv: list[str] | None = None) -> None:
     model = model_class(**model_init_args).to(device)
     if hasattr(model, "init_flow_layer"):
         logger.info("model_init_flow_layer=%s", model.init_flow_layer)
-    checkpoint = torch.load(str(checkpoint_path), map_location=device)
-    state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     # print("Load Pretrained Weights from IFRNet_Vimeo90K.pth as Baseline")
     # state_dict = torch.load("src/models/external/IFRNet/checkpoints/IFRNet/IFRNet_Vimeo90K.pth", map_location=device)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(load_inference_state_dict(checkpoint_path=checkpoint_path, device=device))
     if eval_convex_upsampling is not None:
         set_model_convex_upsampling(
             model=model,
