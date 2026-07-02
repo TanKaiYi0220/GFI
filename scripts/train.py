@@ -15,9 +15,10 @@ PROJECT_ROOT: Path = Path(__file__).parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.dataset_config import get_dataset_preset
-from src.data.dataset_config import iter_dataset_configs
 from src.data.dataset_config import list_dataset_presets
+from src.engine.dataset_runs import build_merged_dataframe
+from src.engine.dataset_runs import build_training_dataset
+from src.engine.dataset_runs import resolve_dataset_class_name
 from src.engine.evaluation import AverageMeter
 from src.engine.evaluation import average_metric_values
 from src.engine.evaluation import build_flip_evaluator
@@ -108,42 +109,6 @@ def build_logger(output_dir: Path) -> tuple[logging.Logger, Path]:
     logger.addHandler(file_handler)
 
     return logger, run_dir
-
-
-def build_merged_dataframe(
-    root_dir: Path,
-    checkpoints_dir: Path,
-    dataset_preset_name: str,
-    only_fps: int,
-    logger: logging.Logger,
-) -> pd.DataFrame:
-    import pandas as pd
-
-    dataset_preset = get_dataset_preset(dataset_preset_name)
-    dataframe_list: list[pd.DataFrame] = []
-
-    for dataset_config in iter_dataset_configs(dataset_preset):
-        if dataset_config.fps != only_fps:
-            continue
-
-        csv_path = root_dir / f"{dataset_config.record_name}_preprocessed" / f"{dataset_config.mode_index}_raw_sequence_frame_index.csv"
-        if not csv_path.is_file():
-            logger.warning("Dataset CSV missing: %s", csv_path)
-            continue
-
-        dataframe = pd.read_csv(csv_path)
-        dataframe["record"] = dataset_config.record
-        dataframe["mode"] = dataset_config.mode_path
-        dataframe_list.append(dataframe)
-        logger.info("Loaded dataset CSV %s rows=%s", csv_path, len(dataframe))
-
-    if len(dataframe_list) == 0:
-        raise RuntimeError(f"No dataset CSV found under root_dir={root_dir} for preset={dataset_preset_name}")
-
-    merged = pd.concat(dataframe_list, ignore_index=True)
-    merged.to_csv(checkpoints_dir / f"{dataset_preset_name}_merged.csv", index=False)
-    logger.info("Merged dataset size=%s preset=%s", len(merged), dataset_preset_name)
-    return merged
 
 
 def forward_model(
@@ -293,27 +258,6 @@ def save_checkpoint(
     )
 
 
-def build_training_dataset(
-    dataframe: Any,
-    dataset_root_dir: str,
-    augment: bool,
-    input_fps: int,
-    model_name: str,
-    flow_approx_method: str,
-) -> Any:
-    normalized_dataframe = dataframe.reset_index(drop=True)
-
-    if uses_flow_approx_model(model_name):
-        from src.data.dataset_loader import FlowEstimationTrainDataset
-
-        include_source_depths = is_splatting_flow_approx_method(flow_approx_method=flow_approx_method)
-        return FlowEstimationTrainDataset(normalized_dataframe, dataset_root_dir, input_fps, augment, include_source_depths)
-
-    from src.data.dataset_loader import VFITrainDataset
-
-    return VFITrainDataset(normalized_dataframe, dataset_root_dir, augment, input_fps)
-
-
 def select_sample_rows(dataframe: Any, frame_keys: list[str]) -> Any:
     indices: list[int] = []
     for frame_key in frame_keys:
@@ -401,13 +345,6 @@ def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: 
                 enabled=previous_convex_upsampling,
                 context="sample evaluation restore",
             )
-
-
-def resolve_dataset_class_name(model_name: str) -> str:
-    if uses_flow_approx_model(model_name):
-        return "FlowEstimationTrainDataset"
-
-    return "VFITrainDataset"
 
 
 def run_training_batch(

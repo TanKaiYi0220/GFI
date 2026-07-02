@@ -11,8 +11,10 @@ PROJECT_ROOT: Path = Path(__file__).parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.train import build_merged_dataframe
 from scripts.train import set_seed
+from src.engine.dataset_runs import build_inference_dataset
+from src.engine.dataset_runs import build_merged_dataframe
+from src.engine.dataset_runs import filter_valid_dataframe
 from src.engine.evaluation import average_metric_values
 from src.engine.evaluation import build_flip_evaluator
 from src.engine.evaluation import build_flolpips_model
@@ -746,8 +748,6 @@ def main(argv: list[str] | None = None) -> None:
     from torch.utils.data import Subset
     from tqdm import tqdm
 
-    from src.data.dataset_loader import FlowEstimationTrainDataset
-    from src.data.dataset_loader import VFITrainDataset
     from src.data.image_ops import flow_to_image
     from src.data.image_ops import save_image
     logger = build_logger("scripts.inference")
@@ -776,8 +776,7 @@ def main(argv: list[str] | None = None) -> None:
         dataframe_list.append(preset_dataframe)
 
     dataframe = pd.concat(dataframe_list, ignore_index=True)
-    if "valid" in dataframe.columns:
-        dataframe = dataframe[dataframe["valid"] == True].reset_index(drop=True)
+    dataframe = filter_valid_dataframe(dataframe)
     model_class = resolve_model_class(model_name)
     model = model_class(**model_init_args).to(device)
     if hasattr(model, "init_flow_layer"):
@@ -802,17 +801,13 @@ def main(argv: list[str] | None = None) -> None:
     with torch.no_grad():
         for (inference_preset, record, mode_name), group_dataframe in dataframe.groupby(["inference_preset", "record", "mode"], sort=False):
             group_dataframe = group_dataframe.reset_index(drop=True)
-            if model_name in (BASELINE_MODEL_NAME, RESIDUAL_MODEL_NAME):
-                dataset = VFITrainDataset(group_dataframe, str(dataset_root_dir), False, input_fps)
-            else:
-                include_source_depths = is_splatting_flow_approx_method(flow_approx_method=flow_approx_method)
-                dataset = FlowEstimationTrainDataset(
-                    group_dataframe,
-                    str(dataset_root_dir),
-                    input_fps,
-                    False,
-                    include_source_depths,
-                )
+            dataset = build_inference_dataset(
+                dataframe=group_dataframe,
+                dataset_root_dir=run_config.dataset_root_dir,
+                input_fps=run_config.input_fps,
+                model_name=run_config.model.model_name,
+                flow_approx_method=run_config.flow_approx.method,
+            )
 
             loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
             record_metric_meters = build_metric_meters(metric_config)
