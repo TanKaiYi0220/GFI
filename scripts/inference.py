@@ -14,9 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.train import build_merged_dataframe
 from scripts.train import read_model_init_args
 from scripts.train import read_optional_bool
-from scripts.train import resolve_model_class
 from scripts.train import set_seed
-from scripts.train import set_model_convex_upsampling
 from src.engine.evaluation import average_metric_values
 from src.engine.evaluation import build_flip_evaluator
 from src.engine.evaluation import build_flolpips_model
@@ -40,13 +38,15 @@ from src.engine.flow_approx import flatten_target_index
 from src.engine.flow_approx import is_splatting_flow_approx_method
 from src.engine.flow_approx import make_source_grid
 from src.engine.flow_approx import SPLATTING_FILL_STRATEGIES
+from src.engine.model_registry import BASELINE_MODEL_NAME
+from src.engine.model_registry import resolve_model_class
+from src.engine.model_registry import RESIDUAL_FLOW_APPROX_MODEL_NAME
+from src.engine.model_registry import RESIDUAL_MODEL_NAME
+from src.engine.model_registry import set_model_convex_upsampling
 from src.models.external.IFRNet.utils import warp
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
 
-BASELINE_MODEL_NAME: str = "IFRNet"
-RESIDUAL_MODEL_NAME: str = "IFRNet_Residual"
-RESIDUAL_FLOW_APPROX_MODEL_NAME: str = "IFRNet_Residual_FlowApprox"
 DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY: str = "bilinear"
 DEFAULT_INIT_FLOW_MASK_EPSILON: float = 1e-6
 INIT_FLOW_DOWNSCALE_STRATEGIES: tuple[str, ...] = ("bilinear", "masked_area")

@@ -40,10 +40,12 @@ from src.engine.flow_approx import FLOW_APPROX_METHODS
 from src.engine.flow_approx import is_splatting_flow_approx_method
 from src.engine.flow_approx import resolve_splatting_fill_strategy
 from src.engine.flow_approx import SPLATTING_FILL_STRATEGIES
+from src.engine.model_registry import MODEL_NAMES
+from src.engine.model_registry import resolve_model_class
+from src.engine.model_registry import set_model_convex_upsampling
+from src.engine.model_registry import uses_flow_approx_model
 from src.utils.config import load_yaml_file
 
-MODEL_NAMES: tuple[str, ...] = ("IFRNet", "IFRNet_Residual", "IFRNet_Residual_FlowApprox")
-FLOW_APPROX_MODEL_NAMES: tuple[str, ...] = ("IFRNet_Residual_FlowApprox",)
 DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY: str = "bilinear"
 DEFAULT_INIT_FLOW_MASK_EPSILON: float = 1e-6
 INIT_FLOW_DOWNSCALE_STRATEGIES: tuple[str, ...] = ("bilinear", "masked_area")
@@ -67,11 +69,6 @@ class BatchStepOutput:
     loss_rec: Any
     loss_geo: Any
     loss_dis: Any
-
-
-def uses_flow_approx_model(model_name: str) -> bool:
-    return model_name in FLOW_APPROX_MODEL_NAMES
-
 
 def read_model_init_args(config_values: dict[str, Any]) -> dict[str, Any]:
     raw_model_init_args = config_values.get("model_init_args", {})
@@ -103,37 +100,6 @@ def read_optional_bool(config_values: dict[str, Any], key: str) -> bool | None:
     if key not in config_values or config_values[key] is None:
         return None
     return parse_bool_value(config_values[key], key)
-
-
-def set_model_convex_upsampling(model: Any, enabled: bool, context: str) -> bool:
-    setter = getattr(model, "set_convex_upsampling", None)
-    if not callable(setter):
-        raise TypeError(
-            f"{context} requested eval_convex_upsampling={enabled}, "
-            f"but model type {type(model).__name__} does not support it."
-        )
-    previous_value = bool(getattr(model, "convex_upsampling"))
-    setter(enabled)
-    return previous_value
-
-
-def resolve_model_class(model_name: str) -> type[Any]:
-    if model_name == "IFRNet":
-        from src.models.IFRNet import Model as IFRNetModel
-
-        return IFRNetModel
-    if model_name == "IFRNet_Residual":
-        from src.models.IFRNet_Residual import Model as IFRNetResidualModel
-
-        return IFRNetResidualModel
-    if model_name == "IFRNet_Residual_FlowApprox":
-        from src.models.IFRNet_Residual import Model as IFRNetResidualModel
-
-        return IFRNetResidualModel
-
-    available_models = ", ".join(MODEL_NAMES)
-    raise KeyError(f"Unknown model '{model_name}'. Available models: {available_models}")
-
 
 def set_seed(seed: int) -> None:
     import numpy as np
