@@ -15,7 +15,6 @@ PROJECT_ROOT: Path = Path(__file__).parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.dataset_config import ACTIVE_DATASET_ROOT_KEY
 from src.data.dataset_config import get_dataset_preset
 from src.data.dataset_config import iter_dataset_configs
 from src.data.dataset_config import list_dataset_presets
@@ -29,27 +28,24 @@ from src.engine.evaluation import calculate_batch_metrics
 from src.engine.evaluation import format_metric_averages
 from src.engine.evaluation import format_metric_values
 from src.engine.evaluation import get_enabled_metric_names
-from src.engine.evaluation import read_metric_config
-from src.engine.evaluation import require_psnr_div_disabled
-from src.engine.evaluation import require_psnr_enabled
-from src.engine.evaluation import require_vfips_disabled
 from src.engine.flow_approx import build_flow_init_result_with_fill_strategy
 from src.engine.flow_approx import DEFAULT_SPLATTING_FILL_STRATEGY
 from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
 from src.engine.flow_approx import FLOW_APPROX_METHODS
 from src.engine.flow_approx import is_splatting_flow_approx_method
-from src.engine.flow_approx import resolve_splatting_fill_strategy
 from src.engine.flow_approx import SPLATTING_FILL_STRATEGIES
 from src.engine.model_registry import MODEL_NAMES
 from src.engine.model_registry import resolve_model_class
 from src.engine.model_registry import set_model_convex_upsampling
 from src.engine.model_registry import uses_flow_approx_model
+from src.engine.run_config import build_train_dry_run_summary
+from src.engine.run_config import build_train_run_config
+from src.engine.run_config import DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY
+from src.engine.run_config import DEFAULT_INIT_FLOW_MASK_EPSILON
+from src.engine.run_config import INIT_FLOW_DOWNSCALE_STRATEGIES
+from src.engine.run_config import parse_eval_convex_upsampling_arg
+from src.engine.run_config import TrainRunConfig
 from src.utils.config import load_yaml_file
-
-DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY: str = "bilinear"
-DEFAULT_INIT_FLOW_MASK_EPSILON: float = 1e-6
-INIT_FLOW_DOWNSCALE_STRATEGIES: tuple[str, ...] = ("bilinear", "masked_area")
-
 
 @dataclass(frozen=True)
 class TrainingState:
@@ -69,37 +65,6 @@ class BatchStepOutput:
     loss_rec: Any
     loss_geo: Any
     loss_dis: Any
-
-def read_model_init_args(config_values: dict[str, Any]) -> dict[str, Any]:
-    raw_model_init_args = config_values.get("model_init_args", {})
-    if raw_model_init_args is None:
-        return {}
-    if not isinstance(raw_model_init_args, dict):
-        raise TypeError(f"model_init_args must be a mapping, got {type(raw_model_init_args).__name__}")
-
-    return dict(raw_model_init_args)
-
-
-def parse_bool_value(value: Any, key: str) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized_value = value.strip().lower()
-        if normalized_value in ("true", "1", "yes", "on"):
-            return True
-        if normalized_value in ("false", "0", "no", "off"):
-            return False
-    raise TypeError(f"{key} must be a boolean, got {value!r}")
-
-
-def parse_eval_convex_upsampling_arg(value: str) -> bool:
-    return parse_bool_value(value, "eval_convex_upsampling")
-
-
-def read_optional_bool(config_values: dict[str, Any], key: str) -> bool | None:
-    if key not in config_values or config_values[key] is None:
-        return None
-    return parse_bool_value(config_values[key], key)
 
 def set_seed(seed: int) -> None:
     import numpy as np
@@ -773,54 +738,48 @@ def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
     config_defaults = load_train_run_config(config_path)
     parser = build_train_arg_parser(config_defaults)
     args = parser.parse_args(argv)
-    args.model_init_args = read_model_init_args(config_defaults)
-    args.metric_config = read_metric_config(config_defaults)
-    args.eval_convex_upsampling = (
-        None
-        if args.eval_convex_upsampling is None
-        else parse_bool_value(args.eval_convex_upsampling, "eval_convex_upsampling")
-    )
-    require_psnr_enabled(args.metric_config, "training")
-    require_psnr_div_disabled(args.metric_config, "training")
-    require_vfips_disabled(args.metric_config, "training")
     args.input_config = config_defaults
-    validate_flow_approx_runtime_args(args)
     return args
 
 
-def resolve_effective_splatting_fill_strategy(args: argparse.Namespace) -> str:
-    if not uses_flow_approx_model(args.model_name):
-        return ""
+def parse_train_config(argv: list[str] | None) -> TrainRunConfig:
+    args = parse_train_args(argv)
+    return build_train_run_config(args=args, config_defaults=args.input_config)
 
-    if not is_splatting_flow_approx_method(flow_approx_method=args.flow_approx_method):
-        return ""
 
-    return resolve_splatting_fill_strategy(
-        flow_approx_method=args.flow_approx_method,
-        splatting_fill_strategy=args.splatting_fill_strategy,
+def build_train_runtime_args(run_config: TrainRunConfig) -> argparse.Namespace:
+    return argparse.Namespace(
+        mode=run_config.mode,
+        model_name=run_config.model.model_name,
+        model_init_args=dict(run_config.model.model_init_args),
+        eval_convex_upsampling=run_config.model.eval_convex_upsampling,
+        flow_approx=run_config.flow_approx,
+        flow_approx_method=run_config.flow_approx.method,
+        splatting_fill_strategy=run_config.flow_approx.splatting_fill_strategy,
+        init_flow_downscale_strategy=run_config.flow_approx.init_flow_downscale_strategy,
+        init_flow_mask_epsilon=run_config.flow_approx.init_flow_mask_epsilon,
+        metric_config=dict(run_config.metrics.values),
+        root_dir=str(run_config.root_dir),
+        dataset_root_dir=run_config.dataset_root_dir,
+        paths_config=run_config.paths_config,
+        train_preset=run_config.train_preset,
+        test_preset=run_config.test_preset,
+        epochs=run_config.epochs,
+        resume_path=run_config.resume_path,
+        pretrained_checkpoint_path=run_config.pretrained_checkpoint_path,
+        eval_interval=run_config.eval_interval,
+        lr_start=run_config.lr_start,
+        lr_end=run_config.lr_end,
+        seed=run_config.seed,
+        batch_size=run_config.batch_size,
+        output_dir=run_config.output_dir,
+        only_fps=run_config.only_fps,
+        input_fps=run_config.input_fps,
+        sample_train_frames=list(run_config.sample_train_frames),
+        sample_test_frames=list(run_config.sample_test_frames),
+        sample_interval_epoch=run_config.sample_interval_epoch,
+        input_config=dict(run_config.input_config),
     )
-
-
-def resolve_effective_init_flow_downscale_strategy(args: argparse.Namespace) -> str:
-    if not uses_flow_approx_model(args.model_name):
-        return ""
-    if not is_splatting_flow_approx_method(flow_approx_method=args.flow_approx_method):
-        return ""
-    return args.init_flow_downscale_strategy
-
-
-def validate_flow_approx_runtime_args(args: argparse.Namespace) -> None:
-    if args.init_flow_mask_epsilon <= 0:
-        raise ValueError(f"init_flow_mask_epsilon must be positive, got {args.init_flow_mask_epsilon}")
-    if args.init_flow_downscale_strategy == "masked_area":
-        if not uses_flow_approx_model(args.model_name):
-            raise ValueError(
-                "init_flow_downscale_strategy=masked_area requires model_name=IFRNet_Residual_FlowApprox."
-            )
-        if not is_splatting_flow_approx_method(flow_approx_method=args.flow_approx_method):
-            raise ValueError(
-                "init_flow_downscale_strategy=masked_area requires a splatting flow approximation method."
-            )
 
 
 def log_run_summary(
@@ -915,43 +874,6 @@ def load_training_state(
     )
 
 
-def build_dry_run_summary(args: argparse.Namespace) -> dict[str, object]:
-    summary: dict[str, object] = {
-        "mode": args.mode,
-        "model_name": args.model_name,
-        "train_preset": args.train_preset,
-        "test_preset": args.test_preset,
-        "active_root_key": ACTIVE_DATASET_ROOT_KEY,
-        "dataset_root_dir": args.dataset_root_dir,
-        "csv_root_dir": str(Path(args.root_dir)),
-        "output_dir": args.output_dir,
-        "resume_path": args.resume_path,
-        "pretrained_checkpoint_path": args.pretrained_checkpoint_path,
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "eval_interval": args.eval_interval,
-        "input_fps": args.input_fps,
-        "only_fps": args.only_fps,
-        "dataset_class": resolve_dataset_class_name(args.model_name),
-        "metrics": dict(args.metric_config),
-    }
-    if args.eval_convex_upsampling is not None:
-        summary["eval_convex_upsampling"] = args.eval_convex_upsampling
-
-    if len(args.model_init_args) > 0:
-        summary["model_init_args"] = dict(args.model_init_args)
-
-    if uses_flow_approx_model(args.model_name):
-        summary["flow_approx_method"] = args.flow_approx_method
-        summary["splatting_fill_strategy"] = args.splatting_fill_strategy
-        summary["effective_splatting_fill_strategy"] = resolve_effective_splatting_fill_strategy(args=args)
-        summary["init_flow_downscale_strategy"] = args.init_flow_downscale_strategy
-        summary["effective_init_flow_downscale_strategy"] = resolve_effective_init_flow_downscale_strategy(args=args)
-        summary["init_flow_mask_epsilon"] = args.init_flow_mask_epsilon
-
-    return summary
-
-
 def save_input_config(target_dir: Path, input_config: dict[str, Any]) -> Path:
     config_path = target_dir / "input_config.json"
     config_path.write_text(json.dumps(input_config, indent=2), encoding="utf-8")
@@ -1006,12 +928,12 @@ def run_training(args: argparse.Namespace) -> None:
         logger.info(
             "splatting_fill_strategy=%s effective_splatting_fill_strategy=%s",
             args.splatting_fill_strategy,
-            resolve_effective_splatting_fill_strategy(args=args),
+            args.flow_approx.effective_splatting_fill_strategy,
         )
         logger.info(
             "init_flow_downscale_strategy=%s effective_init_flow_downscale_strategy=%s init_flow_mask_epsilon=%s",
             args.init_flow_downscale_strategy,
-            resolve_effective_init_flow_downscale_strategy(args=args),
+            args.flow_approx.effective_init_flow_downscale_strategy,
             args.init_flow_mask_epsilon,
         )
 
@@ -1075,13 +997,13 @@ def run_training(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = parse_train_args(argv)
+    run_config = parse_train_config(argv)
 
-    if args.mode == "dry-run":
-        print(json.dumps(build_dry_run_summary(args), indent=2))
+    if run_config.mode == "dry-run":
+        print(json.dumps(build_train_dry_run_summary(config=run_config), indent=2))
         return
 
-    run_training(args)
+    run_training(build_train_runtime_args(run_config))
 
 
 if __name__ == "__main__":

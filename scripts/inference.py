@@ -12,8 +12,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.train import build_merged_dataframe
-from scripts.train import read_model_init_args
-from scripts.train import read_optional_bool
 from scripts.train import set_seed
 from src.engine.evaluation import average_metric_values
 from src.engine.evaluation import build_flip_evaluator
@@ -27,29 +25,24 @@ from src.engine.evaluation import calculate_vfips_sequence_sample_values
 from src.engine.evaluation import format_metric_averages
 from src.engine.evaluation import prepare_psnr_div_sample
 from src.engine.evaluation import PSNR_DIV_METRIC_NAME
-from src.engine.evaluation import read_metric_config
-from src.engine.evaluation import require_psnr_enabled
 from src.engine.evaluation import VFIPS_METRIC_NAME
 from src.engine.flow_approx import build_flow_init_result_with_fill_strategy
 from src.engine.flow_approx import DEFAULT_SPLATTING_FILL_STRATEGY
-from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
 from src.engine.flow_approx import FLOW_APPROX_METHODS
 from src.engine.flow_approx import flatten_target_index
 from src.engine.flow_approx import is_splatting_flow_approx_method
 from src.engine.flow_approx import make_source_grid
-from src.engine.flow_approx import SPLATTING_FILL_STRATEGIES
 from src.engine.model_registry import BASELINE_MODEL_NAME
 from src.engine.model_registry import resolve_model_class
 from src.engine.model_registry import RESIDUAL_FLOW_APPROX_MODEL_NAME
 from src.engine.model_registry import RESIDUAL_MODEL_NAME
 from src.engine.model_registry import set_model_convex_upsampling
+from src.engine.run_config import build_inference_dry_run_summary
+from src.engine.run_config import build_inference_run_config
+from src.engine.run_config import DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY
+from src.engine.run_config import DEFAULT_INIT_FLOW_MASK_EPSILON
 from src.models.external.IFRNet.utils import warp
-from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
-
-DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY: str = "bilinear"
-DEFAULT_INIT_FLOW_MASK_EPSILON: float = 1e-6
-INIT_FLOW_DOWNSCALE_STRATEGIES: tuple[str, ...] = ("bilinear", "masked_area")
 # Model variants:
 # - IFRNet: baseline
 # - IFRNet_Residual: residual model initialized by bmv/fmv from the 60fps motion labels
@@ -151,25 +144,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run inference from one config file.")
     parser.add_argument("--config", required=True, type=str, help="Path to one inference config file.")
     return parser.parse_args(argv)
-
-
-def read_inference_presets(config: dict[str, Any]) -> list[str]:
-    if "inference_presets" in config:
-        value = config["inference_presets"]
-    elif "inference_preset" in config:
-        value = config["inference_preset"]
-    else:
-        raise KeyError("Config must contain inference_preset or inference_presets.")
-
-    if isinstance(value, str):
-        return [value]
-
-    if isinstance(value, list) and all(isinstance(item, str) for item in value):
-        if len(value) == 0:
-            raise ValueError("inference_presets must contain at least one preset name.")
-        return value
-
-    raise TypeError("inference_preset must be a string, or inference_presets must be a list of strings.")
 
 
 def save_flow_diff_visuals(
@@ -733,103 +707,35 @@ def save_selected_sample_artifacts(
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    config_path = Path(args.config)
-    if not config_path.is_absolute():
-        config_path = PROJECT_ROOT / config_path
-
-    config: dict[str, Any] = load_yaml_file(config_path)
-    mode = str(config["mode"])
-    model_name = str(config["model_name"])
-    model_init_args = read_model_init_args(config)
-    eval_convex_upsampling = read_optional_bool(config, "eval_convex_upsampling")
-    inference_presets = read_inference_presets(config)
-    flow_approx_method = str(config["flow_approx_method"])
-    splatting_fill_strategy = str(config.get("splatting_fill_strategy", DEFAULT_SPLATTING_FILL_STRATEGY))
-    init_flow_downscale_strategy = str(
-        config.get("init_flow_downscale_strategy", DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY)
-    )
-    init_flow_mask_epsilon = float(config.get("init_flow_mask_epsilon", DEFAULT_INIT_FLOW_MASK_EPSILON))
-    scale_factor = float(config["scale_factor"])
-    flow_diff_threshold = float(config.get("flow_diff_threshold", 1.0))
-    flow_diff_percentile = float(config.get("flow_diff_percentile", 99.0))
-    save_topk_worst_psnr = int(config.get("save_topk_worst_psnr", 3))
-    save_topk_best_psnr = int(config.get("save_topk_best_psnr", 0))
-    save_topk_largest_flow_diff = int(config.get("save_topk_largest_flow_diff", 3))
-    metric_config = read_metric_config(config)
-    require_psnr_enabled(metric_config, "inference")
-    seed = int(config["seed"])
-    batch_size = int(config["batch_size"])
-    only_fps = int(config["only_fps"])
-    input_fps = int(config["input_fps"])
-
-    root_dir = Path(str(config["root_dir"]))
-    if not root_dir.is_absolute():
-        root_dir = PROJECT_ROOT / root_dir
-
-    dataset_root_dir = Path(str(config["dataset_root_dir"]))
-    if not dataset_root_dir.is_absolute():
-        dataset_root_dir = PROJECT_ROOT / dataset_root_dir
-
-    checkpoint_path = Path(str(config["checkpoint_path"]))
-    if not checkpoint_path.is_absolute():
-        checkpoint_path = PROJECT_ROOT / checkpoint_path
-
-    output_dir = Path(str(config["output_dir"]))
-    if not output_dir.is_absolute():
-        output_dir = PROJECT_ROOT / output_dir
-
-    if model_name == RESIDUAL_FLOW_APPROX_MODEL_NAME and flow_approx_method not in FLOW_APPROX_METHOD_CHOICES:
-        raise ValueError(f"Unsupported flow_approx_method: {flow_approx_method}")
-    if splatting_fill_strategy not in SPLATTING_FILL_STRATEGIES:
-        available_strategies = ", ".join(SPLATTING_FILL_STRATEGIES)
-        raise ValueError(f"Unsupported splatting_fill_strategy: {splatting_fill_strategy}. Available strategies: {available_strategies}")
-    if init_flow_downscale_strategy not in INIT_FLOW_DOWNSCALE_STRATEGIES:
-        available_strategies = ", ".join(INIT_FLOW_DOWNSCALE_STRATEGIES)
-        raise ValueError(
-            f"Unsupported init_flow_downscale_strategy: {init_flow_downscale_strategy}. "
-            f"Available strategies: {available_strategies}"
-        )
-    if init_flow_mask_epsilon <= 0:
-        raise ValueError(f"init_flow_mask_epsilon must be positive, got {init_flow_mask_epsilon}")
-    if init_flow_downscale_strategy == "masked_area" and (
-        model_name != RESIDUAL_FLOW_APPROX_MODEL_NAME
-        or not is_splatting_flow_approx_method(flow_approx_method=flow_approx_method)
-    ):
-        raise ValueError(
-            "init_flow_downscale_strategy=masked_area requires "
-            "model_name=IFRNet_Residual_FlowApprox and a splatting flow approximation method."
-        )
-
-    summary = {
-        "mode": mode,
-        "model_name": model_name,
-        "inference_presets": inference_presets,
-        "root_dir": str(root_dir),
-        "dataset_root_dir": str(dataset_root_dir),
-        "checkpoint_path": str(checkpoint_path),
-        "output_dir": str(output_dir),
-        "batch_size": batch_size,
-        "only_fps": only_fps,
-        "input_fps": input_fps,
-        "scale_factor": scale_factor,
-        "flow_approx_method": flow_approx_method,
-        "splatting_fill_strategy": splatting_fill_strategy,
-        "init_flow_downscale_strategy": init_flow_downscale_strategy,
-        "init_flow_mask_epsilon": init_flow_mask_epsilon,
-        "flow_diff_threshold": flow_diff_threshold,
-        "flow_diff_percentile": flow_diff_percentile,
-        "save_topk_worst_psnr": save_topk_worst_psnr,
-        "save_topk_best_psnr": save_topk_best_psnr,
-        "save_topk_largest_flow_diff": save_topk_largest_flow_diff,
-        "metrics": dict(metric_config),
-    }
-    if eval_convex_upsampling is not None:
-        summary["eval_convex_upsampling"] = eval_convex_upsampling
-    if len(model_init_args) > 0:
-        summary["model_init_args"] = model_init_args
-    if mode == "dry-run":
-        print(json.dumps(summary, indent=2))
+    run_config = build_inference_run_config(config_path=Path(args.config), project_root=PROJECT_ROOT)
+    if run_config.mode == "dry-run":
+        print(json.dumps(build_inference_dry_run_summary(config=run_config), indent=2))
         return
+
+    mode = run_config.mode
+    model_name = run_config.model.model_name
+    model_init_args = dict(run_config.model.model_init_args)
+    eval_convex_upsampling = run_config.model.eval_convex_upsampling
+    inference_presets = list(run_config.inference_presets)
+    flow_approx_method = run_config.flow_approx.method
+    splatting_fill_strategy = run_config.flow_approx.splatting_fill_strategy
+    init_flow_downscale_strategy = run_config.flow_approx.init_flow_downscale_strategy
+    init_flow_mask_epsilon = run_config.flow_approx.init_flow_mask_epsilon
+    scale_factor = run_config.scale_factor
+    flow_diff_threshold = run_config.flow_diff_threshold
+    flow_diff_percentile = run_config.flow_diff_percentile
+    save_topk_worst_psnr = run_config.save_topk_worst_psnr
+    save_topk_best_psnr = run_config.save_topk_best_psnr
+    save_topk_largest_flow_diff = run_config.save_topk_largest_flow_diff
+    metric_config = dict(run_config.metrics.values)
+    seed = run_config.seed
+    batch_size = run_config.batch_size
+    only_fps = run_config.only_fps
+    input_fps = run_config.input_fps
+    root_dir = run_config.root_dir
+    dataset_root_dir = run_config.dataset_root_dir
+    checkpoint_path = run_config.checkpoint_path
+    output_dir = run_config.output_dir
 
     output_dir.mkdir(parents=True, exist_ok=True)
     import cv2
