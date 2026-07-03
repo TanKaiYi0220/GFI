@@ -11,7 +11,6 @@ PROJECT_ROOT: Path = Path(__file__).parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.train import set_seed
 from src.engine.checkpoints import load_inference_state_dict
 from src.engine.dataset_runs import build_inference_dataset
 from src.engine.dataset_runs import build_merged_dataframe
@@ -38,6 +37,7 @@ from src.engine.model_registry import set_model_convex_upsampling
 from src.engine.run_config import build_inference_dry_run_summary
 from src.engine.run_config import build_inference_run_config
 from src.utils.logger import build_logger
+from src.utils.seed import set_seed
 # Model variants:
 # - IFRNet: baseline
 # - IFRNet_Residual: residual model initialized by bmv/fmv from the 60fps motion labels

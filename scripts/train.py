@@ -4,7 +4,6 @@ import argparse
 import json
 import logging
 import math
-import random
 import sys
 import time
 from pathlib import Path
@@ -48,15 +47,7 @@ from src.engine.run_config import INIT_FLOW_DOWNSCALE_STRATEGIES
 from src.engine.run_config import parse_eval_convex_upsampling_arg
 from src.engine.run_config import TrainRunConfig
 from src.utils.config import load_yaml_file
-
-def set_seed(seed: int) -> None:
-    import numpy as np
-    import torch
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+from src.utils.seed import set_seed
 
 
 def get_lr(config: TrainRunConfig, step: int, iters_per_epoch: int) -> float:

@@ -17,10 +17,10 @@ from scripts.train import build_merged_dataframe
 from scripts.train import read_model_init_args
 from scripts.train import read_optional_bool
 from scripts.train import resolve_model_class
-from scripts.train import set_seed
 from scripts.train import set_model_convex_upsampling
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
+from src.utils.seed import set_seed
 
 VIDEO_CONFIG_KEYS: tuple[str, ...] = (
     "output_dir",
