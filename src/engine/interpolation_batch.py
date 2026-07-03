@@ -50,6 +50,25 @@ class _InitFlowState:
     init_fmv_mask: Any | None
 
 
+def _build_exact_imgt_merge(
+    img0: Any,
+    img1: Any,
+    up_flow0_1: Any,
+    up_flow1_1: Any,
+    up_mask_1: Any,
+) -> Any:
+    import torch
+
+    from src.models.external.IFRNet.utils import warp
+
+    mean = torch.cat([img0, img1], dim=2).mean(1, keepdim=True).mean(2, keepdim=True).mean(3, keepdim=True)
+    img0_centered = img0 - mean
+    img1_centered = img1 - mean
+    img0_warp = warp(img0_centered, up_flow0_1)
+    img1_warp = warp(img1_centered, up_flow1_1)
+    return up_mask_1 * img0_warp + (1 - up_mask_1) * img1_warp + mean
+
+
 def _resolve_source_depth_tensors(
     info: dict[str, Any],
     device: Any,
@@ -125,7 +144,7 @@ def _run_model_forward(
     source_depth1: Any | None,
     ground_truth_bmv: Any | None,
     ground_truth_fmv: Any | None,
-) -> tuple[Any, Any | None, Any | None]:
+) -> tuple[Any, _InitFlowState]:
     import torch
 
     init_flow = _build_init_flow(
@@ -142,7 +161,7 @@ def _run_model_forward(
 
     if model_name == BASELINE_MODEL_NAME:
         flow = torch.cat([init_flow.init_bmv, init_flow.init_fmv], dim=1).float()
-        return model(img0, img1, embt, imgt, flow), init_flow.init_bmv, init_flow.init_fmv
+        return model(img0, img1, embt, imgt, flow), init_flow
 
     return (
         model(
@@ -156,8 +175,7 @@ def _run_model_forward(
             init_flow1_mask=init_flow.init_fmv_mask,
             init_flow_mask_epsilon=flow_approx.init_flow_mask_epsilon,
         ),
-        init_flow.init_bmv,
-        init_flow.init_fmv,
+        init_flow,
     )
 
 
@@ -225,6 +243,7 @@ def run_training_batch(
     model: Any,
     batch: Any,
     device: Any,
+    collect_visual_artifacts: bool,
 ) -> InterpolationBatchResult:
     model_name = config.model.model_name
     try:
@@ -255,7 +274,7 @@ def run_training_batch(
     imgt = imgt.to(device)
     embt = embt.to(device)
 
-    model_output, _init_bmv, _init_fmv = _run_model_forward(
+    model_output, init_flow = _run_model_forward(
         model_name=model_name,
         model=model,
         img0=img0,
@@ -270,7 +289,35 @@ def run_training_batch(
         ground_truth_bmv=bmv,
         ground_truth_fmv=fmv,
     )
-    imgt_pred, loss_rec, loss_geo, loss_dis, _up_flow0_1, _up_flow1_1, _up_mask_1 = model_output
+    imgt_pred, loss_rec, loss_geo, loss_dis, up_flow0_1, up_flow1_1, up_mask_1 = model_output
+    if model_name == BASELINE_MODEL_NAME:
+        init_bmv = None
+        init_fmv = None
+        init_masks = None
+        imgt_merge = None
+        splatting_region_maps = None
+    else:
+        init_bmv = init_flow.init_bmv
+        init_fmv = init_flow.init_fmv
+        init_masks = init_flow.init_masks
+        if collect_visual_artifacts:
+            imgt_merge = _build_exact_imgt_merge(
+                img0=img0,
+                img1=img1,
+                up_flow0_1=up_flow0_1,
+                up_flow1_1=up_flow1_1,
+                up_mask_1=up_mask_1,
+            )
+            splatting_region_maps = build_splatting_region_maps(
+                fmv_30=source_fmv,
+                bmv_30=source_bmv,
+                embt=embt,
+                init_masks=init_masks,
+            )
+        else:
+            imgt_merge = None
+            splatting_region_maps = None
+
     return InterpolationBatchResult(
         img0=img0,
         img1=img1,
@@ -280,17 +327,17 @@ def run_training_batch(
         info=info,
         bmv=bmv,
         fmv=fmv,
-        init_bmv=None,
-        init_fmv=None,
-        init_masks=None,
-        up_flow0_1=None,
-        up_flow1_1=None,
-        up_mask_1=None,
-        imgt_merge=None,
+        init_bmv=init_bmv,
+        init_fmv=init_fmv,
+        init_masks=init_masks,
+        up_flow0_1=up_flow0_1,
+        up_flow1_1=up_flow1_1,
+        up_mask_1=up_mask_1,
+        imgt_merge=imgt_merge,
         loss_rec=loss_rec,
         loss_geo=loss_geo,
         loss_dis=loss_dis,
-        splatting_region_maps=None,
+        splatting_region_maps=splatting_region_maps,
     )
 
 

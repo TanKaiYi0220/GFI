@@ -7,7 +7,6 @@ import math
 import random
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.data.dataset_config import list_dataset_presets
 from src.engine.dataset_runs import build_merged_dataframe
 from src.engine.dataset_runs import build_training_dataset
+from src.engine.dataset_runs import filter_valid_dataframe
 from src.engine.dataset_runs import resolve_dataset_class_name
 from src.engine.checkpoints import load_training_state
 from src.engine.checkpoints import save_checkpoint
@@ -32,12 +32,10 @@ from src.engine.evaluation import calculate_batch_metrics
 from src.engine.evaluation import format_metric_averages
 from src.engine.evaluation import format_metric_values
 from src.engine.evaluation import get_enabled_metric_names
-from src.engine.flow_approx import build_flow_init_result_with_fill_strategy
 from src.engine.flow_approx import DEFAULT_SPLATTING_FILL_STRATEGY
 from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
-from src.engine.flow_approx import FLOW_APPROX_METHODS
-from src.engine.flow_approx import is_splatting_flow_approx_method
 from src.engine.flow_approx import SPLATTING_FILL_STRATEGIES
+from src.engine.interpolation_batch import run_training_batch
 from src.engine.model_registry import MODEL_NAMES
 from src.engine.model_registry import resolve_model_class
 from src.engine.model_registry import set_model_convex_upsampling
@@ -51,17 +49,6 @@ from src.engine.run_config import parse_eval_convex_upsampling_arg
 from src.engine.run_config import TrainRunConfig
 from src.utils.config import load_yaml_file
 
-@dataclass(frozen=True)
-class BatchStepOutput:
-    img0: Any
-    img1: Any
-    imgt: Any
-    imgt_pred: Any
-    info: dict[str, Any]
-    loss_rec: Any
-    loss_geo: Any
-    loss_dis: Any
-
 def set_seed(seed: int) -> None:
     import numpy as np
     import torch
@@ -72,10 +59,10 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def get_lr(args: argparse.Namespace, step: int) -> float:
-    total_steps = max(args.epochs * args.iters_per_epoch, 1)
+def get_lr(config: TrainRunConfig, step: int, iters_per_epoch: int) -> float:
+    total_steps = max(config.epochs * iters_per_epoch, 1)
     ratio = 0.5 * (1.0 + math.cos(step / total_steps * math.pi))
-    return (args.lr_start - args.lr_end) * ratio + args.lr_end
+    return (config.lr_start - config.lr_end) * ratio + config.lr_end
 
 
 def set_lr(optimizer: Any, lr: float) -> None:
@@ -104,70 +91,6 @@ def build_logger(output_dir: Path) -> tuple[logging.Logger, Path]:
     logger.addHandler(file_handler)
 
     return logger, run_dir
-
-
-def forward_model(
-    model_name: str,
-    model: Any,
-    img0: Any,
-    img1: Any,
-    embt: Any,
-    imgt: Any,
-    source_bmv: Any,
-    source_fmv: Any,
-    flow_approx_method: str,
-    splatting_fill_strategy: str,
-    init_flow_downscale_strategy: str,
-    init_flow_mask_epsilon: float,
-    source_depth0: Any | None,
-    source_depth1: Any | None,
-    ground_truth_bmv: Any | None,
-    ground_truth_fmv: Any | None,
-) -> Any:
-    import torch
-
-    init_bmv = source_bmv
-    init_fmv = source_fmv
-    init_bmv_mask = None
-    init_fmv_mask = None
-
-    if uses_flow_approx_model(model_name):
-        flow_init = build_flow_init_result_with_fill_strategy(
-            fmv_30=source_fmv,
-            bmv_30=source_bmv,
-            embt=embt,
-            flow_approx_method=flow_approx_method,
-            source_depth0=source_depth0,
-            source_depth1=source_depth1,
-            splatting_fill_strategy=splatting_fill_strategy,
-            ground_truth_bmv=ground_truth_bmv,
-            ground_truth_fmv=ground_truth_fmv,
-        )
-        init_bmv = flow_init.bmv
-        init_fmv = flow_init.fmv
-        if init_flow_downscale_strategy == "masked_area":
-            if flow_init.masks is None:
-                raise RuntimeError(
-                    "init_flow_downscale_strategy=masked_area requires splatting coverage masks, but none were produced."
-                )
-            init_bmv_mask = flow_init.masks[:, 0:1]
-            init_fmv_mask = flow_init.masks[:, 1:2]
-
-    if model_name == "IFRNet":
-        flow = torch.cat([init_bmv, init_fmv], dim=1).float()
-        return model(img0, img1, embt, imgt, flow)
-
-    return model(
-        img0,
-        img1,
-        embt,
-        imgt,
-        init_flow0=init_bmv,
-        init_flow1=init_fmv,
-        init_flow0_mask=init_bmv_mask,
-        init_flow1_mask=init_fmv_mask,
-        init_flow_mask_epsilon=init_flow_mask_epsilon,
-    )
 
 
 def build_loss_record(
@@ -259,28 +182,53 @@ def select_sample_rows(dataframe: Any, frame_keys: list[str]) -> Any:
     return dataframe.loc[indices].reset_index(drop=True)
 
 
-def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: dict[str, Any], epoch: int, device: Any, logger: logging.Logger) -> None:
+def build_sample_artifact_inputs(batch_output: Any) -> dict[str, Any]:
+    return {
+        "img0": batch_output.img0,
+        "img1": batch_output.img1,
+        "imgt": batch_output.imgt,
+        "bmv": batch_output.bmv,
+        "fmv": batch_output.fmv,
+        "imgt_pred": batch_output.imgt_pred,
+        "imgt_merge": batch_output.imgt_merge,
+        "init_bmv": batch_output.init_bmv,
+        "init_fmv": batch_output.init_fmv,
+        "init_masks": batch_output.init_masks,
+        "splatting_region_maps": batch_output.splatting_region_maps,
+        "up_flow0_1": batch_output.up_flow0_1,
+        "up_flow1_1": batch_output.up_flow1_1,
+        "up_mask_1": batch_output.up_mask_1,
+    }
+
+
+def save_epoch_samples(
+    config: TrainRunConfig,
+    model: Any,
+    sample_dataframes: dict[str, Any],
+    epoch: int,
+    device: Any,
+    logger: logging.Logger,
+) -> None:
     import cv2
     import numpy as np
     import torch
     from torch.utils.data import DataLoader
-    from scripts.inference import run_inference_batch_with_fill_strategy
     from scripts.inference import save_selected_sample_artifacts
     from src.data.image_ops import flow_to_image, save_image
 
-    frame_groups = {"train": args.sample_train_frames, "test": args.sample_test_frames}
+    frame_groups = {"train": config.sample_train_frames, "test": config.sample_test_frames}
     if sum(len(frame_keys) for frame_keys in frame_groups.values()) == 0:
         return
-    if args.sample_interval_epoch <= 0:
-        raise ValueError(f"sample_interval_epoch must be positive, got {args.sample_interval_epoch}")
-    if (epoch + 1) % args.sample_interval_epoch != 0:
+    if config.sample_interval_epoch <= 0:
+        raise ValueError(f"sample_interval_epoch must be positive, got {config.sample_interval_epoch}")
+    if (epoch + 1) % config.sample_interval_epoch != 0:
         return
 
     previous_convex_upsampling = None
-    if args.eval_convex_upsampling is not None:
+    if config.model.eval_convex_upsampling is not None:
         previous_convex_upsampling = set_model_convex_upsampling(
             model=model,
-            enabled=args.eval_convex_upsampling,
+            enabled=config.model.eval_convex_upsampling,
             context="sample evaluation",
         )
     try:
@@ -292,26 +240,31 @@ def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: 
                 sample_dataframe = select_sample_rows(sample_dataframes[split_name], list(frame_keys))
                 sample_dataset = build_training_dataset(
                     sample_dataframe,
-                    args.dataset_root_dir,
+                    config.dataset_root_dir,
                     False,
-                    args.input_fps,
-                    args.model_name,
-                    args.flow_approx_method,
+                    config.input_fps,
+                    config.model.model_name,
+                    config.flow_approx.method,
                 )
                 for frame_key, batch in zip(frame_keys, DataLoader(sample_dataset, batch_size=1, shuffle=False)):
-                    save_dir = Path(args.output_dir) / "samples" / split_name / frame_key / f"epoch_{epoch + 1:04d}"
-                    inference_result = run_inference_batch_with_fill_strategy(
-                        batch,
-                        device,
-                        args.flow_approx_method,
-                        args.splatting_fill_strategy,
-                        args.init_flow_downscale_strategy,
-                        args.init_flow_mask_epsilon,
-                        model,
-                        args.model_name,
-                        1.0,
+                    save_dir = Path(config.output_dir) / "samples" / split_name / frame_key / f"epoch_{epoch + 1:04d}"
+                    batch_output = run_training_batch(
+                        config=config,
+                        model=model,
+                        batch=batch,
+                        device=device,
+                        collect_visual_artifacts=True,
                     )
-                    save_selected_sample_artifacts(cv2, 99.0, 1.0, flow_to_image, inference_result, np, save_dir, save_image)
+                    save_selected_sample_artifacts(
+                        cv2,
+                        99.0,
+                        1.0,
+                        flow_to_image,
+                        build_sample_artifact_inputs(batch_output),
+                        np,
+                        save_dir,
+                        save_image,
+                    )
                     logger.info("Saved sample frame split=%s frame=%s epoch=%s dir=%s", split_name, frame_key, epoch + 1, save_dir)
     finally:
         if previous_convex_upsampling is not None:
@@ -322,71 +275,8 @@ def save_epoch_samples(args: argparse.Namespace, model: Any, sample_dataframes: 
             )
 
 
-def run_training_batch(
-    args: argparse.Namespace,
-    model: Any,
-    batch: Any,
-    device: Any,
-) -> BatchStepOutput:
-    if uses_flow_approx_model(args.model_name):
-        img0, imgt, img1, bmv_60, fmv_60, bmv_30, fmv_30, embt, info = batch
-        source_bmv = bmv_30.to(device)
-        source_fmv = fmv_30.to(device)
-        ground_truth_bmv = bmv_60.to(device)
-        ground_truth_fmv = fmv_60.to(device)
-        if is_splatting_flow_approx_method(flow_approx_method=args.flow_approx_method):
-            source_depth0 = info["source_depth0"].to(device)
-            source_depth1 = info["source_depth1"].to(device)
-        else:
-            source_depth0 = None
-            source_depth1 = None
-    else:
-        img0, imgt, img1, bmv, fmv, embt, info = batch
-        source_bmv = bmv.to(device)
-        source_fmv = fmv.to(device)
-        source_depth0 = None
-        source_depth1 = None
-        ground_truth_bmv = None
-        ground_truth_fmv = None
-
-    img0 = img0.to(device)
-    img1 = img1.to(device)
-    imgt = imgt.to(device)
-    embt = embt.to(device)
-
-    model_output = forward_model(
-        args.model_name,
-        model,
-        img0,
-        img1,
-        embt,
-        imgt,
-        source_bmv,
-        source_fmv,
-        args.flow_approx_method,
-        args.splatting_fill_strategy,
-        args.init_flow_downscale_strategy,
-        args.init_flow_mask_epsilon,
-        source_depth0,
-        source_depth1,
-        ground_truth_bmv,
-        ground_truth_fmv,
-    )
-    imgt_pred, loss_rec, loss_geo, loss_dis, _up_flow0_1, _up_flow1_1, _up_mask_1 = model_output
-    return BatchStepOutput(
-        img0=img0,
-        img1=img1,
-        imgt=imgt,
-        imgt_pred=imgt_pred,
-        info=info,
-        loss_rec=loss_rec,
-        loss_geo=loss_geo,
-        loss_dis=loss_dis,
-    )
-
-
 def evaluate(
-    args: argparse.Namespace,
+    config: TrainRunConfig,
     model: Any,
     loader: Any,
     device: Any,
@@ -398,14 +288,14 @@ def evaluate(
     from tqdm import tqdm
 
     previous_convex_upsampling = None
-    if args.eval_convex_upsampling is not None:
+    if config.model.eval_convex_upsampling is not None:
         previous_convex_upsampling = set_model_convex_upsampling(
             model=model,
-            enabled=args.eval_convex_upsampling,
+            enabled=config.model.eval_convex_upsampling,
             context="training evaluation",
         )
 
-    metric_meters = build_metric_meters(args.metric_config)
+    metric_meters = build_metric_meters(config.metrics.values)
     eval_records: list[dict[str, object]] = []
 
     try:
@@ -413,7 +303,13 @@ def evaluate(
         with torch.no_grad():
             pbar = tqdm(loader, desc="Evaluating")
             for batch in pbar:
-                batch_output = run_training_batch(args, model, batch, device)
+                batch_output = run_training_batch(
+                    config=config,
+                    model=model,
+                    batch=batch,
+                    device=device,
+                    collect_visual_artifacts=False,
+                )
                 total_loss = batch_output.loss_rec + batch_output.loss_geo + batch_output.loss_dis
                 loss_record = build_loss_record(
                     batch_output.loss_rec,
@@ -430,7 +326,7 @@ def evaluate(
                     batch_output.img1,
                     batch_output.imgt,
                     loss_record,
-                    args.metric_config,
+                    config.metrics.values,
                     lpips_model,
                     flolpips_model,
                 )
@@ -444,12 +340,12 @@ def evaluate(
             )
 
     eval_df = pd.DataFrame(eval_records)
-    record_name_df = build_record_name_summary(eval_df, args.metric_config)
+    record_name_df = build_record_name_summary(eval_df, config.metrics.values)
     return metric_meters["psnr"].avg, eval_df, record_name_df, average_metric_values(metric_meters)
 
 
 def train(
-    args: argparse.Namespace,
+    config: TrainRunConfig,
     model: Any,
     optimizer: Any,
     train_loader: Any,
@@ -466,24 +362,31 @@ def train(
 
     best_psnr = training_state.best_psnr
     global_step = training_state.global_step
-    checkpoints_dir = Path(args.output_dir) / "checkpoints"
+    checkpoints_dir = Path(config.output_dir) / "checkpoints"
+    train_steps_per_epoch = len(train_loader)
 
-    for epoch in range(training_state.start_epoch, args.epochs):
+    for epoch in range(training_state.start_epoch, config.epochs):
         model.train()
-        train_metric_meters = build_metric_meters(args.metric_config)
+        train_metric_meters = build_metric_meters(config.metrics.values)
         train_loss_total_meter = AverageMeter()
         train_loss_rec_meter = AverageMeter()
         train_loss_geo_meter = AverageMeter()
         train_loss_dis_meter = AverageMeter()
         train_records: list[dict[str, object]] = []
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.epochs}")
 
         for batch in pbar:
-            lr = get_lr(args, global_step)
+            lr = get_lr(config, global_step, train_steps_per_epoch)
             set_lr(optimizer, lr)
             optimizer.zero_grad()
 
-            batch_output = run_training_batch(args, model, batch, device)
+            batch_output = run_training_batch(
+                config=config,
+                model=model,
+                batch=batch,
+                device=device,
+                collect_visual_artifacts=False,
+            )
             total_loss = batch_output.loss_rec + batch_output.loss_geo + batch_output.loss_dis
             total_loss.backward()
             optimizer.step()
@@ -502,7 +405,7 @@ def train(
                     "lr": f"{lr:.6f}",
                 }
             )
-            if (epoch + 1) % args.eval_interval != 0:
+            if (epoch + 1) % config.eval_interval != 0:
                 continue
 
             loss_record = build_loss_record(
@@ -520,14 +423,14 @@ def train(
                 batch_output.img1,
                 batch_output.imgt,
                 loss_record,
-                args.metric_config,
+                config.metrics.values,
                 lpips_model,
                 flolpips_model,
             )
 
-        if (epoch + 1) % args.eval_interval == 0:
+        if (epoch + 1) % config.eval_interval == 0:
             train_df = pd.DataFrame(train_records)
-            train_record_name_df = build_record_name_summary(train_df, args.metric_config)
+            train_record_name_df = build_record_name_summary(train_df, config.metrics.values)
             train_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}.csv", index=False)
             train_record_name_df.to_csv(checkpoints_dir / f"train_epoch_{epoch + 1}_record_name.csv", index=False)
             logger.info(
@@ -549,14 +452,14 @@ def train(
                 train_loss_dis_meter.avg,
             )
 
-        if (epoch + 1) % args.eval_interval == 0:
+        if (epoch + 1) % config.eval_interval == 0:
             test_psnr, test_df, test_record_name_df, test_metric_values = evaluate(
-                args,
-                model,
-                test_loader,
-                device,
-                lpips_model,
-                flolpips_model,
+                config=config,
+                model=model,
+                loader=test_loader,
+                device=device,
+                lpips_model=lpips_model,
+                flolpips_model=flolpips_model,
             )
             test_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}.csv", index=False)
             test_record_name_df.to_csv(checkpoints_dir / f"test_epoch_{epoch + 1}_record_name.csv", index=False)
@@ -569,7 +472,7 @@ def train(
 
         save_checkpoint(checkpoints_dir / f"epoch_{epoch + 1}.pth", model, optimizer, epoch, best_psnr)
         save_checkpoint(checkpoints_dir / "latest.pth", model, optimizer, epoch, best_psnr)
-        save_epoch_samples(args, model, sample_dataframes, epoch, device, logger)
+        save_epoch_samples(config, model, sample_dataframes, epoch, device, logger)
 
 
 def load_train_run_config(config_path: Path | None) -> dict[str, Any]:
@@ -659,43 +562,8 @@ def parse_train_config(argv: list[str] | None) -> TrainRunConfig:
     return build_train_run_config(args=args, config_defaults=args.input_config)
 
 
-def build_train_runtime_args(run_config: TrainRunConfig) -> argparse.Namespace:
-    return argparse.Namespace(
-        mode=run_config.mode,
-        model_name=run_config.model.model_name,
-        model_init_args=dict(run_config.model.model_init_args),
-        eval_convex_upsampling=run_config.model.eval_convex_upsampling,
-        flow_approx=run_config.flow_approx,
-        flow_approx_method=run_config.flow_approx.method,
-        splatting_fill_strategy=run_config.flow_approx.splatting_fill_strategy,
-        init_flow_downscale_strategy=run_config.flow_approx.init_flow_downscale_strategy,
-        init_flow_mask_epsilon=run_config.flow_approx.init_flow_mask_epsilon,
-        metric_config=dict(run_config.metrics.values),
-        root_dir=str(run_config.root_dir),
-        dataset_root_dir=run_config.dataset_root_dir,
-        paths_config=run_config.paths_config,
-        train_preset=run_config.train_preset,
-        test_preset=run_config.test_preset,
-        epochs=run_config.epochs,
-        resume_path=run_config.resume_path,
-        pretrained_checkpoint_path=run_config.pretrained_checkpoint_path,
-        eval_interval=run_config.eval_interval,
-        lr_start=run_config.lr_start,
-        lr_end=run_config.lr_end,
-        seed=run_config.seed,
-        batch_size=run_config.batch_size,
-        output_dir=run_config.output_dir,
-        only_fps=run_config.only_fps,
-        input_fps=run_config.input_fps,
-        sample_train_frames=list(run_config.sample_train_frames),
-        sample_test_frames=list(run_config.sample_test_frames),
-        sample_interval_epoch=run_config.sample_interval_epoch,
-        input_config=dict(run_config.input_config),
-    )
-
-
 def log_run_summary(
-    args: argparse.Namespace,
+    config: TrainRunConfig,
     train_dataset: Any,
     test_dataset: Any,
     training_state: TrainingState,
@@ -704,17 +572,17 @@ def log_run_summary(
 ) -> None:
     logger.info(
         "model=%s mode=%s dataset_class=%s device=%s output_dir=%s dataset_root_dir=%s train_samples=%s test_samples=%s start_epoch=%s epochs=%s batch_size=%s",
-        args.model_name,
+        config.model.model_name,
         training_state.mode,
-        resolve_dataset_class_name(args.model_name),
+        resolve_dataset_class_name(config.model.model_name),
         device,
-        args.output_dir,
-        args.dataset_root_dir,
+        config.output_dir,
+        config.dataset_root_dir,
         len(train_dataset),
         len(test_dataset),
         training_state.start_epoch,
-        args.epochs,
-        args.batch_size,
+        config.epochs,
+        config.batch_size,
     )
 
 
@@ -724,139 +592,139 @@ def save_input_config(target_dir: Path, input_config: dict[str, Any]) -> Path:
     return config_path
 
 
-def run_training(args: argparse.Namespace) -> None:
+def run_training(config: TrainRunConfig) -> None:
     import torch
     import torch.optim as optim
     from torch.utils.data import DataLoader
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(config.output_dir)
     checkpoints_dir = output_dir / "checkpoints"
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     logger, run_dir = build_logger(output_dir)
-    set_seed(args.seed)
+    set_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lpips_model = build_lpips_model(args.metric_config, device)
-    flolpips_model = build_flolpips_model(args.metric_config, device)
-    build_flip_evaluator(args.metric_config)
+    metric_config = dict(config.metrics.values)
+    lpips_model = build_lpips_model(metric_config, device)
+    flolpips_model = build_flolpips_model(metric_config, device)
+    build_flip_evaluator(metric_config)
     logger.info("device=%s", device)
-    logger.info("model_name=%s model_init_args=%s", args.model_name, args.model_init_args)
+    logger.info("model_name=%s model_init_args=%s", config.model.model_name, config.model.model_init_args)
     logger.info(
         "train_preset=%s test_preset=%s input_fps=%s only_fps=%s",
-        args.train_preset,
-        args.test_preset,
-        args.input_fps,
-        args.only_fps,
+        config.train_preset,
+        config.test_preset,
+        config.input_fps,
+        config.only_fps,
     )
     logger.info(
         "epochs=%s batch_size=%s eval_interval=%s lr_start=%s lr_end=%s seed=%s",
-        args.epochs,
-        args.batch_size,
-        args.eval_interval,
-        args.lr_start,
-        args.lr_end,
-        args.seed,
+        config.epochs,
+        config.batch_size,
+        config.eval_interval,
+        config.lr_start,
+        config.lr_end,
+        config.seed,
     )
     logger.info(
         "resume_path=%s pretrained_checkpoint_path=%s output_dir=%s",
-        args.resume_path,
-        args.pretrained_checkpoint_path,
-        args.output_dir,
+        config.resume_path,
+        config.pretrained_checkpoint_path,
+        config.output_dir,
     )
-    logger.info("metrics=%s", args.metric_config)
-    if args.eval_convex_upsampling is not None:
-        logger.info("eval_convex_upsampling=%s", args.eval_convex_upsampling)
-    if uses_flow_approx_model(args.model_name):
-        logger.info("flow_approx_method=%s", args.flow_approx_method)
+    logger.info("metrics=%s", metric_config)
+    if config.model.eval_convex_upsampling is not None:
+        logger.info("eval_convex_upsampling=%s", config.model.eval_convex_upsampling)
+    if uses_flow_approx_model(config.model.model_name):
+        logger.info("flow_approx_method=%s", config.flow_approx.method)
         logger.info(
             "splatting_fill_strategy=%s effective_splatting_fill_strategy=%s",
-            args.splatting_fill_strategy,
-            args.flow_approx.effective_splatting_fill_strategy,
+            config.flow_approx.splatting_fill_strategy,
+            config.flow_approx.effective_splatting_fill_strategy,
         )
         logger.info(
             "init_flow_downscale_strategy=%s effective_init_flow_downscale_strategy=%s init_flow_mask_epsilon=%s",
-            args.init_flow_downscale_strategy,
-            args.flow_approx.effective_init_flow_downscale_strategy,
-            args.init_flow_mask_epsilon,
+            config.flow_approx.init_flow_downscale_strategy,
+            config.flow_approx.effective_init_flow_downscale_strategy,
+            config.flow_approx.init_flow_mask_epsilon,
         )
 
-    root_dir = Path(args.root_dir)
-    train_df = build_merged_dataframe(root_dir, checkpoints_dir, args.train_preset, args.only_fps, logger)
-    test_df = build_merged_dataframe(root_dir, checkpoints_dir, args.test_preset, args.only_fps, logger)
+    train_df = build_merged_dataframe(config.root_dir, checkpoints_dir, config.train_preset, config.only_fps, logger)
+    test_df = build_merged_dataframe(config.root_dir, checkpoints_dir, config.test_preset, config.only_fps, logger)
 
     if "valid" in train_df.columns:
-        logger.info("Valid Count %s in %s", train_df["valid"].value_counts().to_dict(), args.train_preset)
-        train_df = train_df[train_df["valid"] == True]
+        logger.info("Valid Count %s in %s", train_df["valid"].value_counts().to_dict(), config.train_preset)
     if "valid" in test_df.columns:
-        logger.info("Valid Count %s in %s", test_df["valid"].value_counts().to_dict(), args.test_preset)
-        test_df = test_df[test_df["valid"] == True]
+        logger.info("Valid Count %s in %s", test_df["valid"].value_counts().to_dict(), config.test_preset)
+    train_df = filter_valid_dataframe(train_df)
+    test_df = filter_valid_dataframe(test_df)
 
     train_dataset = build_training_dataset(
         train_df,
-        args.dataset_root_dir,
+        config.dataset_root_dir,
         True,
-        args.input_fps,
-        args.model_name,
-        args.flow_approx_method,
+        config.input_fps,
+        config.model.model_name,
+        config.flow_approx.method,
     )
     test_dataset = build_training_dataset(
         test_df,
-        args.dataset_root_dir,
+        config.dataset_root_dir,
         False,
-        args.input_fps,
-        args.model_name,
-        args.flow_approx_method,
+        config.input_fps,
+        config.model.model_name,
+        config.flow_approx.method,
     )
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-    args.iters_per_epoch = len(train_loader)
-    model_class = resolve_model_class(args.model_name)
-    model_init_args = dict(getattr(args, "model_init_args", {}))
+    iters_per_epoch = len(train_loader)
+    model_class = resolve_model_class(config.model.model_name)
+    model_init_args = dict(config.model.model_init_args)
     model = model_class(**model_init_args).to(device)
     if hasattr(model, "init_flow_layer"):
         logger.info("model_init_flow_layer=%s", model.init_flow_layer)
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr_start, weight_decay=0)
+    optimizer = optim.AdamW(model.parameters(), lr=config.lr_start, weight_decay=0)
     training_state = load_training_state(
-        resume_path=args.resume_path,
-        pretrained_checkpoint_path=args.pretrained_checkpoint_path,
+        resume_path=config.resume_path,
+        pretrained_checkpoint_path=config.pretrained_checkpoint_path,
         model=model,
         optimizer=optimizer,
         device=device,
         logger=logger,
-        iters_per_epoch=args.iters_per_epoch,
-        model_name=args.model_name,
+        iters_per_epoch=iters_per_epoch,
+        model_name=config.model.model_name,
     )
 
-    log_run_summary(args, train_dataset, test_dataset, training_state, device, logger)
+    log_run_summary(config, train_dataset, test_dataset, training_state, device, logger)
     logger.info("run_log_dir=%s", run_dir)
-    input_config_path = save_input_config(target_dir=run_dir, input_config=args.input_config)
+    input_config_path = save_input_config(target_dir=run_dir, input_config=config.input_config)
     logger.info("input_config_path=%s", input_config_path)
 
     train(
-        args,
-        model,
-        optimizer,
-        train_loader,
-        test_loader,
-        device,
-        logger,
-        training_state,
-        {"train": train_df, "test": test_df},
-        lpips_model,
-        flolpips_model,
+        config=config,
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        test_loader=test_loader,
+        device=device,
+        logger=logger,
+        training_state=training_state,
+        sample_dataframes={"train": train_df, "test": test_df},
+        lpips_model=lpips_model,
+        flolpips_model=flolpips_model,
     )
 
 
 def main(argv: list[str] | None = None) -> None:
-    run_config = parse_train_config(argv)
+    config = parse_train_config(argv)
 
-    if run_config.mode == "dry-run":
-        print(json.dumps(build_train_dry_run_summary(config=run_config), indent=2))
+    if config.mode == "dry-run":
+        print(json.dumps(build_train_dry_run_summary(config=config), indent=2))
         return
 
-    run_training(build_train_runtime_args(run_config))
+    run_training(config=config)
 
 
 if __name__ == "__main__":
