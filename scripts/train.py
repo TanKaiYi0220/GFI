@@ -173,25 +173,6 @@ def select_sample_rows(dataframe: Any, frame_keys: list[str]) -> Any:
     return dataframe.loc[indices].reset_index(drop=True)
 
 
-def build_sample_artifact_inputs(batch_output: Any) -> dict[str, Any]:
-    return {
-        "img0": batch_output.img0,
-        "img1": batch_output.img1,
-        "imgt": batch_output.imgt,
-        "bmv": batch_output.bmv,
-        "fmv": batch_output.fmv,
-        "imgt_pred": batch_output.imgt_pred,
-        "imgt_merge": batch_output.imgt_merge,
-        "init_bmv": batch_output.init_bmv,
-        "init_fmv": batch_output.init_fmv,
-        "init_masks": batch_output.init_masks,
-        "splatting_region_maps": batch_output.splatting_region_maps,
-        "up_flow0_1": batch_output.up_flow0_1,
-        "up_flow1_1": batch_output.up_flow1_1,
-        "up_mask_1": batch_output.up_mask_1,
-    }
-
-
 def save_epoch_samples(
     config: TrainRunConfig,
     model: Any,
@@ -251,7 +232,7 @@ def save_epoch_samples(
                         99.0,
                         1.0,
                         flow_to_image,
-                        build_sample_artifact_inputs(batch_output),
+                        batch_output,
                         np,
                         save_dir,
                         save_image,

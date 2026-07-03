@@ -10,14 +10,15 @@ PROJECT_ROOT: Path = Path(__file__).parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.inference import BASELINE_MODEL_NAME
-from scripts.inference import run_inference_batch
-from src.engine.flow_approx import SPLATTING_FLOW_APPROX_METHODS
-from scripts.train import build_merged_dataframe
-from scripts.train import read_model_init_args
-from scripts.train import read_optional_bool
-from scripts.train import resolve_model_class
-from scripts.train import set_model_convex_upsampling
+from src.engine.checkpoints import load_inference_state_dict
+from src.engine.dataset_runs import build_inference_dataset
+from src.engine.dataset_runs import build_merged_dataframe
+from src.engine.interpolation_batch import InterpolationBatchResult
+from src.engine.interpolation_batch import run_inference_batch
+from src.engine.model_registry import BASELINE_MODEL_NAME
+from src.engine.model_registry import resolve_model_class
+from src.engine.model_registry import set_model_convex_upsampling
+from src.engine.run_config import build_inference_run_config
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
 from src.utils.seed import set_seed
@@ -119,7 +120,7 @@ def build_flow_error_vis(bg_img_np: Any, init_flow_np: Any, final_flow_np: Any, 
 def build_grid_frame(
     batch_index: int,
     flow_to_image: Any,
-    inference_result: dict[str, Any],
+    inference_result: InterpolationBatchResult,
     model_name: str,
     pad: int,
     tile_scale: float,
@@ -127,17 +128,20 @@ def build_grid_frame(
     cv2: Any,
     np: Any,
 ) -> Any:
-    img0 = inference_result["img0"]
-    img1 = inference_result["img1"]
-    imgt = inference_result["imgt"]
-    bmv = inference_result["bmv"]
-    fmv = inference_result["fmv"]
-    imgt_pred = inference_result["imgt_pred"]
-    init_bmv = inference_result["init_bmv"]
-    init_fmv = inference_result["init_fmv"]
-    up_flow0_1 = inference_result["up_flow0_1"]
-    up_flow1_1 = inference_result["up_flow1_1"]
-    up_mask_1 = inference_result["up_mask_1"]
+    img0 = inference_result.img0
+    img1 = inference_result.img1
+    imgt = inference_result.imgt
+    bmv = inference_result.bmv
+    fmv = inference_result.fmv
+    imgt_pred = inference_result.imgt_pred
+    init_bmv = inference_result.init_bmv
+    init_fmv = inference_result.init_fmv
+    up_flow0_1 = inference_result.up_flow0_1
+    up_flow1_1 = inference_result.up_flow1_1
+    up_mask_1 = inference_result.up_mask_1
+
+    if bmv is None or fmv is None or up_flow0_1 is None or up_flow1_1 is None or up_mask_1 is None:
+        raise RuntimeError("Video export requires batch results with ground-truth and predicted flow tensors.")
 
     img0_warped = warp(img0, up_flow0_1)
     img1_warped = warp(img1, up_flow1_1)
@@ -205,18 +209,24 @@ def main(argv: list[str] | None = None) -> None:
         config_path = PROJECT_ROOT / config_path
 
     config = load_yaml_file(config_path)
+    run_config = build_inference_run_config(config_path=config_path, project_root=PROJECT_ROOT)
     video_config = read_video_config(config)
-    mode = str(config["mode"])
-    model_name = str(config["model_name"])
-    model_init_args = read_model_init_args(config)
-    eval_convex_upsampling = read_optional_bool(config, "eval_convex_upsampling")
-    inference_preset = str(config["inference_preset"])
-    flow_approx_method = str(config.get("flow_approx_method", "combination"))
-    scale_factor = float(config.get("scale_factor", 1.0))
-    seed = int(config.get("seed", 1234))
-    batch_size = int(config.get("batch_size", 1))
-    only_fps = int(config["only_fps"])
-    input_fps = int(config["input_fps"])
+    if len(run_config.inference_presets) != 1:
+        raise ValueError(
+            "Video export requires exactly one inference_preset/inference_presets entry. "
+            f"Got {len(run_config.inference_presets)} entries."
+        )
+
+    mode = run_config.mode
+    model_name = run_config.model.model_name
+    model_init_args = dict(run_config.model.model_init_args)
+    eval_convex_upsampling = run_config.model.eval_convex_upsampling
+    inference_preset = run_config.inference_presets[0]
+    flow_approx_method = run_config.flow_approx.method
+    seed = run_config.seed
+    batch_size = run_config.batch_size
+    only_fps = run_config.only_fps
+    input_fps = run_config.input_fps
     fps = int(video_config["fps"])
     export_grid = bool(video_config["export_grid"])
     tile_scale = float(video_config["tile_scale"])
@@ -228,17 +238,9 @@ def main(argv: list[str] | None = None) -> None:
     mode_filter = video_config["mode_filter"]
     single_files = list(video_config["single_files"])
 
-    root_dir = Path(str(config["root_dir"]))
-    if not root_dir.is_absolute():
-        root_dir = PROJECT_ROOT / root_dir
-
-    dataset_root_dir = Path(str(config["dataset_root_dir"]))
-    if not dataset_root_dir.is_absolute():
-        dataset_root_dir = PROJECT_ROOT / dataset_root_dir
-
-    checkpoint_path = Path(str(config["checkpoint_path"]))
-    if not checkpoint_path.is_absolute():
-        checkpoint_path = PROJECT_ROOT / checkpoint_path
+    root_dir = run_config.root_dir
+    dataset_root_dir = run_config.dataset_root_dir
+    checkpoint_path = run_config.checkpoint_path
 
     output_dir = Path(str(video_config["output_dir"]))
     if not output_dir.is_absolute():
@@ -275,8 +277,6 @@ def main(argv: list[str] | None = None) -> None:
     from torch.utils.data import DataLoader
     from tqdm import tqdm
 
-    from src.data.dataset_loader import FlowEstimationTrainDataset
-    from src.data.dataset_loader import VFITrainDataset
     from src.data.image_ops import flow_to_image
     from src.models.external.IFRNet.utils import warp
 
@@ -298,9 +298,7 @@ def main(argv: list[str] | None = None) -> None:
 
     model_class = resolve_model_class(model_name)
     model = model_class(**model_init_args).to(device)
-    checkpoint = torch.load(str(checkpoint_path), map_location=device)
-    state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
-    model.load_state_dict(state_dict)
+    model.load_state_dict(load_inference_state_dict(checkpoint_path=checkpoint_path, device=device))
     if eval_convex_upsampling is not None:
         set_model_convex_upsampling(
             model=model,
@@ -327,17 +325,13 @@ def main(argv: list[str] | None = None) -> None:
     with torch.no_grad():
         for (record, mode_name), group_dataframe in dataframe.groupby(["record", "mode"], sort=False):
             group_dataframe = group_dataframe.reset_index(drop=True)
-            if model_name == BASELINE_MODEL_NAME:
-                dataset = VFITrainDataset(group_dataframe, str(dataset_root_dir), False, input_fps)
-            else:
-                include_source_depths = flow_approx_method in SPLATTING_FLOW_APPROX_METHODS
-                dataset = FlowEstimationTrainDataset(
-                    group_dataframe,
-                    str(dataset_root_dir),
-                    input_fps,
-                    False,
-                    include_source_depths,
-                )
+            dataset = build_inference_dataset(
+                dataframe=group_dataframe,
+                dataset_root_dir=dataset_root_dir,
+                input_fps=input_fps,
+                model_name=model_name,
+                flow_approx_method=flow_approx_method,
+            )
 
             loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
             progress = tqdm(loader, desc=f"{record}_{mode_name}", leave=True)
@@ -364,16 +358,24 @@ def main(argv: list[str] | None = None) -> None:
             sample_count = 0
 
             for batch in progress:
-                inference_result = run_inference_batch(batch, device, flow_approx_method, model, model_name, scale_factor)
-                img0 = inference_result["img0"]
-                img1 = inference_result["img1"]
-                imgt = inference_result["imgt"]
-                imgt_pred = inference_result["imgt_pred"]
-                init_bmv = inference_result["init_bmv"]
-                init_fmv = inference_result["init_fmv"]
-                up_flow0_1 = inference_result["up_flow0_1"]
-                up_flow1_1 = inference_result["up_flow1_1"]
-                up_mask_1 = inference_result["up_mask_1"]
+                inference_result = run_inference_batch(
+                    config=run_config,
+                    model=model,
+                    batch=batch,
+                    device=device,
+                )
+                img0 = inference_result.img0
+                img1 = inference_result.img1
+                imgt = inference_result.imgt
+                imgt_pred = inference_result.imgt_pred
+                init_bmv = inference_result.init_bmv
+                init_fmv = inference_result.init_fmv
+                up_flow0_1 = inference_result.up_flow0_1
+                up_flow1_1 = inference_result.up_flow1_1
+                up_mask_1 = inference_result.up_mask_1
+
+                if up_flow0_1 is None or up_flow1_1 is None or up_mask_1 is None:
+                    raise RuntimeError("Video export requires inference results with predicted flow tensors.")
 
                 img0_warped = warp(img0, up_flow0_1)
                 img1_warped = warp(img1, up_flow1_1)
