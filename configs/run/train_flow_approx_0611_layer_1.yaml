@@ -18,7 +18,7 @@
   "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 32,
-  "output_dir": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_MaskedArea_0624_oracleTime",
+  "output_dir": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_0624_oracleTime",
   "only_fps": 60,
   "input_fps": 30,
   "metrics": {
@@ -27,6 +27,6 @@
     "enable_lpips": true,
     "lpips_net": "alex"
   },
-  "resume_path": null,
-  "pretrained_checkpoint_path": "outputs/IFRNet_Residual_4_Layer_Scratch_0624_oracleTime/checkpoints/best.pth"
+  "resume_path": "outputs/IFRNet_Residual_FlowApprox_1_Layer_TwoStage_Splat_4Direction_Bilinear_0624_oracleTime/checkpoints/latest.pth",
+  "pretrained_checkpoint_path": null
 }
