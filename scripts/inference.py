@@ -29,29 +29,20 @@ from src.engine.evaluation import format_metric_averages
 from src.engine.evaluation import prepare_psnr_div_sample
 from src.engine.evaluation import PSNR_DIV_METRIC_NAME
 from src.engine.evaluation import VFIPS_METRIC_NAME
-from src.engine.flow_approx import build_flow_init_result_with_fill_strategy
-from src.engine.flow_approx import DEFAULT_SPLATTING_FILL_STRATEGY
-from src.engine.flow_approx import FLOW_APPROX_METHODS
-from src.engine.flow_approx import flatten_target_index
-from src.engine.flow_approx import is_splatting_flow_approx_method
-from src.engine.flow_approx import make_source_grid
-from src.engine.model_registry import BASELINE_MODEL_NAME
+from src.engine.interpolation_batch import InterpolationBatchResult
+from src.engine.interpolation_batch import run_inference_batch
 from src.engine.model_registry import resolve_model_class
 from src.engine.model_registry import RESIDUAL_FLOW_APPROX_MODEL_NAME
 from src.engine.model_registry import RESIDUAL_MODEL_NAME
 from src.engine.model_registry import set_model_convex_upsampling
 from src.engine.run_config import build_inference_dry_run_summary
 from src.engine.run_config import build_inference_run_config
-from src.engine.run_config import DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY
-from src.engine.run_config import DEFAULT_INIT_FLOW_MASK_EPSILON
-from src.models.external.IFRNet.utils import warp
 from src.utils.logger import build_logger
 # Model variants:
 # - IFRNet: baseline
 # - IFRNet_Residual: residual model initialized by bmv/fmv from the 60fps motion labels
 # - IFRNet_Residual_FlowApprox: residual model initialized by approximated 60fps motion from bmv_30/fmv_30
 
-InferenceBatchResult = dict[str, Any]
 SplattingRegionMaps = dict[str, Any]
 VfipsSegment = dict[str, Any]
 
@@ -210,60 +201,6 @@ def save_flow_diff_visuals(
     }
 
 
-def build_nearest_splat_hit_count(source_motion: Any) -> Any:
-    import torch
-
-    batch_size = int(source_motion.shape[0])
-    height = int(source_motion.shape[2])
-    width = int(source_motion.shape[3])
-    pixel_count = height * width
-    source_grid = make_source_grid(batch_size, height, width, source_motion.device, source_motion.dtype)
-    target_position = source_grid + source_motion
-    target_x = target_position[:, 0].round().long()
-    target_y = target_position[:, 1].round().long()
-    valid = (target_x >= 0) & (target_x < width) & (target_y >= 0) & (target_y < height)
-    flat_target_index = flatten_target_index(
-        target_x=target_x.clamp(0, width - 1),
-        target_y=target_y.clamp(0, height - 1),
-        width=width,
-    ).reshape(batch_size, -1)
-    flat_valid = valid.reshape(batch_size, -1).to(dtype=source_motion.dtype)
-    hit_count = torch.zeros(
-        (batch_size, pixel_count),
-        device=source_motion.device,
-        dtype=source_motion.dtype,
-    )
-    hit_count.scatter_add_(dim=1, index=flat_target_index, src=flat_valid)
-    return hit_count.reshape(batch_size, 1, height, width)
-
-
-def build_splatting_region_maps(fmv_30: Any, bmv_30: Any, embt: Any, init_masks: Any | None) -> SplattingRegionMaps | None:
-    if init_masks is None:
-        return None
-
-    time = embt.reshape(embt.shape[0], 1, 1, 1)
-    bmv_hit_count = build_nearest_splat_hit_count(time * fmv_30)
-    fmv_hit_count = build_nearest_splat_hit_count((1 - time) * bmv_30)
-    bmv_hit = init_masks[:, 0:1] > 0
-    fmv_hit = init_masks[:, 1:2] > 0
-    hit_both = bmv_hit & fmv_hit
-    hole_any = ~hit_both
-    bmv_many_to_one = bmv_hit_count > 1
-    fmv_many_to_one = fmv_hit_count > 1
-    many_to_one_any = bmv_many_to_one | fmv_many_to_one
-    return {
-        "bmv_hit": bmv_hit,
-        "fmv_hit": fmv_hit,
-        "hit_both": hit_both,
-        "hole_any": hole_any,
-        "bmv_many_to_one": bmv_many_to_one,
-        "fmv_many_to_one": fmv_many_to_one,
-        "many_to_one_any": many_to_one_any,
-        "bmv_hit_count": bmv_hit_count,
-        "fmv_hit_count": fmv_hit_count,
-    }
-
-
 def build_direction_splatting_region_label_image(hit: Any, many_to_one: Any, np: Any) -> Any:
     hit_np = hit[0, 0].detach().cpu().numpy().astype(bool)
     many_to_one_np = many_to_one[0, 0].detach().cpu().numpy().astype(bool)
@@ -403,194 +340,35 @@ def save_splatting_region_visuals(
     return image_paths
 
 
-def run_inference_batch_with_fill_strategy(
-    batch: Any,
-    device: Any,
-    flow_approx_method: str,
-    splatting_fill_strategy: str,
-    init_flow_downscale_strategy: str,
-    init_flow_mask_epsilon: float,
-    model: Any,
-    model_name: str,
-    scale_factor: float,
-) -> InferenceBatchResult:
-    if model_name == BASELINE_MODEL_NAME:
-        img0, imgt, img1, bmv, fmv, embt, _info = batch
-        img0 = img0.to(device)
-        imgt = imgt.to(device)
-        img1 = img1.to(device)
-        bmv = bmv.to(device)
-        fmv = fmv.to(device)
-        embt = embt.to(device)
-
-        imgt_pred, up_flow0_1, up_flow1_1, up_mask_1 = model.inference(img0, img1, embt, scale_factor)
-        
-        return {
-            "bmv": bmv,
-            "embt": embt,
-            "fmv": fmv,
-            "img0": img0,
-            "img1": img1,
-            "imgt": imgt,
-            "imgt_merge": None,
-            "imgt_pred": imgt_pred,
-            "init_bmv": None,
-            "init_fmv": None,
-            "splatting_region_maps": None,
-            "up_flow0_1": up_flow0_1,
-            "up_flow1_1": up_flow1_1,
-            "up_mask_1": up_mask_1,
-        }
-
-    if model_name == RESIDUAL_FLOW_APPROX_MODEL_NAME:
-        img0, imgt, img1, bmv, fmv, bmv_30, fmv_30, embt, info = batch
-        img0 = img0.to(device)
-        imgt = imgt.to(device)
-        img1 = img1.to(device)
-        bmv = bmv.to(device)
-        fmv = fmv.to(device)
-        bmv_30 = bmv_30.to(device)
-        fmv_30 = fmv_30.to(device)
-        embt = embt.to(device)
-        source_depth0 = None
-        source_depth1 = None
-        if is_splatting_flow_approx_method(flow_approx_method=flow_approx_method):
-            source_depth0 = info["source_depth0"].to(device)
-            source_depth1 = info["source_depth1"].to(device)
-
-        flow_init = build_flow_init_result_with_fill_strategy(
-            fmv_30=fmv_30,
-            bmv_30=bmv_30,
-            embt=embt,
-            flow_approx_method=flow_approx_method,
-            source_depth0=source_depth0,
-            source_depth1=source_depth1,
-            splatting_fill_strategy=splatting_fill_strategy,
-            ground_truth_bmv=bmv,
-            ground_truth_fmv=fmv,
-        )
-        init_bmv = flow_init.bmv
-        init_fmv = flow_init.fmv
-        splatting_region_maps = build_splatting_region_maps(fmv_30, bmv_30, embt, flow_init.masks)
-        init_bmv_mask = None
-        init_fmv_mask = None
-        if init_flow_downscale_strategy == "masked_area":
-            if flow_init.masks is None:
-                raise RuntimeError(
-                    "init_flow_downscale_strategy=masked_area requires splatting coverage masks, but none were produced."
-                )
-            init_bmv_mask = flow_init.masks[:, 0:1]
-            init_fmv_mask = flow_init.masks[:, 1:2]
-        imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
-            img0,
-            img1,
-            embt,
-            scale_factor,
-            init_flow0=init_bmv,
-            init_flow1=init_fmv,
-            init_flow0_mask=init_bmv_mask,
-            init_flow1_mask=init_fmv_mask,
-            init_flow_mask_epsilon=init_flow_mask_epsilon,
-        )
-        return {
-            "bmv": bmv,
-            "embt": embt,
-            "fmv": fmv,
-            "img0": img0,
-            "img1": img1,
-            "imgt": imgt,
-            "imgt_merge": imgt_merge,
-            "imgt_pred": imgt_pred,
-            "init_bmv": init_bmv,
-            "init_fmv": init_fmv,
-            "init_masks": flow_init.masks,
-            "splatting_region_maps": splatting_region_maps,
-            "up_flow0_1": up_flow0_1,
-            "up_flow1_1": up_flow1_1,
-            "up_mask_1": up_mask_1,
-        }
-
-    if model_name == RESIDUAL_MODEL_NAME:
-        img0, imgt, img1, bmv, fmv, embt, _info = batch
-        img0 = img0.to(device)
-        imgt = imgt.to(device)
-        img1 = img1.to(device)
-        bmv = bmv.to(device)
-        fmv = fmv.to(device)
-        embt = embt.to(device)
-        imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
-            img0,
-            img1,
-            embt,
-            scale_factor,
-            init_flow0=bmv,
-            init_flow1=fmv,
-        )
-        return {
-            "bmv": bmv,
-            "embt": embt,
-            "fmv": fmv,
-            "img0": img0,
-            "img1": img1,
-            "imgt": imgt,
-            "imgt_merge": imgt_merge,
-            "imgt_pred": imgt_pred,
-            "init_bmv": bmv,
-            "init_fmv": fmv,
-            "splatting_region_maps": None,
-            "up_flow0_1": up_flow0_1,
-            "up_flow1_1": up_flow1_1,
-            "up_mask_1": up_mask_1,
-        }
-
-    raise ValueError(f"Unsupported model_name: {model_name}")
-
-
-def run_inference_batch(
-    batch: Any,
-    device: Any,
-    flow_approx_method: str,
-    model: Any,
-    model_name: str,
-    scale_factor: float,
-) -> InferenceBatchResult:
-    return run_inference_batch_with_fill_strategy(
-        batch=batch,
-        device=device,
-        flow_approx_method=flow_approx_method,
-        splatting_fill_strategy=DEFAULT_SPLATTING_FILL_STRATEGY,
-        init_flow_downscale_strategy=DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY,
-        init_flow_mask_epsilon=DEFAULT_INIT_FLOW_MASK_EPSILON,
-        model=model,
-        model_name=model_name,
-        scale_factor=scale_factor,
-    )
-
-
 def save_selected_sample_artifacts(
     cv2: Any,
     flow_diff_percentile: float,
     flow_diff_threshold: float,
     flow_to_image: Any,
-    inference_result: InferenceBatchResult,
+    inference_result: InterpolationBatchResult,
     np: Any,
     save_dir: Path,
     save_image: Any,
 ) -> dict[str, str]:
-    img0 = inference_result["img0"]
-    img1 = inference_result["img1"]
-    imgt = inference_result["imgt"]
-    bmv = inference_result["bmv"]
-    fmv = inference_result["fmv"]
-    imgt_pred = inference_result["imgt_pred"]
-    imgt_merge = inference_result["imgt_merge"]
-    init_bmv = inference_result["init_bmv"]
-    init_fmv = inference_result["init_fmv"]
-    init_masks = inference_result.get("init_masks")
-    splatting_region_maps = inference_result.get("splatting_region_maps")
-    up_flow0_1 = inference_result["up_flow0_1"]
-    up_flow1_1 = inference_result["up_flow1_1"]
-    up_mask_1 = inference_result["up_mask_1"]
+    from src.models.external.IFRNet.utils import warp
+
+    img0 = inference_result.img0
+    img1 = inference_result.img1
+    imgt = inference_result.imgt
+    bmv = inference_result.bmv
+    fmv = inference_result.fmv
+    imgt_pred = inference_result.imgt_pred
+    imgt_merge = inference_result.imgt_merge
+    init_bmv = inference_result.init_bmv
+    init_fmv = inference_result.init_fmv
+    init_masks = inference_result.init_masks
+    up_flow0_1 = inference_result.up_flow0_1
+    up_flow1_1 = inference_result.up_flow1_1
+    up_mask_1 = inference_result.up_mask_1
+    splatting_region_maps = inference_result.splatting_region_maps
+
+    if bmv is None or fmv is None or up_flow0_1 is None or up_flow1_1 is None or up_mask_1 is None:
+        raise RuntimeError("Inference artifacts require bmv, fmv, up_flow0_1, up_flow1_1, and up_mask_1.")
 
     img0_warped = warp(img0, up_flow0_1)
     img1_warped = warp(img1, up_flow1_1)
@@ -710,37 +488,18 @@ def save_selected_sample_artifacts(
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    run_config = build_inference_run_config(config_path=Path(args.config), project_root=PROJECT_ROOT)
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = PROJECT_ROOT / config_path
+
+    run_config = build_inference_run_config(config_path=config_path, project_root=PROJECT_ROOT)
     if run_config.mode == "dry-run":
         print(json.dumps(build_inference_dry_run_summary(config=run_config), indent=2))
         return
 
-    mode = run_config.mode
-    model_name = run_config.model.model_name
-    model_init_args = dict(run_config.model.model_init_args)
-    eval_convex_upsampling = run_config.model.eval_convex_upsampling
-    inference_presets = list(run_config.inference_presets)
-    flow_approx_method = run_config.flow_approx.method
-    splatting_fill_strategy = run_config.flow_approx.splatting_fill_strategy
-    init_flow_downscale_strategy = run_config.flow_approx.init_flow_downscale_strategy
-    init_flow_mask_epsilon = run_config.flow_approx.init_flow_mask_epsilon
-    scale_factor = run_config.scale_factor
-    flow_diff_threshold = run_config.flow_diff_threshold
-    flow_diff_percentile = run_config.flow_diff_percentile
-    save_topk_worst_psnr = run_config.save_topk_worst_psnr
-    save_topk_best_psnr = run_config.save_topk_best_psnr
-    save_topk_largest_flow_diff = run_config.save_topk_largest_flow_diff
     metric_config = dict(run_config.metrics.values)
-    seed = run_config.seed
-    batch_size = run_config.batch_size
-    only_fps = run_config.only_fps
-    input_fps = run_config.input_fps
-    root_dir = run_config.root_dir
-    dataset_root_dir = run_config.dataset_root_dir
-    checkpoint_path = run_config.checkpoint_path
-    output_dir = run_config.output_dir
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    run_config.output_dir.mkdir(parents=True, exist_ok=True)
     import cv2
     import numpy as np
     import pandas as pd
@@ -752,43 +511,49 @@ def main(argv: list[str] | None = None) -> None:
     from src.data.image_ops import flow_to_image
     from src.data.image_ops import save_image
     logger = build_logger("scripts.inference")
-    set_seed(seed)
+    set_seed(run_config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lpips_model = build_lpips_model(metric_config, device)
     flolpips_model = build_flolpips_model(metric_config, device)
     vfips_model = build_vfips_model(metric_config, device)
     build_flip_evaluator(metric_config)
-    logger.info("device=%s model=%s", device, model_name)
+    logger.info("device=%s model=%s", device, run_config.model.model_name)
     logger.info("metrics=%s", metric_config)
-    if eval_convex_upsampling is not None:
-        logger.info("eval_convex_upsampling=%s", eval_convex_upsampling)
+    if run_config.model.eval_convex_upsampling is not None:
+        logger.info("eval_convex_upsampling=%s", run_config.model.eval_convex_upsampling)
     logger.info(
         "flow_approx_method=%s splatting_fill_strategy=%s init_flow_downscale_strategy=%s init_flow_mask_epsilon=%s",
-        flow_approx_method,
-        splatting_fill_strategy,
-        init_flow_downscale_strategy,
-        init_flow_mask_epsilon,
+        run_config.flow_approx.method,
+        run_config.flow_approx.splatting_fill_strategy,
+        run_config.flow_approx.init_flow_downscale_strategy,
+        run_config.flow_approx.init_flow_mask_epsilon,
     )
 
     dataframe_list: list[Any] = []
-    for inference_preset in inference_presets:
-        preset_dataframe = build_merged_dataframe(root_dir, output_dir, inference_preset, only_fps, logger)
+    for inference_preset in run_config.inference_presets:
+        preset_dataframe = build_merged_dataframe(
+            run_config.root_dir,
+            run_config.output_dir,
+            inference_preset,
+            run_config.only_fps,
+            logger,
+        )
         preset_dataframe["inference_preset"] = inference_preset
         dataframe_list.append(preset_dataframe)
 
     dataframe = pd.concat(dataframe_list, ignore_index=True)
     dataframe = filter_valid_dataframe(dataframe)
-    model_class = resolve_model_class(model_name)
-    model = model_class(**model_init_args).to(device)
+    model_class = resolve_model_class(run_config.model.model_name)
+    model = model_class(**run_config.model.model_init_args).to(device)
     if hasattr(model, "init_flow_layer"):
         logger.info("model_init_flow_layer=%s", model.init_flow_layer)
     # print("Load Pretrained Weights from IFRNet_Vimeo90K.pth as Baseline")
     # state_dict = torch.load("src/models/external/IFRNet/checkpoints/IFRNet/IFRNet_Vimeo90K.pth", map_location=device)
-    model.load_state_dict(load_inference_state_dict(checkpoint_path=checkpoint_path, device=device))
-    if eval_convex_upsampling is not None:
+    model.load_state_dict(load_inference_state_dict(checkpoint_path=run_config.checkpoint_path, device=device))
+    if run_config.model.eval_convex_upsampling is not None:
         set_model_convex_upsampling(
             model=model,
-            enabled=eval_convex_upsampling,
+            enabled=run_config.model.eval_convex_upsampling,
             context="inference",
         )
     model.eval()
@@ -808,7 +573,7 @@ def main(argv: list[str] | None = None) -> None:
                 flow_approx_method=run_config.flow_approx.method,
             )
 
-            loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+            loader = DataLoader(dataset, batch_size=run_config.batch_size, shuffle=False)
             record_metric_meters = build_metric_meters(metric_config)
             progress = tqdm(loader, desc=f"{inference_preset}_{record}_{mode_name}", leave=True)
             sample_offset = 0
@@ -824,32 +589,26 @@ def main(argv: list[str] | None = None) -> None:
             pending_psnr_div_prediction_rgb = None
 
             for batch in progress:
-                inference_result = run_inference_batch_with_fill_strategy(
-                    batch,
-                    device,
-                    flow_approx_method,
-                    splatting_fill_strategy,
-                    init_flow_downscale_strategy,
-                    init_flow_mask_epsilon,
-                    model,
-                    model_name,
-                    scale_factor,
+                inference_result = run_inference_batch(
+                    config=run_config,
+                    model=model,
+                    batch=batch,
+                    device=device,
                 )
-                imgt = inference_result["imgt"]
-                imgt_pred = inference_result["imgt_pred"]
-                init_bmv = inference_result["init_bmv"]
-                init_fmv = inference_result["init_fmv"]
-                splatting_region_maps = inference_result.get("splatting_region_maps")
-                up_flow0_1 = inference_result["up_flow0_1"]
-                up_flow1_1 = inference_result["up_flow1_1"]
+                imgt = inference_result.imgt
+                imgt_pred = inference_result.imgt_pred
+                init_bmv = inference_result.init_bmv
+                init_fmv = inference_result.init_fmv
+                up_flow0_1 = inference_result.up_flow0_1
+                up_flow1_1 = inference_result.up_flow1_1
                 batch_metric_values = calculate_batch_metrics(
                     target=imgt.detach(),
                     prediction=imgt_pred.detach(),
                     metric_config=metric_config,
                     lpips_model=lpips_model,
                     flolpips_model=flolpips_model,
-                    img0=inference_result["img0"].detach(),
-                    img1=inference_result["img1"].detach(),
+                    img0=inference_result.img0.detach(),
+                    img1=inference_result.img1.detach(),
                 )
 
                 for batch_index in range(int(imgt_pred.shape[0])):
@@ -862,7 +621,7 @@ def main(argv: list[str] | None = None) -> None:
 
                     diff_1_to_0 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
                     diff_1_to_2 = {"diff_mag_mean": -1.0, "diff_mag_max": -1.0, "diff_changed_ratio": -1.0, "diff_percentile_value": -1.0}
-                    if init_bmv is not None and init_fmv is not None:
+                    if init_bmv is not None and init_fmv is not None and up_flow0_1 is not None and up_flow1_1 is not None:
                         init_flow_1_to_0_np = init_bmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
                         init_flow_1_to_2_np = init_fmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
                         final_flow_1_to_0_np = up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
@@ -872,14 +631,18 @@ def main(argv: list[str] | None = None) -> None:
                         diff_1_to_0 = {
                             "diff_mag_mean": float(diff_mag_1_to_0_np.mean()),
                             "diff_mag_max": float(diff_mag_1_to_0_np.max()),
-                            "diff_changed_ratio": float((diff_mag_1_to_0_np > flow_diff_threshold).mean()),
-                            "diff_percentile_value": float(max(np.percentile(diff_mag_1_to_0_np, flow_diff_percentile), 1e-6)),
+                            "diff_changed_ratio": float((diff_mag_1_to_0_np > run_config.flow_diff_threshold).mean()),
+                            "diff_percentile_value": float(
+                                max(np.percentile(diff_mag_1_to_0_np, run_config.flow_diff_percentile), 1e-6)
+                            ),
                         }
                         diff_1_to_2 = {
                             "diff_mag_mean": float(diff_mag_1_to_2_np.mean()),
                             "diff_mag_max": float(diff_mag_1_to_2_np.max()),
-                            "diff_changed_ratio": float((diff_mag_1_to_2_np > flow_diff_threshold).mean()),
-                            "diff_percentile_value": float(max(np.percentile(diff_mag_1_to_2_np, flow_diff_percentile), 1e-6)),
+                            "diff_changed_ratio": float((diff_mag_1_to_2_np > run_config.flow_diff_threshold).mean()),
+                            "diff_percentile_value": float(
+                                max(np.percentile(diff_mag_1_to_2_np, run_config.flow_diff_percentile), 1e-6)
+                            ),
                         }
 
                     sample_row = {
@@ -908,9 +671,9 @@ def main(argv: list[str] | None = None) -> None:
                             sample_index=int(sample_row["sample_index"]),
                             frame_0_index=int(row["img0"]),
                             frame_2_index=int(row["img2"]),
-                            img0=inference_result["img0"][batch_index],
+                            img0=inference_result.img0[batch_index],
                             imgt=imgt[batch_index],
-                            img1=inference_result["img1"][batch_index],
+                            img1=inference_result.img1[batch_index],
                             imgt_pred=imgt_pred[batch_index],
                         )
                     if psnr_div_enabled:
@@ -985,16 +748,16 @@ def main(argv: list[str] | None = None) -> None:
             )
             selected_sample_reasons: dict[int, list[str]] = {}
 
-            if save_topk_worst_psnr > 0:
-                for sample_index in group_metrics_df.nsmallest(save_topk_worst_psnr, "psnr")["sample_index"].tolist():
+            if run_config.save_topk_worst_psnr > 0:
+                for sample_index in group_metrics_df.nsmallest(run_config.save_topk_worst_psnr, "psnr")["sample_index"].tolist():
                     selected_sample_reasons.setdefault(int(sample_index), []).append("worst_psnr")
-            if save_topk_best_psnr > 0:
-                for sample_index in group_metrics_df.nlargest(save_topk_best_psnr, "psnr")["sample_index"].tolist():
+            if run_config.save_topk_best_psnr > 0:
+                for sample_index in group_metrics_df.nlargest(run_config.save_topk_best_psnr, "psnr")["sample_index"].tolist():
                     selected_sample_reasons.setdefault(int(sample_index), []).append("best_psnr")
-            if model_name in (RESIDUAL_MODEL_NAME, RESIDUAL_FLOW_APPROX_MODEL_NAME) and save_topk_largest_flow_diff > 0:
-                for sample_index in group_metrics_df.nlargest(save_topk_largest_flow_diff, "flow_diff_1_to_0_changed_ratio")["sample_index"].tolist():
+            if run_config.model.model_name in (RESIDUAL_MODEL_NAME, RESIDUAL_FLOW_APPROX_MODEL_NAME) and run_config.save_topk_largest_flow_diff > 0:
+                for sample_index in group_metrics_df.nlargest(run_config.save_topk_largest_flow_diff, "flow_diff_1_to_0_changed_ratio")["sample_index"].tolist():
                     selected_sample_reasons.setdefault(int(sample_index), []).append("largest_flow_diff_1_to_0")
-                for sample_index in group_metrics_df.nlargest(save_topk_largest_flow_diff, "flow_diff_1_to_2_changed_ratio")["sample_index"].tolist():
+                for sample_index in group_metrics_df.nlargest(run_config.save_topk_largest_flow_diff, "flow_diff_1_to_2_changed_ratio")["sample_index"].tolist():
                     selected_sample_reasons.setdefault(int(sample_index), []).append("largest_flow_diff_1_to_2")
 
             group_metrics_df["selected_for_save"] = group_metrics_df["sample_index"].map(lambda sample_index: int(sample_index) in selected_sample_reasons)
@@ -1035,23 +798,18 @@ def main(argv: list[str] | None = None) -> None:
                 for selected_batch_index, batch in enumerate(selected_progress):
                     selected_row = group_metrics_df[group_metrics_df["sample_index"] == selected_indices[selected_batch_index]].iloc[0]
                     frame_range = str(selected_row["frame_range"])
-                    save_dir = output_dir / str(record) / str(mode_name) / frame_range
+                    save_dir = run_config.output_dir / str(record) / str(mode_name) / frame_range
 
-                    inference_result = run_inference_batch_with_fill_strategy(
-                        batch,
-                        device,
-                        flow_approx_method,
-                        splatting_fill_strategy,
-                        init_flow_downscale_strategy,
-                        init_flow_mask_epsilon,
-                        model,
-                        model_name,
-                        scale_factor,
+                    inference_result = run_inference_batch(
+                        config=run_config,
+                        model=model,
+                        batch=batch,
+                        device=device,
                     )
                     image_paths = save_selected_sample_artifacts(
                         cv2,
-                        flow_diff_percentile,
-                        flow_diff_threshold,
+                        run_config.flow_diff_percentile,
+                        run_config.flow_diff_threshold,
                         flow_to_image,
                         inference_result,
                         np,
@@ -1065,9 +823,9 @@ def main(argv: list[str] | None = None) -> None:
             rows.extend(group_metrics_df.to_dict("records"))
             logger.info("record=%s mode=%s samples=%s metrics=%s", record, mode_name, len(group_dataframe), format_metric_averages(record_metric_meters))
 
-    pd.DataFrame(rows).to_csv(output_dir / "metrics.csv", index=False)
-    pd.DataFrame(record_rows).to_csv(output_dir / "record_metrics.csv", index=False)
-    logger.info("samples=%s metrics=%s output_dir=%s", len(rows), format_metric_averages(metric_meters), output_dir)
+    pd.DataFrame(rows).to_csv(run_config.output_dir / "metrics.csv", index=False)
+    pd.DataFrame(record_rows).to_csv(run_config.output_dir / "record_metrics.csv", index=False)
+    logger.info("samples=%s metrics=%s output_dir=%s", len(rows), format_metric_averages(metric_meters), run_config.output_dir)
 
 
 if __name__ == "__main__":
