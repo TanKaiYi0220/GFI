@@ -8,8 +8,6 @@ from src.engine.flow_approx import flatten_target_index
 from src.engine.flow_approx import is_splatting_flow_approx_method
 from src.engine.flow_approx import make_source_grid
 from src.engine.model_registry import BASELINE_MODEL_NAME
-from src.engine.model_registry import RESIDUAL_FLOW_APPROX_MODEL_NAME
-from src.engine.model_registry import RESIDUAL_MODEL_NAME
 from src.engine.model_registry import uses_flow_approx_model
 from src.engine.run_config import FlowApproxConfig
 from src.engine.run_config import InferenceRunConfig
@@ -48,6 +46,21 @@ class _InitFlowState:
     init_masks: Any | None
     init_bmv_mask: Any | None
     init_fmv_mask: Any | None
+
+
+@dataclass(frozen=True)
+class _PreparedBatchInputs:
+    img0: Any
+    img1: Any
+    imgt: Any
+    embt: Any
+    info: dict[str, Any] | None
+    bmv: Any
+    fmv: Any
+    source_bmv: Any
+    source_fmv: Any
+    source_depth0: Any | None
+    source_depth1: Any | None
 
 
 def _build_exact_imgt_merge(
@@ -238,14 +251,12 @@ def build_splatting_region_maps(
     }
 
 
-def run_training_batch(
-    config: TrainRunConfig,
-    model: Any,
+def _prepare_batch_inputs(
+    model_name: str,
     batch: Any,
     device: Any,
-    collect_visual_artifacts: bool,
-) -> InterpolationBatchResult:
-    model_name = config.model.model_name
+    flow_approx_method: str,
+) -> _PreparedBatchInputs:
     try:
         if uses_flow_approx_model(model_name):
             img0, imgt, img1, bmv_60, fmv_60, bmv_30, fmv_30, embt, info = batch
@@ -256,7 +267,7 @@ def run_training_batch(
             source_depth0, source_depth1 = _resolve_source_depth_tensors(
                 info=info,
                 device=device,
-                flow_approx_method=config.flow_approx.method,
+                flow_approx_method=flow_approx_method,
             )
         else:
             img0, imgt, img1, bmv, fmv, embt, info = batch
@@ -267,27 +278,138 @@ def run_training_batch(
             source_depth0 = None
             source_depth1 = None
     except (TypeError, ValueError) as error:
-        raise ValueError(f"Unsupported training batch contract for model_name={config.model.model_name}") from error
+        raise ValueError(f"Unsupported batch contract for model_name={model_name}") from error
 
-    img0 = img0.to(device)
-    img1 = img1.to(device)
-    imgt = imgt.to(device)
-    embt = embt.to(device)
+    return _PreparedBatchInputs(
+        img0=img0.to(device),
+        img1=img1.to(device),
+        imgt=imgt.to(device),
+        embt=embt.to(device),
+        info=info,
+        bmv=bmv,
+        fmv=fmv,
+        source_bmv=source_bmv,
+        source_fmv=source_fmv,
+        source_depth0=source_depth0,
+        source_depth1=source_depth1,
+    )
+
+
+def _run_model_inference(
+    model_name: str,
+    model: Any,
+    batch_inputs: _PreparedBatchInputs,
+    flow_approx: FlowApproxConfig,
+    scale_factor: float,
+) -> InterpolationBatchResult:
+    if model_name == BASELINE_MODEL_NAME:
+        imgt_pred, up_flow0_1, up_flow1_1, up_mask_1 = model.inference(
+            batch_inputs.img0,
+            batch_inputs.img1,
+            batch_inputs.embt,
+            scale_factor,
+        )
+        return InterpolationBatchResult(
+            img0=batch_inputs.img0,
+            img1=batch_inputs.img1,
+            imgt=batch_inputs.imgt,
+            imgt_pred=imgt_pred,
+            embt=batch_inputs.embt,
+            info=batch_inputs.info,
+            bmv=batch_inputs.bmv,
+            fmv=batch_inputs.fmv,
+            init_bmv=None,
+            init_fmv=None,
+            init_masks=None,
+            up_flow0_1=up_flow0_1,
+            up_flow1_1=up_flow1_1,
+            up_mask_1=up_mask_1,
+            imgt_merge=None,
+            loss_rec=None,
+            loss_geo=None,
+            loss_dis=None,
+            splatting_region_maps=None,
+        )
+
+    init_flow = _build_init_flow(
+        model_name=model_name,
+        source_bmv=batch_inputs.source_bmv,
+        source_fmv=batch_inputs.source_fmv,
+        embt=batch_inputs.embt,
+        flow_approx=flow_approx,
+        source_depth0=batch_inputs.source_depth0,
+        source_depth1=batch_inputs.source_depth1,
+        ground_truth_bmv=batch_inputs.bmv,
+        ground_truth_fmv=batch_inputs.fmv,
+    )
+    imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
+        batch_inputs.img0,
+        batch_inputs.img1,
+        batch_inputs.embt,
+        scale_factor,
+        init_flow0=init_flow.init_bmv,
+        init_flow1=init_flow.init_fmv,
+        init_flow0_mask=init_flow.init_bmv_mask,
+        init_flow1_mask=init_flow.init_fmv_mask,
+        init_flow_mask_epsilon=flow_approx.init_flow_mask_epsilon,
+    )
+    return InterpolationBatchResult(
+        img0=batch_inputs.img0,
+        img1=batch_inputs.img1,
+        imgt=batch_inputs.imgt,
+        imgt_pred=imgt_pred,
+        embt=batch_inputs.embt,
+        info=batch_inputs.info,
+        bmv=batch_inputs.bmv,
+        fmv=batch_inputs.fmv,
+        init_bmv=init_flow.init_bmv,
+        init_fmv=init_flow.init_fmv,
+        init_masks=init_flow.init_masks,
+        up_flow0_1=up_flow0_1,
+        up_flow1_1=up_flow1_1,
+        up_mask_1=up_mask_1,
+        imgt_merge=imgt_merge,
+        loss_rec=None,
+        loss_geo=None,
+        loss_dis=None,
+        splatting_region_maps=build_splatting_region_maps(
+            batch_inputs.source_fmv,
+            batch_inputs.source_bmv,
+            batch_inputs.embt,
+            init_flow.init_masks,
+        ),
+    )
+
+
+def run_training_batch(
+    config: TrainRunConfig,
+    model: Any,
+    batch: Any,
+    device: Any,
+    collect_visual_artifacts: bool,
+) -> InterpolationBatchResult:
+    model_name = config.model.model_name
+    batch_inputs = _prepare_batch_inputs(
+        model_name=model_name,
+        batch=batch,
+        device=device,
+        flow_approx_method=config.flow_approx.method,
+    )
 
     model_output, init_flow = _run_model_forward(
         model_name=model_name,
         model=model,
-        img0=img0,
-        img1=img1,
-        embt=embt,
-        imgt=imgt,
-        source_bmv=source_bmv,
-        source_fmv=source_fmv,
+        img0=batch_inputs.img0,
+        img1=batch_inputs.img1,
+        embt=batch_inputs.embt,
+        imgt=batch_inputs.imgt,
+        source_bmv=batch_inputs.source_bmv,
+        source_fmv=batch_inputs.source_fmv,
         flow_approx=config.flow_approx,
-        source_depth0=source_depth0,
-        source_depth1=source_depth1,
-        ground_truth_bmv=bmv,
-        ground_truth_fmv=fmv,
+        source_depth0=batch_inputs.source_depth0,
+        source_depth1=batch_inputs.source_depth1,
+        ground_truth_bmv=batch_inputs.bmv,
+        ground_truth_fmv=batch_inputs.fmv,
     )
     imgt_pred, loss_rec, loss_geo, loss_dis, up_flow0_1, up_flow1_1, up_mask_1 = model_output
     if model_name == BASELINE_MODEL_NAME:
@@ -302,16 +424,16 @@ def run_training_batch(
         init_masks = init_flow.init_masks
         if collect_visual_artifacts:
             imgt_merge = _build_exact_imgt_merge(
-                img0=img0,
-                img1=img1,
+                img0=batch_inputs.img0,
+                img1=batch_inputs.img1,
                 up_flow0_1=up_flow0_1,
                 up_flow1_1=up_flow1_1,
                 up_mask_1=up_mask_1,
             )
             splatting_region_maps = build_splatting_region_maps(
-                fmv_30=source_fmv,
-                bmv_30=source_bmv,
-                embt=embt,
+                fmv_30=batch_inputs.source_fmv,
+                bmv_30=batch_inputs.source_bmv,
+                embt=batch_inputs.embt,
                 init_masks=init_masks,
             )
         else:
@@ -319,14 +441,14 @@ def run_training_batch(
             splatting_region_maps = None
 
     return InterpolationBatchResult(
-        img0=img0,
-        img1=img1,
-        imgt=imgt,
+        img0=batch_inputs.img0,
+        img1=batch_inputs.img1,
+        imgt=batch_inputs.imgt,
         imgt_pred=imgt_pred,
-        embt=embt,
-        info=info,
-        bmv=bmv,
-        fmv=fmv,
+        embt=batch_inputs.embt,
+        info=batch_inputs.info,
+        bmv=batch_inputs.bmv,
+        fmv=batch_inputs.fmv,
         init_bmv=init_bmv,
         init_fmv=init_fmv,
         init_masks=init_masks,
@@ -341,141 +463,43 @@ def run_training_batch(
     )
 
 
+def run_training_sample_batch(
+    config: TrainRunConfig,
+    model: Any,
+    batch: Any,
+    device: Any,
+) -> InterpolationBatchResult:
+    batch_inputs = _prepare_batch_inputs(
+        model_name=config.model.model_name,
+        batch=batch,
+        device=device,
+        flow_approx_method=config.flow_approx.method,
+    )
+    return _run_model_inference(
+        model_name=config.model.model_name,
+        model=model,
+        batch_inputs=batch_inputs,
+        flow_approx=config.flow_approx,
+        scale_factor=1.0,
+    )
+
+
 def run_inference_batch(
     config: InferenceRunConfig,
     model: Any,
     batch: Any,
     device: Any,
 ) -> InterpolationBatchResult:
-    model_name = config.model.model_name
-
-    if model_name == BASELINE_MODEL_NAME:
-        img0, imgt, img1, bmv, fmv, embt, info = batch
-        img0 = img0.to(device)
-        imgt = imgt.to(device)
-        img1 = img1.to(device)
-        bmv = bmv.to(device)
-        fmv = fmv.to(device)
-        embt = embt.to(device)
-
-        imgt_pred, up_flow0_1, up_flow1_1, up_mask_1 = model.inference(img0, img1, embt, config.scale_factor)
-        return InterpolationBatchResult(
-            img0=img0,
-            img1=img1,
-            imgt=imgt,
-            imgt_pred=imgt_pred,
-            embt=embt,
-            info=info,
-            bmv=bmv,
-            fmv=fmv,
-            init_bmv=None,
-            init_fmv=None,
-            init_masks=None,
-            up_flow0_1=up_flow0_1,
-            up_flow1_1=up_flow1_1,
-            up_mask_1=up_mask_1,
-            imgt_merge=None,
-            loss_rec=None,
-            loss_geo=None,
-            loss_dis=None,
-            splatting_region_maps=None,
-        )
-
-    if model_name == RESIDUAL_FLOW_APPROX_MODEL_NAME:
-        img0, imgt, img1, bmv, fmv, bmv_30, fmv_30, embt, info = batch
-        img0 = img0.to(device)
-        imgt = imgt.to(device)
-        img1 = img1.to(device)
-        bmv = bmv.to(device)
-        fmv = fmv.to(device)
-        bmv_30 = bmv_30.to(device)
-        fmv_30 = fmv_30.to(device)
-        embt = embt.to(device)
-        source_depth0, source_depth1 = _resolve_source_depth_tensors(
-            info=info,
-            device=device,
-            flow_approx_method=config.flow_approx.method,
-        )
-        init_flow = _build_init_flow(
-            model_name=model_name,
-            source_bmv=bmv_30,
-            source_fmv=fmv_30,
-            embt=embt,
-            flow_approx=config.flow_approx,
-            source_depth0=source_depth0,
-            source_depth1=source_depth1,
-            ground_truth_bmv=bmv,
-            ground_truth_fmv=fmv,
-        )
-        imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
-            img0,
-            img1,
-            embt,
-            config.scale_factor,
-            init_flow0=init_flow.init_bmv,
-            init_flow1=init_flow.init_fmv,
-            init_flow0_mask=init_flow.init_bmv_mask,
-            init_flow1_mask=init_flow.init_fmv_mask,
-            init_flow_mask_epsilon=config.flow_approx.init_flow_mask_epsilon,
-        )
-        return InterpolationBatchResult(
-            img0=img0,
-            img1=img1,
-            imgt=imgt,
-            imgt_pred=imgt_pred,
-            embt=embt,
-            info=info,
-            bmv=bmv,
-            fmv=fmv,
-            init_bmv=init_flow.init_bmv,
-            init_fmv=init_flow.init_fmv,
-            init_masks=init_flow.init_masks,
-            up_flow0_1=up_flow0_1,
-            up_flow1_1=up_flow1_1,
-            up_mask_1=up_mask_1,
-            imgt_merge=imgt_merge,
-            loss_rec=None,
-            loss_geo=None,
-            loss_dis=None,
-            splatting_region_maps=build_splatting_region_maps(fmv_30, bmv_30, embt, init_flow.init_masks),
-        )
-
-    if model_name == RESIDUAL_MODEL_NAME:
-        img0, imgt, img1, bmv, fmv, embt, info = batch
-        img0 = img0.to(device)
-        imgt = imgt.to(device)
-        img1 = img1.to(device)
-        bmv = bmv.to(device)
-        fmv = fmv.to(device)
-        embt = embt.to(device)
-        imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
-            img0,
-            img1,
-            embt,
-            config.scale_factor,
-            init_flow0=bmv,
-            init_flow1=fmv,
-        )
-        return InterpolationBatchResult(
-            img0=img0,
-            img1=img1,
-            imgt=imgt,
-            imgt_pred=imgt_pred,
-            embt=embt,
-            info=info,
-            bmv=bmv,
-            fmv=fmv,
-            init_bmv=bmv,
-            init_fmv=fmv,
-            init_masks=None,
-            up_flow0_1=up_flow0_1,
-            up_flow1_1=up_flow1_1,
-            up_mask_1=up_mask_1,
-            imgt_merge=imgt_merge,
-            loss_rec=None,
-            loss_geo=None,
-            loss_dis=None,
-            splatting_region_maps=None,
-        )
-
-    raise ValueError(f"Unsupported model_name: {config.model.model_name}")
+    batch_inputs = _prepare_batch_inputs(
+        model_name=config.model.model_name,
+        batch=batch,
+        device=device,
+        flow_approx_method=config.flow_approx.method,
+    )
+    return _run_model_inference(
+        model_name=config.model.model_name,
+        model=model,
+        batch_inputs=batch_inputs,
+        flow_approx=config.flow_approx,
+        scale_factor=config.scale_factor,
+    )

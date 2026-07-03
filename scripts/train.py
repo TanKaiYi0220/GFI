@@ -34,6 +34,7 @@ from src.engine.evaluation import get_enabled_metric_names
 from src.engine.flow_approx import DEFAULT_SPLATTING_FILL_STRATEGY
 from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
 from src.engine.flow_approx import SPLATTING_FILL_STRATEGIES
+from src.engine.interpolation_batch import run_training_sample_batch
 from src.engine.interpolation_batch import run_training_batch
 from src.engine.model_registry import MODEL_NAMES
 from src.engine.model_registry import resolve_model_class
@@ -220,12 +221,11 @@ def save_epoch_samples(
                 )
                 for frame_key, batch in zip(frame_keys, DataLoader(sample_dataset, batch_size=1, shuffle=False)):
                     save_dir = Path(config.output_dir) / "samples" / split_name / frame_key / f"epoch_{epoch + 1:04d}"
-                    batch_output = run_training_batch(
+                    batch_output = run_training_sample_batch(
                         config=config,
                         model=model,
                         batch=batch,
                         device=device,
-                        collect_visual_artifacts=True,
                     )
                     save_selected_sample_artifacts(
                         cv2,
