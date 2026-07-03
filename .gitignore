@@ -6,6 +6,7 @@ __pycache__/
 *.pyd
 
 # Generated artifacts
+.superpowers/
 outputs/
 analysis_outputs/
 inference_outputs/

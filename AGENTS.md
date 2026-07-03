@@ -21,3 +21,17 @@ This repository prefers simple, pipeline-oriented Python code.
 
 - Match the existing structure and patterns in nearby files before introducing a new style.
 - Prefer minimal changes that solve the current task without broad refactors.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked in GitHub Issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default triage label vocabulary. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repo with root `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.

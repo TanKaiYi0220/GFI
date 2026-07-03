@@ -11,8 +11,7 @@ PROJECT_ROOT: Path = Path(__file__).parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.train import build_merged_dataframe
-from scripts.train import set_seed
+from src.engine.dataset_runs import build_merged_dataframe
 from src.engine.evaluation import build_flip_evaluator
 from src.engine.evaluation import build_lpips_model
 from src.engine.evaluation import calculate_batch_metrics
@@ -27,6 +26,7 @@ from src.engine.flow_approx import build_flow_init_result
 from src.engine.flow_approx import FLOW_APPROX_METHODS
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
+from src.utils.seed import set_seed
 
 ANALYSIS_SPLATTING_FILL_METHODS: dict[str, str] = {
     "splatting_zero_fill": "zero",
