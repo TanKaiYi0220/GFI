@@ -6,12 +6,13 @@ BASELINE_MODEL_NAME: str = "IFRNet"
 RESIDUAL_MODEL_NAME: str = "IFRNet_Residual"
 RESIDUAL_FLOW_APPROX_MODEL_NAME: str = "IFRNet_Residual_FlowApprox"
 RIFE_MODEL_NAME: str = "RIFE"
+UPRNET_MODEL_NAME: str = "UPRNet"
 
 TRAIN_MODEL_NAMES: tuple[str, ...] = (BASELINE_MODEL_NAME, RESIDUAL_MODEL_NAME, RESIDUAL_FLOW_APPROX_MODEL_NAME)
-INFERENCE_MODEL_NAMES: tuple[str, ...] = (*TRAIN_MODEL_NAMES, RIFE_MODEL_NAME)
+INFERENCE_MODEL_NAMES: tuple[str, ...] = (*TRAIN_MODEL_NAMES, RIFE_MODEL_NAME, UPRNET_MODEL_NAME)
 MODEL_NAMES: tuple[str, ...] = INFERENCE_MODEL_NAMES
 FLOW_APPROX_MODEL_NAMES: tuple[str, ...] = (RESIDUAL_FLOW_APPROX_MODEL_NAME,)
-IMAGE_ONLY_VFI_MODEL_NAMES: tuple[str, ...] = (RIFE_MODEL_NAME,)
+IMAGE_ONLY_VFI_MODEL_NAMES: tuple[str, ...] = (RIFE_MODEL_NAME, UPRNET_MODEL_NAME)
 
 
 def uses_flow_approx_model(model_name: str) -> bool:
@@ -39,6 +40,10 @@ def resolve_model_class(model_name: str) -> type[Any]:
         from src.models.RIFE import Model as RIFEModel
 
         return RIFEModel
+    if model_name == UPRNET_MODEL_NAME:
+        from src.models.UPRNet import Model as UPRNetModel
+
+        return UPRNetModel
 
     available_models = ", ".join(MODEL_NAMES)
     raise KeyError(f"Unknown model '{model_name}'. Available models: {available_models}")

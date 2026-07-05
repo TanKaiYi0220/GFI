@@ -138,7 +138,7 @@ def require_train_model_name(model_name: str) -> None:
     available_models = ", ".join(TRAIN_MODEL_NAMES)
     raise ValueError(
         f"Training does not support model_name={model_name}. "
-        f"Available training models: {available_models}. RIFE is inference-only in this baseline slice."
+        f"Available training models: {available_models}. External baselines are inference-only in this slice."
     )
 
 
