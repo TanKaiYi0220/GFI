@@ -10,7 +10,7 @@ PROJECT_ROOT: Path = Path(__file__).parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.engine.checkpoints import load_inference_state_dict
+from src.engine.checkpoints import load_inference_checkpoint
 from src.engine.dataset_runs import build_inference_dataset
 from src.engine.dataset_runs import build_merged_dataframe
 from src.engine.interpolation_batch import InterpolationBatchResult
@@ -18,6 +18,7 @@ from src.engine.interpolation_batch import run_inference_batch
 from src.engine.model_registry import BASELINE_MODEL_NAME
 from src.engine.model_registry import resolve_model_class
 from src.engine.model_registry import set_model_convex_upsampling
+from src.engine.model_registry import uses_image_only_vfi_model
 from src.engine.run_config import build_inference_run_config
 from src.utils.config import load_yaml_file
 from src.utils.logger import build_logger
@@ -35,6 +36,20 @@ VIDEO_CONFIG_KEYS: tuple[str, ...] = (
     "export_all",
     "export_vfi60",
     "single_files",
+)
+IMAGE_ONLY_VIDEO_SINGLE_FILES: tuple[str, ...] = (
+    "image_0.png",
+    "image_pred.png",
+    "image_1.png",
+    "image_gt.png",
+)
+FLOW_VIDEO_SINGLE_FILES: tuple[str, ...] = (
+    *IMAGE_ONLY_VIDEO_SINGLE_FILES,
+    "flow_t_to_0.png",
+    "flow_t_to_1.png",
+    "flow_mask.png",
+    "image_0_warped.png",
+    "image_1_warped.png",
 )
 
 
@@ -57,6 +72,33 @@ def read_video_config(config: dict[str, Any]) -> dict[str, Any]:
         raise KeyError(f"video config missing required keys: {missing_key_names}")
 
     return dict(raw_video_config)
+
+
+def validate_image_only_video_config(
+    model_name: str,
+    export_grid: bool,
+    export_all: bool,
+    single_files: list[str],
+    export_vfi60: bool,
+) -> None:
+    if not uses_image_only_vfi_model(model_name=model_name):
+        return
+    if export_grid:
+        raise ValueError(
+            "video.export_grid requires flow artifacts, "
+            f"but model_name={model_name} returns image-only predictions. Set video.export_grid=false."
+        )
+    if not export_all:
+        return
+
+    unsupported_files = [filename for filename in single_files if filename not in IMAGE_ONLY_VIDEO_SINGLE_FILES]
+    if len(unsupported_files) > 0:
+        raise ValueError(
+            "video.single_files contains flow-specific streams, "
+            f"but model_name={model_name} returns image-only predictions. "
+            f"Unsupported files: {unsupported_files}. "
+            f"Supported files: {list(IMAGE_ONLY_VIDEO_SINGLE_FILES)}."
+        )
 
 
 def make_even_size(height: int, width: int) -> tuple[int, int]:
@@ -237,6 +279,14 @@ def main(argv: list[str] | None = None) -> None:
     record_filter = video_config["record_filter"]
     mode_filter = video_config["mode_filter"]
     single_files = list(video_config["single_files"])
+    image_only_model = uses_image_only_vfi_model(model_name=model_name)
+    validate_image_only_video_config(
+        model_name=model_name,
+        export_grid=export_grid,
+        export_all=export_all,
+        single_files=single_files,
+        export_vfi60=export_vfi60,
+    )
 
     root_dir = run_config.root_dir
     dataset_root_dir = run_config.dataset_root_dir
@@ -277,8 +327,14 @@ def main(argv: list[str] | None = None) -> None:
     from torch.utils.data import DataLoader
     from tqdm import tqdm
 
-    from src.data.image_ops import flow_to_image
-    from src.models.external.IFRNet.utils import warp
+    flow_to_image = None
+    warp = None
+    if not image_only_model:
+        from src.data.image_ops import flow_to_image as flow_to_image_func
+        from src.models.external.IFRNet.utils import warp as warp_func
+
+        flow_to_image = flow_to_image_func
+        warp = warp_func
 
     logger = build_logger("scripts.inference_results_to_video")
     set_seed(seed)
@@ -298,7 +354,7 @@ def main(argv: list[str] | None = None) -> None:
 
     model_class = resolve_model_class(model_name)
     model = model_class(**model_init_args).to(device)
-    model.load_state_dict(load_inference_state_dict(checkpoint_path=checkpoint_path, device=device))
+    load_inference_checkpoint(model=model, checkpoint_path=checkpoint_path, device=device)
     if eval_convex_upsampling is not None:
         set_model_convex_upsampling(
             model=model,
@@ -308,17 +364,7 @@ def main(argv: list[str] | None = None) -> None:
     model.eval()
 
     if len(single_files) == 0:
-        single_files = [
-            "image_0.png",
-            "image_pred.png",
-            "image_1.png",
-            "image_gt.png",
-            "flow_t_to_0.png",
-            "flow_t_to_1.png",
-            "flow_mask.png",
-            "image_0_warped.png",
-            "image_1_warped.png",
-        ]
+        single_files = list(IMAGE_ONLY_VIDEO_SINGLE_FILES if image_only_model else FLOW_VIDEO_SINGLE_FILES)
 
     video_rows: list[dict[str, object]] = []
 
@@ -374,35 +420,42 @@ def main(argv: list[str] | None = None) -> None:
                 up_flow1_1 = inference_result.up_flow1_1
                 up_mask_1 = inference_result.up_mask_1
 
-                if up_flow0_1 is None or up_flow1_1 is None or up_mask_1 is None:
+                if not image_only_model and (up_flow0_1 is None or up_flow1_1 is None or up_mask_1 is None):
                     raise RuntimeError("Video export requires inference results with predicted flow tensors.")
 
-                img0_warped = warp(img0, up_flow0_1)
-                img1_warped = warp(img1, up_flow1_1)
+                img0_warped = None if image_only_model else warp(img0, up_flow0_1)
+                img1_warped = None if image_only_model else warp(img1, up_flow1_1)
 
                 for batch_index in range(int(imgt_pred.shape[0])):
                     img0_np = np.round(img0[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
                     img1_np = np.round(img1[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
                     imgt_np = np.round(imgt[batch_index].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
                     img_pred_np = np.round(imgt_pred[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                    flow_mask_np = np.round(up_mask_1[batch_index, 0].detach().cpu().numpy() * 255.0).astype(np.uint8)
-                    img0_warped_np = np.round(img0_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                    img1_warped_np = np.round(img1_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                    if not image_only_model:
+                        flow_mask_np = np.round(up_mask_1[batch_index, 0].detach().cpu().numpy() * 255.0).astype(np.uint8)
+                        img0_warped_np = (
+                            np.round(img0_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0)
+                            .astype(np.uint8)
+                        )
+                        img1_warped_np = (
+                            np.round(img1_warped[batch_index].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0)
+                            .astype(np.uint8)
+                        )
 
-                    if model_name == BASELINE_MODEL_NAME:
-                        flow_t_to_0_np = flow_to_image(up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
-                        flow_t_to_1_np = flow_to_image(up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
-                        flow_t_to_0_is_rgb = True
-                        flow_t_to_1_is_rgb = True
-                    else:
-                        init_flow_1_to_0_np = init_bmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
-                        init_flow_1_to_2_np = init_fmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
-                        final_flow_1_to_0_np = up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
-                        final_flow_1_to_2_np = up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
-                        flow_t_to_0_np = build_flow_error_vis(img0_np, init_flow_1_to_0_np, final_flow_1_to_0_np, cv2, np)
-                        flow_t_to_1_np = build_flow_error_vis(img1_np, init_flow_1_to_2_np, final_flow_1_to_2_np, cv2, np)
-                        flow_t_to_0_is_rgb = False
-                        flow_t_to_1_is_rgb = False
+                        if model_name == BASELINE_MODEL_NAME:
+                            flow_t_to_0_np = flow_to_image(up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
+                            flow_t_to_1_np = flow_to_image(up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy())
+                            flow_t_to_0_is_rgb = True
+                            flow_t_to_1_is_rgb = True
+                        else:
+                            init_flow_1_to_0_np = init_bmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                            init_flow_1_to_2_np = init_fmv[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                            final_flow_1_to_0_np = up_flow0_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                            final_flow_1_to_2_np = up_flow1_1[batch_index].detach().cpu().permute(1, 2, 0).numpy()
+                            flow_t_to_0_np = build_flow_error_vis(img0_np, init_flow_1_to_0_np, final_flow_1_to_0_np, cv2, np)
+                            flow_t_to_1_np = build_flow_error_vis(img1_np, init_flow_1_to_2_np, final_flow_1_to_2_np, cv2, np)
+                            flow_t_to_0_is_rgb = False
+                            flow_t_to_1_is_rgb = False
 
                     if pred_writer is None and export_vfi60:
                         pred_writer, pred_video_actual_path, pred_video_shape = open_video_writer(pred_video_path, fps, img0_np.shape[:2], cv2, logger)
@@ -423,12 +476,17 @@ def main(argv: list[str] | None = None) -> None:
                             "image_pred.png": (img_pred_np, False),
                             "image_1.png": (img1_np, False),
                             "image_gt.png": (imgt_np, False),
-                            "flow_t_to_0.png": (flow_t_to_0_np, flow_t_to_0_is_rgb),
-                            "flow_t_to_1.png": (flow_t_to_1_np, flow_t_to_1_is_rgb),
-                            "flow_mask.png": (cv2.cvtColor(flow_mask_np, cv2.COLOR_GRAY2BGR), False),
-                            "image_0_warped.png": (img0_warped_np, False),
-                            "image_1_warped.png": (img1_warped_np, False),
                         }
+                        if not image_only_model:
+                            stream_frames.update(
+                                {
+                                    "flow_t_to_0.png": (flow_t_to_0_np, flow_t_to_0_is_rgb),
+                                    "flow_t_to_1.png": (flow_t_to_1_np, flow_t_to_1_is_rgb),
+                                    "flow_mask.png": (cv2.cvtColor(flow_mask_np, cv2.COLOR_GRAY2BGR), False),
+                                    "image_0_warped.png": (img0_warped_np, False),
+                                    "image_1_warped.png": (img1_warped_np, False),
+                                }
+                            )
                         for filename in single_files:
                             stream_entry = stream_frames.get(filename)
                             if stream_entry is None:

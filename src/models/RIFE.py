@@ -9,6 +9,7 @@ from typing import Iterator
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
 REQUIRED_EXTERNAL_FILES: tuple[Path, ...] = (
@@ -17,6 +18,7 @@ REQUIRED_EXTERNAL_FILES: tuple[Path, ...] = (
     Path("train_log/RIFE_HDv3.py"),
 )
 CHECKPOINT_FILENAME: str = "flownet.pkl"
+PAD_MULTIPLE: int = 32
 
 
 class RIFEExternalFilesError(RuntimeError):
@@ -114,6 +116,19 @@ def _convert_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
     return {key.replace("module.", ""): value for key, value in state_dict.items()}
 
 
+def _next_multiple(value: int, multiple: int) -> int:
+    return ((value - 1) // multiple + 1) * multiple
+
+
+def _pad_to_size(image: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    image_height = int(image.shape[-2])
+    image_width = int(image.shape[-1])
+    padding = (0, width - image_width, 0, height - image_height)
+    if padding == (0, 0, 0, 0):
+        return image
+    return F.pad(image, padding)
+
+
 def extract_scalar_timestep(embt: torch.Tensor) -> float:
     if not torch.is_tensor(embt):
         raise TypeError(f"RIFE embt must be a torch.Tensor, got {type(embt).__name__}")
@@ -178,11 +193,19 @@ class Model(nn.Module):
     def inference(self, img0: Any, img1: Any, embt: Any, scale_factor: float) -> Any:
         if not self._checkpoint_loaded:
             raise RuntimeError("RIFE checkpoint is not loaded. Call load_external_checkpoint before inference.")
+        if img0.shape[-2:] != img1.shape[-2:]:
+            raise ValueError(f"RIFE input frames must share spatial shape, got img0={img0.shape} img1={img1.shape}")
         timestep = extract_scalar_timestep(embt=embt)
-        imgs = torch.cat((img0, img1), dim=1)
+        height = int(img0.shape[-2])
+        width = int(img0.shape[-1])
+        padded_height = _next_multiple(value=height, multiple=PAD_MULTIPLE)
+        padded_width = _next_multiple(value=width, multiple=PAD_MULTIPLE)
+        padded_img0 = _pad_to_size(image=img0, height=padded_height, width=padded_width)
+        padded_img1 = _pad_to_size(image=img1, height=padded_height, width=padded_width)
+        imgs = torch.cat((padded_img0, padded_img1), dim=1)
         scale_list = [8.0 / scale_factor, 4.0 / scale_factor, 2.0 / scale_factor, 1.0 / scale_factor]
         _flow, _mask, merged = self.flownet(imgs, timestep, scale_list)
-        return merged[3].clamp(0.0, 1.0)
+        return merged[3][:, :, :height, :width].clamp(0.0, 1.0)
 
 
 __all__ = ["Model", "RIFEExternalFilesError", "extract_scalar_timestep"]

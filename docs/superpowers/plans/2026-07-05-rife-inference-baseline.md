@@ -800,7 +800,7 @@ git commit -m "feat: allow image-only RIFE inference artifacts"
     "ignore_valid": true,
     "record_filter": null,
     "mode_filter": null,
-    "export_grid": true,
+    "export_grid": false,
     "tile_scale": 0.5,
     "pad": 8,
     "export_all": false,
