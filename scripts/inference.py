@@ -34,6 +34,7 @@ from src.engine.model_registry import resolve_model_class
 from src.engine.model_registry import RESIDUAL_FLOW_APPROX_MODEL_NAME
 from src.engine.model_registry import RESIDUAL_MODEL_NAME
 from src.engine.model_registry import set_model_convex_upsampling
+from src.engine.model_registry import uses_image_only_vfi_model
 from src.engine.run_config import build_inference_dry_run_summary
 from src.engine.run_config import build_inference_run_config
 from src.utils.logger import build_logger
@@ -45,6 +46,30 @@ from src.utils.seed import set_seed
 
 SplattingRegionMaps = dict[str, Any]
 VfipsSegment = dict[str, Any]
+
+SELECTED_ARTIFACT_COLUMNS: tuple[str, ...] = (
+    "image_0_path",
+    "image_1_path",
+    "image_gt_path",
+    "image_pred_path",
+    "image_merge_path",
+    "bmv_path",
+    "fmv_path",
+    "flow_1_to_0_path",
+    "flow_1_to_2_path",
+    "flow_mask_path",
+    "image_0_warped_path",
+    "image_1_warped_path",
+    "image_0_bmv_warped_path",
+    "image_1_fmv_warped_path",
+    "image_0_init_warped_path",
+    "image_1_init_warped_path",
+    "image_init_warped_merge_path",
+    "splatting_region_label_bmv_color_path",
+    "splatting_region_label_fmv_color_path",
+    "splatting_hit_count_bmv_path",
+    "splatting_hit_count_fmv_path",
+)
 
 
 def update_metric_meter(metric_meters: dict[str, Any], metric_name: str, metric_value: float) -> None:
@@ -340,6 +365,28 @@ def save_splatting_region_visuals(
     return image_paths
 
 
+def build_blank_selected_artifact_paths() -> dict[str, str]:
+    return {column_name: "" for column_name in SELECTED_ARTIFACT_COLUMNS}
+
+
+def has_flow_artifacts(inference_result: InterpolationBatchResult) -> bool:
+    return (
+        inference_result.bmv is not None
+        and inference_result.fmv is not None
+        and inference_result.up_flow0_1 is not None
+        and inference_result.up_flow1_1 is not None
+        and inference_result.up_mask_1 is not None
+    )
+
+
+def validate_flow_specific_requests(model_name: str, save_topk_largest_flow_diff: int) -> None:
+    if uses_image_only_vfi_model(model_name=model_name) and save_topk_largest_flow_diff > 0:
+        raise ValueError(
+            "save_topk_largest_flow_diff requires flow artifacts, "
+            f"but model_name={model_name} returns image-only predictions. Set save_topk_largest_flow_diff=0."
+        )
+
+
 def save_selected_sample_artifacts(
     cv2: Any,
     flow_diff_percentile: float,
@@ -350,8 +397,6 @@ def save_selected_sample_artifacts(
     save_dir: Path,
     save_image: Any,
 ) -> dict[str, str]:
-    from src.models.external.IFRNet.utils import warp
-
     img0 = inference_result.img0
     img1 = inference_result.img1
     imgt = inference_result.imgt
@@ -367,8 +412,35 @@ def save_selected_sample_artifacts(
     up_mask_1 = inference_result.up_mask_1
     splatting_region_maps = inference_result.splatting_region_maps
 
-    if bmv is None or fmv is None or up_flow0_1 is None or up_flow1_1 is None or up_mask_1 is None:
-        raise RuntimeError("Inference artifacts require bmv, fmv, up_flow0_1, up_flow1_1, and up_mask_1.")
+    img0_np = np.round(img0[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    img1_np = np.round(img1[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    imgt_np = np.round(imgt[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    img_pred_np = np.round(imgt_pred[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    imgt_merge_np = None if imgt_merge is None else np.round(imgt_merge[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+
+    image_paths = build_blank_selected_artifact_paths()
+    image_paths.update(
+        {
+            "image_0_path": str(save_dir / "image_0.png"),
+            "image_1_path": str(save_dir / "image_1.png"),
+            "image_gt_path": str(save_dir / "image_gt.png"),
+            "image_pred_path": str(save_dir / "image_pred.png"),
+            "image_merge_path": str(save_dir / "image_merge.png") if imgt_merge_np is not None else "",
+        }
+    )
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_image(Path(image_paths["image_0_path"]), img0_np)
+    save_image(Path(image_paths["image_1_path"]), img1_np)
+    save_image(Path(image_paths["image_gt_path"]), imgt_np)
+    save_image(Path(image_paths["image_pred_path"]), img_pred_np)
+    if imgt_merge_np is not None:
+        save_image(Path(image_paths["image_merge_path"]), imgt_merge_np)
+
+    if not has_flow_artifacts(inference_result=inference_result):
+        return image_paths
+
+    from src.models.external.IFRNet.utils import warp
 
     img0_warped = warp(img0, up_flow0_1)
     img1_warped = warp(img1, up_flow1_1)
@@ -392,11 +464,6 @@ def save_selected_sample_artifacts(
             ) / init_weight_sum.clamp_min(1.0)
             init_merge = init_average.where(init_weight_sum <= 0, init_weighted)
 
-    img0_np = np.round(img0[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-    img1_np = np.round(img1[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-    imgt_np = np.round(imgt[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-    img_pred_np = np.round(imgt_pred[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-    imgt_merge_np = None if imgt_merge is None else np.round(imgt_merge[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
     bmv_np = flow_to_image(bmv[0].detach().cpu().permute(1, 2, 0).numpy())
     fmv_np = flow_to_image(fmv[0].detach().cpu().permute(1, 2, 0).numpy())
     flow_1_to_0_np = flow_to_image(up_flow0_1[0].detach().cpu().permute(1, 2, 0).numpy())
@@ -410,12 +477,7 @@ def save_selected_sample_artifacts(
     init_img1_warped_np = None if init_img1_warped is None else np.round(init_img1_warped[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
     init_merge_np = None if init_merge is None else np.round(init_merge[0].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
 
-    image_paths = {
-        "image_0_path": str(save_dir / "image_0.png"),
-        "image_1_path": str(save_dir / "image_1.png"),
-        "image_gt_path": str(save_dir / "image_gt.png"),
-        "image_pred_path": str(save_dir / "image_pred.png"),
-        "image_merge_path": str(save_dir / "image_merge.png") if imgt_merge_np is not None else "",
+    image_paths.update({
         "bmv_path": str(save_dir / "bmv.png"),
         "fmv_path": str(save_dir / "fmv.png"),
         "flow_1_to_0_path": str(save_dir / "flow_1_to_0.png"),
@@ -428,15 +490,9 @@ def save_selected_sample_artifacts(
         "image_0_init_warped_path": str(save_dir / "image_0_init_warped.png") if init_img0_warped_np is not None else "",
         "image_1_init_warped_path": str(save_dir / "image_1_init_warped.png") if init_img1_warped_np is not None else "",
         "image_init_warped_merge_path": str(save_dir / "image_init_warped_merge.png") if init_merge_np is not None else "",
-    }
+    })
     image_paths.update(save_splatting_region_visuals(cv2, np, splatting_region_maps, save_dir, save_image))
 
-    save_image(Path(image_paths["image_0_path"]), img0_np)
-    save_image(Path(image_paths["image_1_path"]), img1_np)
-    save_image(Path(image_paths["image_gt_path"]), imgt_np)
-    save_image(Path(image_paths["image_pred_path"]), img_pred_np)
-    if imgt_merge_np is not None:
-        save_image(Path(image_paths["image_merge_path"]), imgt_merge_np)
     save_image(Path(image_paths["bmv_path"]), bmv_np)
     save_image(Path(image_paths["fmv_path"]), fmv_np)
     save_image(Path(image_paths["flow_1_to_0_path"]), flow_1_to_0_np)
@@ -493,6 +549,10 @@ def main(argv: list[str] | None = None) -> None:
         config_path = PROJECT_ROOT / config_path
 
     run_config = build_inference_run_config(config_path=config_path, project_root=PROJECT_ROOT)
+    validate_flow_specific_requests(
+        model_name=run_config.model.model_name,
+        save_topk_largest_flow_diff=run_config.save_topk_largest_flow_diff,
+    )
     if run_config.mode == "dry-run":
         print(json.dumps(build_inference_dry_run_summary(config=run_config), indent=2))
         return
@@ -764,29 +824,7 @@ def main(argv: list[str] | None = None) -> None:
             group_metrics_df["save_reason"] = group_metrics_df["sample_index"].map(
                 lambda sample_index: ";".join(selected_sample_reasons.get(int(sample_index), [])),
             )
-            for column_name in (
-                "image_0_path",
-                "image_1_path",
-                "image_gt_path",
-                "image_pred_path",
-                "image_merge_path",
-                "bmv_path",
-                "fmv_path",
-                "flow_1_to_0_path",
-                "flow_1_to_2_path",
-                "flow_mask_path",
-                "image_0_warped_path",
-                "image_1_warped_path",
-                "image_0_bmv_warped_path",
-                "image_1_fmv_warped_path",
-                "image_0_init_warped_path",
-                "image_1_init_warped_path",
-                "image_init_warped_merge_path",
-                "splatting_region_label_bmv_color_path",
-                "splatting_region_label_fmv_color_path",
-                "splatting_hit_count_bmv_path",
-                "splatting_hit_count_fmv_path",
-            ):
+            for column_name in SELECTED_ARTIFACT_COLUMNS:
                 group_metrics_df[column_name] = ""
 
             selected_indices = sorted(selected_sample_reasons.keys())
