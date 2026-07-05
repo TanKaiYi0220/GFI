@@ -4,7 +4,7 @@
 
 **Goal:** Add official RIFE as an image-only inference/evaluation baseline while keeping external source and checkpoint files out of git.
 
-**Architecture:** Keep the official RIFE clone under ignored `src/models/external/RIFE`, and commit only the GFI-side adapter, registry/runtime seams, setup helper, and representative config. Treat RIFE as image interpolation only: it produces `imgt_pred` for metrics and selected image artifacts, but does not provide GFI flow, masks, residual merge images, or flow-diff artifacts.
+**Architecture:** Keep the official RIFE clone under ignored `src/models/external/RIFE`, and commit only the GFI-side adapter, registry/runtime seams, and representative config. Treat RIFE as image interpolation only: it produces `imgt_pred` for metrics and selected image artifacts, but does not provide GFI flow, masks, residual merge images, or flow-diff artifacts.
 
 **Tech Stack:** Python 3.10+, PyTorch, existing JSON-compatible `.yaml` configs, existing `scripts/inference.py`, official `hzwer/ECCV2022-RIFE` HD model package files under `src/models/external/RIFE/train_log`.
 
@@ -15,6 +15,7 @@
 - Checkpoint target: `src/models/external/RIFE/train_log/flownet.pkl`.
 - `src/models/external/` remains gitignored.
 - Do not commit the official RIFE repo or checkpoint into GFI.
+- Do not add a committed setup helper script; external RIFE setup is manual on the target machine.
 - Do not add RIFE fine-tuning in this slice.
 - Fail fast for missing external repo, missing RIFE model-package files, missing checkpoint directory, missing `flownet.pkl`, unsupported timestep shape, and flow-specific requests that RIFE cannot satisfy.
 - Keep config files JSON-compatible because `src.utils.config.load_yaml_file` uses `json.load`.
@@ -26,10 +27,6 @@
 
 ## File Structure
 
-- Create `scripts/setup_external_rife.py`
-  - Owns cloning the official RIFE repository into the ignored external directory.
-  - Refuses to overwrite an existing non-empty directory.
-  - Prints the exact manual checkpoint/model-package placement expected by the adapter.
 - Create `src/models/RIFE.py`
   - Owns the GFI adapter around official RIFE HD v3 model-package files.
   - Imports `train_log.IFNet_HDv3.IFNet` from the ignored external clone.
@@ -56,138 +53,7 @@
 
 ---
 
-### Task 1: External RIFE Setup Helper
-
-**Files:**
-- Create: `scripts/setup_external_rife.py`
-
-**Interfaces:**
-- Consumes: `git` CLI and the official repository URL.
-- Produces:
-  - `RIFE_REPO_URL: str`
-  - `DEFAULT_TARGET_DIR: Path`
-  - `RifeSetupError`
-  - `resolve_target_dir(path_value: str) -> Path`
-  - `clone_rife_repo(repo_url: str, target_dir: Path) -> None`
-  - `main(argv: list[str]) -> None`
-
-- [ ] **Step 1: Create the setup helper**
-
-```python
-from __future__ import annotations
-
-import argparse
-import subprocess
-import sys
-from pathlib import Path
-
-PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
-RIFE_REPO_URL: str = "https://github.com/hzwer/ECCV2022-RIFE.git"
-DEFAULT_TARGET_DIR: Path = PROJECT_ROOT / "src" / "models" / "external" / "RIFE"
-
-
-class RifeSetupError(RuntimeError):
-    """Raised when the external RIFE repository cannot be prepared safely."""
-
-
-def resolve_target_dir(path_value: str) -> Path:
-    target_dir = Path(path_value)
-    if target_dir.is_absolute():
-        return target_dir
-    return PROJECT_ROOT / target_dir
-
-
-def clone_rife_repo(repo_url: str, target_dir: Path) -> None:
-    if target_dir.exists() and any(target_dir.iterdir()):
-        raise RifeSetupError(
-            "RIFE target directory already exists and is not empty: "
-            f"path={target_dir}. Move it manually or choose --target-dir; this helper will not overwrite it."
-        )
-
-    target_dir.parent.mkdir(parents=True, exist_ok=True)
-    command = ["git", "clone", "--depth", "1", repo_url, str(target_dir)]
-    subprocess.run(command, check=True)
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Clone the official RIFE repository into src/models/external/RIFE.")
-    parser.add_argument("--repo-url", type=str, default=RIFE_REPO_URL)
-    parser.add_argument("--target-dir", type=str, default=str(DEFAULT_TARGET_DIR))
-    return parser
-
-
-def main(argv: list[str]) -> None:
-    args = build_parser().parse_args(argv)
-    target_dir = resolve_target_dir(path_value=str(args.target_dir))
-    clone_rife_repo(repo_url=str(args.repo_url), target_dir=target_dir)
-    print(f"Cloned official RIFE into {target_dir}")
-    print("Download the official HD model package and place its files under:")
-    print(f"  {target_dir / 'train_log'}")
-    print("Required adapter checkpoint:")
-    print(f"  {target_dir / 'train_log' / 'flownet.pkl'}")
-
-
-if __name__ == "__main__":
-    main(sys.argv[1:])
-```
-
-- [ ] **Step 2: Verify the helper imports without cloning**
-
-Run:
-
-```powershell
-python -c "import scripts.setup_external_rife as s; print(s.RIFE_REPO_URL); print(s.DEFAULT_TARGET_DIR.name)"
-```
-
-Expected output contains:
-
-```text
-https://github.com/hzwer/ECCV2022-RIFE.git
-RIFE
-```
-
-- [ ] **Step 3: Verify the no-overwrite error path**
-
-Run:
-
-```powershell
-python -c "from pathlib import Path; from scripts.setup_external_rife import clone_rife_repo, RifeSetupError; p=Path('src/models/external'); p.mkdir(parents=True, exist_ok=True); open(p / 'rife_setup_probe.txt', 'w', encoding='utf-8').write('probe'); clone_rife_repo('https://github.com/hzwer/ECCV2022-RIFE.git', p)"
-```
-
-Expected: command exits non-zero with `RifeSetupError` and a message containing `will not overwrite it`.
-
-- [ ] **Step 4: Remove the single probe file**
-
-Run:
-
-```powershell
-Remove-Item "src\models\external\rife_setup_probe.txt"
-```
-
-Expected: command exits `0`.
-
-- [ ] **Step 5: Verify compile**
-
-Run:
-
-```powershell
-python -m compileall scripts/setup_external_rife.py
-```
-
-Expected: command exits `0`.
-
-- [ ] **Step 6: Commit**
-
-Run:
-
-```powershell
-git add scripts/setup_external_rife.py
-git commit -m "chore: add RIFE external setup helper"
-```
-
----
-
-### Task 2: RIFE Adapter
+### Task 1: RIFE Adapter
 
 **Files:**
 - Create: `src/models/RIFE.py`
@@ -258,7 +124,9 @@ def _require_external_files(external_root: Path) -> None:
     if not external_root.exists():
         raise FileNotFoundError(
             "Official RIFE repository is missing. "
-            f"Expected clone at {external_root}. Run: python scripts/setup_external_rife.py"
+            f"Expected clone at {external_root}. "
+            "Clone https://github.com/hzwer/ECCV2022-RIFE into src/models/external/RIFE "
+            "and place the official HD model package under train_log."
         )
     if not external_root.is_dir():
         raise NotADirectoryError(f"Official RIFE path must be a directory: path={external_root}")
@@ -380,7 +248,7 @@ Run:
 python -c "from src.models.RIFE import Model; Model(external_root='src/models/external/RIFE_DOES_NOT_EXIST')"
 ```
 
-Expected: command exits non-zero with `FileNotFoundError` and a message containing `Run: python scripts/setup_external_rife.py`.
+Expected: command exits non-zero with `FileNotFoundError` and a message containing `Clone https://github.com/hzwer/ECCV2022-RIFE`.
 
 - [ ] **Step 4: Verify timestep validation**
 
@@ -413,7 +281,7 @@ git commit -m "feat: add RIFE inference adapter"
 
 ---
 
-### Task 3: Runtime Registry, Checkpoint, and Batch Seams
+### Task 2: Runtime Registry, Checkpoint, and Batch Seams
 
 **Files:**
 - Modify: `src/engine/model_registry.py`
@@ -426,7 +294,7 @@ git commit -m "feat: add RIFE inference adapter"
 **Interfaces:**
 - Consumes:
   - `src.models.RIFE.Model`
-  - `Model.load_external_checkpoint(checkpoint_path: Path, device: Any) -> None` from Task 2
+  - `Model.load_external_checkpoint(checkpoint_path: Path, device: Any) -> None` from Task 1
 - Produces:
   - `RIFE_MODEL_NAME: str`
   - `TRAIN_MODEL_NAMES: tuple[str, ...]`
@@ -686,7 +554,7 @@ git commit -m "feat: route RIFE through inference runtime seams"
 
 ---
 
-### Task 4: RIFE-Compatible Selected Artifacts
+### Task 3: RIFE-Compatible Selected Artifacts
 
 **Files:**
 - Modify: `scripts/inference.py`
@@ -869,7 +737,7 @@ git commit -m "feat: allow image-only RIFE inference artifacts"
 
 ---
 
-### Task 5: RIFE Config and End-to-End Smoke Checks
+### Task 4: RIFE Config and End-to-End Smoke Checks
 
 **Files:**
 - Create: `configs/run/inference_rife_official.yaml`
@@ -877,7 +745,7 @@ git commit -m "feat: allow image-only RIFE inference artifacts"
 **Interfaces:**
 - Consumes:
   - `src.models.RIFE.Model(external_root: str)`
-  - `checkpoint_path` directory contract from Task 2
+  - `checkpoint_path` directory contract from Task 1
   - `scripts/inference.py --config <path>`
 - Produces:
   - A representative RIFE inference config with `model_name: "RIFE"`, `model_init_args.external_root`, and `checkpoint_path: "src/models/external/RIFE/train_log"`.
@@ -982,7 +850,7 @@ Expected output:
 ok
 ```
 
-- [ ] **Step 5: Verify missing setup error is actionable**
+- [ ] **Step 5: Verify missing external dependency error is actionable**
 
 Run:
 
@@ -990,7 +858,7 @@ Run:
 python -c "from src.models.RIFE import Model; Model(external_root='src/models/external/RIFE_DOES_NOT_EXIST')"
 ```
 
-Expected: command exits non-zero with `FileNotFoundError` and a message containing `python scripts/setup_external_rife.py`.
+Expected: command exits non-zero with `FileNotFoundError` and a message containing `Clone https://github.com/hzwer/ECCV2022-RIFE`.
 
 - [ ] **Step 6: Verify optional tiny RIFE inference when the official files are present**
 
@@ -1039,7 +907,24 @@ git status --short --branch
 
 Expected: branch is `codex/repo-architecture-review` and status is clean except for being ahead of origin.
 
-- [ ] **Step 2: Verify all planned smoke checks together**
+- [ ] **Step 2: Prepare a local ignored RIFE clone for verification when absent**
+
+Run:
+
+```powershell
+if (Test-Path "src\models\external\RIFE") {
+  Write-Output "src\models\external\RIFE already exists; leaving it untouched."
+} else {
+  git clone --depth 1 https://github.com/hzwer/ECCV2022-RIFE.git "src\models\external\RIFE"
+}
+if (Test-Path "src\models\external\RIFE\.git") {
+  git -C "src\models\external\RIFE" remote get-url origin
+}
+```
+
+Expected: command exits `0`. If a clone is needed, it is created under ignored `src/models/external/RIFE`; do not commit it. If the directory already exists, it is not overwritten.
+
+- [ ] **Step 3: Verify all planned smoke checks together**
 
 Run:
 
@@ -1054,7 +939,7 @@ python -m compileall src scripts tests
 
 Expected: each command exits `0`; dry-run JSON contains `"model_name": "RIFE"`.
 
-- [ ] **Step 3: Inspect committed diff**
+- [ ] **Step 4: Inspect committed diff**
 
 Run:
 
@@ -1062,4 +947,4 @@ Run:
 git --no-pager diff origin/codex/repo-architecture-review...HEAD --stat
 ```
 
-Expected: committed changes include the approved RIFE design spec plus this implementation's adapter, runtime seams, setup helper, and config. No files under `src/models/external/` are tracked.
+Expected: committed changes include the approved RIFE design spec plus this implementation's adapter, runtime seams, and config. No files under `src/models/external/` are tracked.

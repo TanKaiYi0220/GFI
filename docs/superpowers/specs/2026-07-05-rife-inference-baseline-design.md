@@ -18,7 +18,7 @@ The official repo and checkpoint are local dependencies, not committed GFI sourc
 - Checkpoint target: `src/models/external/RIFE/train_log/flownet.pkl`
 - `src/models/external/` remains gitignored.
 
-The implementation should provide clear setup instructions or a small setup script that clones the official repo if it is missing. It should not silently download checkpoints, because official checkpoint links may require Drive or Baidu access.
+Do not add a committed setup helper script. The external repo and checkpoint are prepared manually on the target machine. Verification may create a local ignored clone under `src/models/external/RIFE`, but that clone must not be committed and must not overwrite an existing directory. The implementation should not silently download checkpoints, because official checkpoint links may require Drive or Baidu access.
 
 ## Scope
 
@@ -121,7 +121,10 @@ Required verification:
 
 - Import smoke:
   - `python -c "import src.models.RIFE; import scripts.inference"`
-- Setup failure smoke:
+- Optional local clone for verification only:
+  - If `src/models/external/RIFE` is absent in the verification environment, clone `https://github.com/hzwer/ECCV2022-RIFE` into that ignored path before functional smoke checks.
+  - Do not commit the clone and do not overwrite an existing external directory.
+- External dependency failure smoke:
   - Missing external repo/checkpoint produces the expected actionable error.
 - Dry-run:
   - `python scripts/inference.py --config configs/run/inference_rife_official.yaml` with dry-run mode, or an equivalent temporary dry-run config, exits `0` and prints parseable JSON.
