@@ -17,6 +17,7 @@ from src.engine.flow_approx import is_splatting_flow_approx_method
 from src.engine.flow_approx import resolve_splatting_fill_strategy
 from src.engine.model_registry import TRAIN_MODEL_NAMES
 from src.engine.model_registry import uses_flow_approx_model
+from src.engine.model_registry import uses_image_only_vfi_model
 from src.utils.config import load_yaml_file
 
 DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY: str = "bilinear"
@@ -141,6 +142,33 @@ def require_train_model_name(model_name: str) -> None:
     )
 
 
+def require_image_only_flow_approx_defaults(
+    model_name: str,
+    method: str,
+    splatting_fill_strategy: str,
+    init_flow_downscale_strategy: str,
+    init_flow_mask_epsilon: float,
+) -> None:
+    if not uses_image_only_vfi_model(model_name):
+        return
+
+    if (
+        method == "combination"
+        and splatting_fill_strategy == DEFAULT_SPLATTING_FILL_STRATEGY
+        and init_flow_downscale_strategy == DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY
+        and init_flow_mask_epsilon == DEFAULT_INIT_FLOW_MASK_EPSILON
+    ):
+        return
+
+    raise ValueError(
+        f"model_name={model_name} returns image-only predictions and does not support flow approximation settings. "
+        "Use default flow_approx_method=combination, "
+        f"splatting_fill_strategy={DEFAULT_SPLATTING_FILL_STRATEGY}, "
+        f"init_flow_downscale_strategy={DEFAULT_INIT_FLOW_DOWNSCALE_STRATEGY}, "
+        f"and init_flow_mask_epsilon={DEFAULT_INIT_FLOW_MASK_EPSILON}."
+    )
+
+
 def build_flow_approx_config(model_name: str, config_values: dict[str, Any]) -> FlowApproxConfig:
     method = str(config_values.get("flow_approx_method", "combination"))
     if method not in FLOW_APPROX_METHOD_CHOICES:
@@ -167,6 +195,14 @@ def build_flow_approx_config(model_name: str, config_values: dict[str, Any]) -> 
     init_flow_mask_epsilon = float(config_values.get("init_flow_mask_epsilon", DEFAULT_INIT_FLOW_MASK_EPSILON))
     if init_flow_mask_epsilon <= 0:
         raise ValueError(f"init_flow_mask_epsilon must be positive, got {init_flow_mask_epsilon}")
+
+    require_image_only_flow_approx_defaults(
+        model_name=model_name,
+        method=method,
+        splatting_fill_strategy=splatting_fill_strategy,
+        init_flow_downscale_strategy=init_flow_downscale_strategy,
+        init_flow_mask_epsilon=init_flow_mask_epsilon,
+    )
 
     if init_flow_downscale_strategy == "masked_area":
         if model_name != "IFRNet_Residual_FlowApprox":
