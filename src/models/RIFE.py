@@ -120,6 +120,12 @@ def _next_multiple(value: int, multiple: int) -> int:
     return ((value - 1) // multiple + 1) * multiple
 
 
+def _resolve_pad_multiple(scale_factor: float) -> int:
+    if scale_factor <= 0.0:
+        raise ValueError(f"RIFE scale_factor must be positive, got {scale_factor}")
+    return max(PAD_MULTIPLE, int(PAD_MULTIPLE / scale_factor))
+
+
 def _pad_to_size(image: torch.Tensor, height: int, width: int) -> torch.Tensor:
     image_height = int(image.shape[-2])
     image_width = int(image.shape[-1])
@@ -198,8 +204,9 @@ class Model(nn.Module):
         timestep = extract_scalar_timestep(embt=embt)
         height = int(img0.shape[-2])
         width = int(img0.shape[-1])
-        padded_height = _next_multiple(value=height, multiple=PAD_MULTIPLE)
-        padded_width = _next_multiple(value=width, multiple=PAD_MULTIPLE)
+        pad_multiple = _resolve_pad_multiple(scale_factor=scale_factor)
+        padded_height = _next_multiple(value=height, multiple=pad_multiple)
+        padded_width = _next_multiple(value=width, multiple=pad_multiple)
         padded_img0 = _pad_to_size(image=img0, height=padded_height, width=padded_width)
         padded_img1 = _pad_to_size(image=img1, height=padded_height, width=padded_width)
         imgs = torch.cat((padded_img0, padded_img1), dim=1)

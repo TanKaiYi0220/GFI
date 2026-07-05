@@ -79,7 +79,6 @@ def validate_image_only_video_config(
     export_grid: bool,
     export_all: bool,
     single_files: list[str],
-    export_vfi60: bool,
 ) -> None:
     if not uses_image_only_vfi_model(model_name=model_name):
         return
@@ -285,7 +284,6 @@ def main(argv: list[str] | None = None) -> None:
         export_grid=export_grid,
         export_all=export_all,
         single_files=single_files,
-        export_vfi60=export_vfi60,
     )
 
     root_dir = run_config.root_dir
