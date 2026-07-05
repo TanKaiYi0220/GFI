@@ -124,3 +124,13 @@ def load_inference_state_dict(checkpoint_path: Path, device: Any) -> Any:
         "checkpoint_path must point to either a raw model state_dict or a full training checkpoint "
         f"containing a 'model' key: path={checkpoint_path}, keys={available_keys}"
     )
+
+
+def load_inference_checkpoint(model: Any, checkpoint_path: Path, device: Any) -> None:
+    external_loader = getattr(model, "load_external_checkpoint", None)
+    if callable(external_loader):
+        external_loader(checkpoint_path=checkpoint_path, device=device)
+        return
+
+    state_dict = load_inference_state_dict(checkpoint_path=checkpoint_path, device=device)
+    model.load_state_dict(state_dict)

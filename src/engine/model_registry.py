@@ -5,12 +5,21 @@ from typing import Any
 BASELINE_MODEL_NAME: str = "IFRNet"
 RESIDUAL_MODEL_NAME: str = "IFRNet_Residual"
 RESIDUAL_FLOW_APPROX_MODEL_NAME: str = "IFRNet_Residual_FlowApprox"
-MODEL_NAMES: tuple[str, ...] = (BASELINE_MODEL_NAME, RESIDUAL_MODEL_NAME, RESIDUAL_FLOW_APPROX_MODEL_NAME)
+RIFE_MODEL_NAME: str = "RIFE"
+
+TRAIN_MODEL_NAMES: tuple[str, ...] = (BASELINE_MODEL_NAME, RESIDUAL_MODEL_NAME, RESIDUAL_FLOW_APPROX_MODEL_NAME)
+INFERENCE_MODEL_NAMES: tuple[str, ...] = (*TRAIN_MODEL_NAMES, RIFE_MODEL_NAME)
+MODEL_NAMES: tuple[str, ...] = INFERENCE_MODEL_NAMES
 FLOW_APPROX_MODEL_NAMES: tuple[str, ...] = (RESIDUAL_FLOW_APPROX_MODEL_NAME,)
+IMAGE_ONLY_VFI_MODEL_NAMES: tuple[str, ...] = (RIFE_MODEL_NAME,)
 
 
 def uses_flow_approx_model(model_name: str) -> bool:
     return model_name in FLOW_APPROX_MODEL_NAMES
+
+
+def uses_image_only_vfi_model(model_name: str) -> bool:
+    return model_name in IMAGE_ONLY_VFI_MODEL_NAMES
 
 
 def resolve_model_class(model_name: str) -> type[Any]:
@@ -26,6 +35,10 @@ def resolve_model_class(model_name: str) -> type[Any]:
         from src.models.IFRNet_Residual import Model as IFRNetResidualModel
 
         return IFRNetResidualModel
+    if model_name == RIFE_MODEL_NAME:
+        from src.models.RIFE import Model as RIFEModel
+
+        return RIFEModel
 
     available_models = ", ".join(MODEL_NAMES)
     raise KeyError(f"Unknown model '{model_name}'. Available models: {available_models}")

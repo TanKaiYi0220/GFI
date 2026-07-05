@@ -36,9 +36,9 @@ from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
 from src.engine.flow_approx import SPLATTING_FILL_STRATEGIES
 from src.engine.interpolation_batch import run_training_sample_batch
 from src.engine.interpolation_batch import run_training_batch
-from src.engine.model_registry import MODEL_NAMES
 from src.engine.model_registry import resolve_model_class
 from src.engine.model_registry import set_model_convex_upsampling
+from src.engine.model_registry import TRAIN_MODEL_NAMES
 from src.engine.model_registry import uses_flow_approx_model
 from src.engine.run_config import build_train_dry_run_summary
 from src.engine.run_config import build_train_run_config
@@ -458,7 +458,7 @@ def build_train_arg_parser(config_defaults: dict[str, Any]) -> argparse.Argument
     parser = argparse.ArgumentParser(description="Train IFRNet variants on the VFI dataset.")
     parser.add_argument("--config", default=config_defaults.get("config"), type=str, help="Optional JSON-formatted YAML-compatible run config.")
     parser.add_argument("--mode", default=config_defaults.get("mode", "dry-run"), choices=["dry-run", "train"])
-    parser.add_argument("--model-name", default=config_defaults.get("model_name", "IFRNet"), choices=MODEL_NAMES)
+    parser.add_argument("--model-name", default=config_defaults.get("model_name", "IFRNet"), choices=TRAIN_MODEL_NAMES)
     parser.add_argument("--root-dir", default=config_defaults.get("root_dir", "./datasets/data"), help="Directory containing preprocessed CSV indexes.")
     parser.add_argument("--dataset-root-dir", default=config_defaults.get("dataset_root_dir"), type=str, help="Root directory containing frame and velocity assets.")
     parser.add_argument("--paths-config", default=config_defaults.get("paths_config"), type=str, help="Optional path to configs/paths/default.yaml.")

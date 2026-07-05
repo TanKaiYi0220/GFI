@@ -15,6 +15,7 @@ from src.engine.flow_approx import FLOW_APPROX_METHOD_CHOICES
 from src.engine.flow_approx import SPLATTING_FILL_STRATEGIES
 from src.engine.flow_approx import is_splatting_flow_approx_method
 from src.engine.flow_approx import resolve_splatting_fill_strategy
+from src.engine.model_registry import TRAIN_MODEL_NAMES
 from src.engine.model_registry import uses_flow_approx_model
 from src.utils.config import load_yaml_file
 
@@ -129,6 +130,17 @@ def read_optional_bool(config_values: dict[str, Any], key: str) -> bool | None:
     return parse_bool_value(config_values[key], key)
 
 
+def require_train_model_name(model_name: str) -> None:
+    if model_name in TRAIN_MODEL_NAMES:
+        return
+
+    available_models = ", ".join(TRAIN_MODEL_NAMES)
+    raise ValueError(
+        f"Training does not support model_name={model_name}. "
+        f"Available training models: {available_models}. RIFE is inference-only in this baseline slice."
+    )
+
+
 def build_flow_approx_config(model_name: str, config_values: dict[str, Any]) -> FlowApproxConfig:
     method = str(config_values.get("flow_approx_method", "combination"))
     if method not in FLOW_APPROX_METHOD_CHOICES:
@@ -199,6 +211,8 @@ def build_flow_approx_config(model_name: str, config_values: dict[str, Any]) -> 
 
 def build_train_run_config(args: argparse.Namespace, config_defaults: dict[str, Any]) -> TrainRunConfig:
     metric_config = read_metric_config(config_defaults)
+    model_name = str(args.model_name)
+    require_train_model_name(model_name=model_name)
     require_psnr_enabled(metric_config, "training")
     require_psnr_div_disabled(metric_config, "training")
     require_vfips_disabled(metric_config, "training")
@@ -210,7 +224,7 @@ def build_train_run_config(args: argparse.Namespace, config_defaults: dict[str, 
         else parse_bool_value(args.eval_convex_upsampling, "eval_convex_upsampling")
     )
     model_config = ModelRunConfig(
-        model_name=str(args.model_name),
+        model_name=model_name,
         model_init_args=model_init_args,
         eval_convex_upsampling=eval_convex_upsampling,
     )

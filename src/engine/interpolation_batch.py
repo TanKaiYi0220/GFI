@@ -9,6 +9,7 @@ from src.engine.flow_approx import is_splatting_flow_approx_method
 from src.engine.flow_approx import make_source_grid
 from src.engine.model_registry import BASELINE_MODEL_NAME
 from src.engine.model_registry import uses_flow_approx_model
+from src.engine.model_registry import uses_image_only_vfi_model
 from src.engine.run_config import FlowApproxConfig
 from src.engine.run_config import InferenceRunConfig
 from src.engine.run_config import TrainRunConfig
@@ -302,6 +303,35 @@ def _run_model_inference(
     flow_approx: FlowApproxConfig,
     scale_factor: float,
 ) -> InterpolationBatchResult:
+    if uses_image_only_vfi_model(model_name):
+        imgt_pred = model.inference(
+            batch_inputs.img0,
+            batch_inputs.img1,
+            batch_inputs.embt,
+            scale_factor,
+        )
+        return InterpolationBatchResult(
+            img0=batch_inputs.img0,
+            img1=batch_inputs.img1,
+            imgt=batch_inputs.imgt,
+            imgt_pred=imgt_pred,
+            embt=batch_inputs.embt,
+            info=batch_inputs.info,
+            bmv=None,
+            fmv=None,
+            init_bmv=None,
+            init_fmv=None,
+            init_masks=None,
+            up_flow0_1=None,
+            up_flow1_1=None,
+            up_mask_1=None,
+            imgt_merge=None,
+            loss_rec=None,
+            loss_geo=None,
+            loss_dis=None,
+            splatting_region_maps=None,
+        )
+
     if model_name == BASELINE_MODEL_NAME:
         imgt_pred, up_flow0_1, up_flow1_1, up_mask_1 = model.inference(
             batch_inputs.img0,
