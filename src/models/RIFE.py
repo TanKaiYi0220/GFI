@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -37,6 +37,25 @@ def _temporary_sys_path(path: Path) -> Iterator[None]:
             sys.path.remove(path_value)
 
 
+@contextmanager
+def _temporary_external_modules(prefixes: tuple[str, ...]) -> Iterator[None]:
+    previous_modules = {
+        module_name: module
+        for module_name, module in sys.modules.items()
+        if any(module_name == prefix or module_name.startswith(f"{prefix}.") for prefix in prefixes)
+    }
+    for module_name in previous_modules:
+        sys.modules.pop(module_name, None)
+
+    try:
+        yield
+    finally:
+        for module_name in list(sys.modules):
+            if any(module_name == prefix or module_name.startswith(f"{prefix}.") for prefix in prefixes):
+                sys.modules.pop(module_name, None)
+        sys.modules.update(previous_modules)
+
+
 def _resolve_project_path(path_value: str | Path) -> Path:
     path = Path(path_value)
     if path.is_absolute():
@@ -70,9 +89,21 @@ def _require_external_files(external_root: Path) -> None:
 
 def _load_ifnet_class(external_root: Path) -> type[nn.Module]:
     _require_external_files(external_root=external_root)
-    with _temporary_sys_path(path=external_root):
-        importlib.invalidate_caches()
-        module = importlib.import_module("train_log.IFNet_HDv3")
+    module_path = external_root / "train_log" / "IFNet_HDv3.py"
+    module_name = f"_gfi_rife_ifnet_{abs(hash(str(module_path.resolve())))}"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load train_log.IFNet_HDv3 from {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    with _temporary_sys_path(path=external_root), _temporary_external_modules(prefixes=("model", "train_log")):
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
+
     ifnet_class = getattr(module, "IFNet", None)
     if ifnet_class is None:
         raise ImportError(f"train_log.IFNet_HDv3 does not define IFNet: external_root={external_root}")
