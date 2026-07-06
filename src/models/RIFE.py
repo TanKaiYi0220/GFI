@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import importlib.util
 import sys
 from contextlib import contextmanager
@@ -254,6 +255,51 @@ def _scale_optional_loss(reference_loss: torch.Tensor, loss_value: Any | None, w
     return reference_loss.new_tensor(weight * float(loss_value))
 
 
+def _get_flownet_forward_parameter_names(flownet: nn.Module) -> tuple[str, ...]:
+    signature = inspect.signature(flownet.forward)
+    return tuple(signature.parameters)
+
+
+def _call_flownet_inference(
+    flownet: nn.Module,
+    imgs: torch.Tensor,
+    timestep: float,
+    scale_list: list[float],
+) -> Any:
+    parameter_names = _get_flownet_forward_parameter_names(flownet=flownet)
+    if "scale" in parameter_names:
+        if "timestep" in parameter_names:
+            return flownet(imgs, scale=scale_list, timestep=timestep)
+        return flownet(imgs, scale=scale_list)
+    if "scale_list" in parameter_names:
+        if "timestep" in parameter_names:
+            return flownet(imgs, scale_list=scale_list, timestep=timestep)
+        return flownet(imgs, scale_list=scale_list)
+    raise TypeError(f"Unsupported RIFE flownet forward signature: parameters={parameter_names}")
+
+
+def _call_flownet_training(
+    flownet: nn.Module,
+    imgs: torch.Tensor,
+    timestep: float,
+    scale_list: list[float],
+) -> Any:
+    parameter_names = _get_flownet_forward_parameter_names(flownet=flownet)
+    if "scale" in parameter_names:
+        if "timestep" in parameter_names:
+            return flownet(imgs, scale=scale_list, timestep=timestep)
+        if "training" in parameter_names:
+            return flownet(imgs, scale=scale_list, training=True)
+        return flownet(imgs, scale=scale_list)
+    if "scale_list" in parameter_names:
+        if "timestep" in parameter_names:
+            return flownet(imgs, scale_list=scale_list, timestep=timestep)
+        if "training" in parameter_names:
+            return flownet(imgs, scale_list=scale_list, training=True)
+        return flownet(imgs, scale_list=scale_list)
+    raise TypeError(f"Unsupported RIFE flownet forward signature: parameters={parameter_names}")
+
+
 def extract_scalar_timestep(embt: torch.Tensor) -> float:
     if not torch.is_tensor(embt):
         raise TypeError(f"RIFE embt must be a torch.Tensor, got {type(embt).__name__}")
@@ -358,7 +404,12 @@ class Model(nn.Module):
     def _run_flownet_inference(self, img0: torch.Tensor, img1: torch.Tensor, timestep: float, scale_factor: float) -> Any:
         imgs = torch.cat((img0, img1), dim=1)
         scale_list = [8.0 / scale_factor, 4.0 / scale_factor, 2.0 / scale_factor, 1.0 / scale_factor]
-        return self.flownet(imgs, timestep, scale_list)
+        return _call_flownet_inference(
+            flownet=self.flownet,
+            imgs=imgs,
+            timestep=timestep,
+            scale_list=scale_list,
+        )
 
     def _run_flownet_training(
         self,
@@ -370,7 +421,12 @@ class Model(nn.Module):
     ) -> Any:
         imgs = torch.cat((img0, img1, imgt), dim=1)
         scale_list = [8.0 / scale_factor, 4.0 / scale_factor, 2.0 / scale_factor, 1.0 / scale_factor]
-        return self.flownet(imgs, timestep, scale_list)
+        return _call_flownet_training(
+            flownet=self.flownet,
+            imgs=imgs,
+            timestep=timestep,
+            scale_list=scale_list,
+        )
 
     def inference(self, img0: Any, img1: Any, embt: Any, scale_factor: float) -> Any:
         if not self._checkpoint_loaded:
@@ -418,12 +474,13 @@ class Model(nn.Module):
         padded_prediction, padded_teacher_prediction, loss_distill = _extract_prediction_teacher_and_distillation_loss(
             output=output
         )
-        if padded_teacher_prediction is None:
-            raise RuntimeError("RIFE training forward expected merged_teacher from the official flownet output.")
         imgt_pred = padded_prediction[:, :, :height, :width].clamp(0.0, 1.0)
-        teacher_prediction = padded_teacher_prediction[:, :, :height, :width].clamp(0.0, 1.0)
         loss_l1 = self.reconstruction_loss(imgt_pred, imgt)
-        loss_tea = self.reconstruction_loss(teacher_prediction, imgt)
+        if padded_teacher_prediction is None:
+            loss_tea = loss_l1.new_zeros(())
+        else:
+            teacher_prediction = padded_teacher_prediction[:, :, :height, :width].clamp(0.0, 1.0)
+            loss_tea = self.reconstruction_loss(teacher_prediction, imgt)
         loss_rec = loss_l1 + loss_tea
         loss_geo = loss_rec.new_zeros(())
         loss_dis = _scale_optional_loss(
