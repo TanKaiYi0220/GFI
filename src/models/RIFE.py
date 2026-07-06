@@ -289,6 +289,7 @@ def _call_flownet_training(
     imgs: torch.Tensor,
     timestep: float,
     scale_list: list[float],
+    use_forward_training_branch: bool,
 ) -> Any:
     parameter_names = _get_flownet_forward_parameter_names(flownet=flownet)
     if "scale" in parameter_names:
@@ -296,14 +297,14 @@ def _call_flownet_training(
         if "timestep" in parameter_names:
             kwargs["timestep"] = timestep
         if "training" in parameter_names:
-            kwargs["training"] = True
+            kwargs["training"] = use_forward_training_branch
         return flownet(imgs, **kwargs)
     if "scale_list" in parameter_names:
         kwargs = {"scale_list": scale_list}
         if "timestep" in parameter_names:
             kwargs["timestep"] = timestep
         if "training" in parameter_names:
-            kwargs["training"] = True
+            kwargs["training"] = use_forward_training_branch
         return flownet(imgs, **kwargs)
     raise TypeError(f"Unsupported RIFE flownet forward signature: parameters={parameter_names}")
 
@@ -427,13 +428,19 @@ class Model(nn.Module):
         timestep: float,
         scale_factor: float,
     ) -> Any:
-        imgs = torch.cat((img0, img1, imgt), dim=1)
+        parameter_names = _get_flownet_forward_parameter_names(flownet=self.flownet)
+        use_forward_training_branch = "training" not in parameter_names
+        if use_forward_training_branch:
+            imgs = torch.cat((img0, img1, imgt), dim=1)
+        else:
+            imgs = torch.cat((img0, img1), dim=1)
         scale_list = [8.0 / scale_factor, 4.0 / scale_factor, 2.0 / scale_factor, 1.0 / scale_factor]
         return _call_flownet_training(
             flownet=self.flownet,
             imgs=imgs,
             timestep=timestep,
             scale_list=scale_list,
+            use_forward_training_branch=use_forward_training_branch,
         )
 
     def inference(self, img0: Any, img1: Any, embt: Any, scale_factor: float) -> Any:
