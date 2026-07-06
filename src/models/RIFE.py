@@ -14,7 +14,6 @@ from torch.nn import functional as F
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
 REQUIRED_EXTERNAL_FILES: tuple[Path, ...] = (
     Path("model/warplayer.py"),
-    Path("model/laplacian.py"),
     Path("train_log/IFNet_HDv3.py"),
     Path("train_log/RIFE_HDv3.py"),
 )
@@ -114,29 +113,6 @@ def _load_ifnet_class(external_root: Path) -> type[nn.Module]:
     return ifnet_class
 
 
-def _load_lap_loss_class(external_root: Path) -> type[nn.Module]:
-    _require_external_files(external_root=external_root)
-    module_path = external_root / "model" / "laplacian.py"
-    module_name = f"_gfi_rife_laplacian_{abs(hash(str(module_path.resolve())))}"
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load model.laplacian from {module_path}")
-
-    module = importlib.util.module_from_spec(spec)
-    with _temporary_sys_path(path=external_root), _temporary_external_modules(prefixes=("model", "train_log")):
-        sys.modules[module_name] = module
-        try:
-            spec.loader.exec_module(module)
-        except Exception:
-            sys.modules.pop(module_name, None)
-            raise
-
-    lap_loss_class = getattr(module, "LapLoss", None)
-    if lap_loss_class is None:
-        raise ImportError(f"model.laplacian does not define LapLoss: external_root={external_root}")
-    return lap_loss_class
-
-
 def _convert_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
     return {key.replace("module.", ""): value for key, value in state_dict.items()}
 
@@ -166,6 +142,81 @@ def _pad_to_size(image: torch.Tensor, height: int, width: int) -> torch.Tensor:
     if padding == (0, 0, 0, 0):
         return image
     return F.pad(image, padding)
+
+
+def _build_laplacian_kernel(channels: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    kernel_values = [
+        [1.0, 4.0, 6.0, 4.0, 1.0],
+        [4.0, 16.0, 24.0, 16.0, 4.0],
+        [6.0, 24.0, 36.0, 24.0, 6.0],
+        [4.0, 16.0, 24.0, 16.0, 4.0],
+        [1.0, 4.0, 6.0, 4.0, 1.0],
+    ]
+    kernel = torch.tensor(kernel_values, device=device, dtype=dtype) / 256.0
+    return kernel.reshape(1, 1, 5, 5).repeat(channels, 1, 1, 1)
+
+
+def _laplacian_downsample(image: torch.Tensor) -> torch.Tensor:
+    return image[:, :, ::2, ::2]
+
+
+def _laplacian_upsample(image: torch.Tensor) -> torch.Tensor:
+    zeros = torch.zeros_like(image)
+    width_expanded = torch.stack((image, zeros), dim=-1).flatten(start_dim=-2)
+    height_expanded = torch.stack(
+        (width_expanded, torch.zeros_like(width_expanded)),
+        dim=-2,
+    ).flatten(start_dim=-3, end_dim=-2)
+    kernel = 4.0 * _build_laplacian_kernel(
+        channels=int(image.shape[1]),
+        device=image.device,
+        dtype=image.dtype,
+    )
+    return F.conv2d(F.pad(height_expanded, (2, 2, 2, 2), mode="reflect"), kernel, groups=int(image.shape[1]))
+
+
+def _laplacian_pyramid(image: torch.Tensor, max_levels: int) -> list[torch.Tensor]:
+    current = image
+    pyramid = []
+    kernel = _build_laplacian_kernel(
+        channels=int(image.shape[1]),
+        device=image.device,
+        dtype=image.dtype,
+    )
+    for _level in range(max_levels):
+        filtered = F.conv2d(F.pad(current, (2, 2, 2, 2), mode="reflect"), kernel, groups=int(image.shape[1]))
+        downsampled = _laplacian_downsample(image=filtered)
+        upsampled = _laplacian_upsample(image=downsampled)
+        upsampled = upsampled[:, :, : current.shape[-2], : current.shape[-1]]
+        pyramid.append(current - upsampled)
+        current = downsampled
+    return pyramid
+
+
+class LapLoss(nn.Module):
+    def __init__(self, max_levels: int, channels: int) -> None:
+        super().__init__()
+        self.max_levels: int = max_levels
+        self.channels: int = channels
+
+    def forward(self, input_image: torch.Tensor, target_image: torch.Tensor) -> torch.Tensor:
+        if input_image.shape != target_image.shape:
+            raise ValueError(
+                "LapLoss input and target shapes must match, "
+                f"got input_shape={tuple(input_image.shape)} target_shape={tuple(target_image.shape)}"
+            )
+        if int(input_image.shape[1]) != self.channels:
+            raise ValueError(
+                "LapLoss channel count mismatch, "
+                f"expected={self.channels} actual={int(input_image.shape[1])}"
+            )
+
+        input_pyramid = _laplacian_pyramid(image=input_image, max_levels=self.max_levels)
+        target_pyramid = _laplacian_pyramid(image=target_image, max_levels=self.max_levels)
+        loss = input_image.new_zeros(())
+        for input_level, target_level in zip(input_pyramid, target_pyramid):
+            loss = loss + F.l1_loss(input_level, target_level)
+        return loss
 
 
 def _select_merged_prediction(merged: Any) -> torch.Tensor:
@@ -228,8 +279,7 @@ class Model(nn.Module):
         self.external_root: Path = _resolve_project_path(path_value=external_root)
         ifnet_class = _load_ifnet_class(external_root=self.external_root)
         self.flownet: nn.Module = ifnet_class()
-        lap_loss_class = _load_lap_loss_class(external_root=self.external_root)
-        self.reconstruction_loss: nn.Module = lap_loss_class()
+        self.reconstruction_loss: nn.Module = LapLoss(max_levels=5, channels=3)
         self._checkpoint_loaded: bool = False
 
     def load_state_dict(self, state_dict: Any, strict: bool = True) -> Any:
