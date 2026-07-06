@@ -14,6 +14,7 @@ from torch.nn import functional as F
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
 REQUIRED_EXTERNAL_FILES: tuple[Path, ...] = (
     Path("model/warplayer.py"),
+    Path("model/laplacian.py"),
     Path("train_log/IFNet_HDv3.py"),
     Path("train_log/RIFE_HDv3.py"),
 )
@@ -113,6 +114,29 @@ def _load_ifnet_class(external_root: Path) -> type[nn.Module]:
     return ifnet_class
 
 
+def _load_lap_loss_class(external_root: Path) -> type[nn.Module]:
+    _require_external_files(external_root=external_root)
+    module_path = external_root / "model" / "laplacian.py"
+    module_name = f"_gfi_rife_laplacian_{abs(hash(str(module_path.resolve())))}"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load model.laplacian from {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    with _temporary_sys_path(path=external_root), _temporary_external_modules(prefixes=("model", "train_log")):
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
+
+    lap_loss_class = getattr(module, "LapLoss", None)
+    if lap_loss_class is None:
+        raise ImportError(f"model.laplacian does not define LapLoss: external_root={external_root}")
+    return lap_loss_class
+
+
 def _convert_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
     return {key.replace("module.", ""): value for key, value in state_dict.items()}
 
@@ -154,16 +178,29 @@ def _select_merged_prediction(merged: Any) -> torch.Tensor:
     return merged[-1]
 
 
-def _extract_prediction_and_distillation_loss(output: Any) -> tuple[torch.Tensor, Any | None]:
+def _extract_prediction_teacher_and_distillation_loss(output: Any) -> tuple[torch.Tensor, torch.Tensor | None, Any | None]:
     if not isinstance(output, (list, tuple)):
         raise TypeError(f"RIFE flownet output must be a tuple or list, got {type(output).__name__}")
     if len(output) == 3:
         _flow, _mask, merged = output
-        return _select_merged_prediction(merged=merged), None
+        return _select_merged_prediction(merged=merged), None, None
     if len(output) == 6:
-        _flow, _mask, merged, _flow_teacher, _merged_teacher, loss_distill = output
-        return _select_merged_prediction(merged=merged), loss_distill
+        _flow, _mask, merged, _flow_teacher, merged_teacher, loss_distill = output
+        if merged_teacher is not None and not torch.is_tensor(merged_teacher):
+            raise TypeError(
+                "RIFE flownet merged_teacher output must be a torch.Tensor or None, "
+                f"got {type(merged_teacher).__name__}"
+            )
+        return _select_merged_prediction(merged=merged), merged_teacher, loss_distill
     raise RuntimeError(f"Unsupported RIFE flownet output length={len(output)}.")
+
+
+def _scale_optional_loss(reference_loss: torch.Tensor, loss_value: Any | None, weight: float) -> torch.Tensor:
+    if loss_value is None:
+        return reference_loss.new_zeros(())
+    if torch.is_tensor(loss_value):
+        return weight * loss_value
+    return reference_loss.new_tensor(weight * float(loss_value))
 
 
 def extract_scalar_timestep(embt: torch.Tensor) -> float:
@@ -191,6 +228,8 @@ class Model(nn.Module):
         self.external_root: Path = _resolve_project_path(path_value=external_root)
         ifnet_class = _load_ifnet_class(external_root=self.external_root)
         self.flownet: nn.Module = ifnet_class()
+        lap_loss_class = _load_lap_loss_class(external_root=self.external_root)
+        self.reconstruction_loss: nn.Module = lap_loss_class()
         self._checkpoint_loaded: bool = False
 
     def load_state_dict(self, state_dict: Any, strict: bool = True) -> Any:
@@ -261,13 +300,25 @@ class Model(nn.Module):
         except RuntimeError as error:
             raise RuntimeError(
                 "RIFE checkpoint is incompatible with train_log.IFNet_HDv3.IFNet. "
-                f"checkpoint_path={flownet_path}"
+                f"checkpoint_path={checkpoint_path}"
             ) from error
         self.flownet.to(device)
         self._checkpoint_loaded = True
 
-    def _run_flownet(self, img0: torch.Tensor, img1: torch.Tensor, timestep: float, scale_factor: float) -> Any:
+    def _run_flownet_inference(self, img0: torch.Tensor, img1: torch.Tensor, timestep: float, scale_factor: float) -> Any:
         imgs = torch.cat((img0, img1), dim=1)
+        scale_list = [8.0 / scale_factor, 4.0 / scale_factor, 2.0 / scale_factor, 1.0 / scale_factor]
+        return self.flownet(imgs, timestep, scale_list)
+
+    def _run_flownet_training(
+        self,
+        img0: torch.Tensor,
+        img1: torch.Tensor,
+        imgt: torch.Tensor,
+        timestep: float,
+        scale_factor: float,
+    ) -> Any:
+        imgs = torch.cat((img0, img1, imgt), dim=1)
         scale_list = [8.0 / scale_factor, 4.0 / scale_factor, 2.0 / scale_factor, 1.0 / scale_factor]
         return self.flownet(imgs, timestep, scale_list)
 
@@ -284,13 +335,13 @@ class Model(nn.Module):
         padded_width = _next_multiple(value=width, multiple=pad_multiple)
         padded_img0 = _pad_to_size(image=img0, height=padded_height, width=padded_width)
         padded_img1 = _pad_to_size(image=img1, height=padded_height, width=padded_width)
-        output = self._run_flownet(
+        output = self._run_flownet_inference(
             img0=padded_img0,
             img1=padded_img1,
             timestep=timestep,
             scale_factor=scale_factor,
         )
-        prediction, _loss_distill = _extract_prediction_and_distillation_loss(output=output)
+        prediction, _teacher_prediction, _loss_distill = _extract_prediction_teacher_and_distillation_loss(output=output)
         return prediction[:, :, :height, :width].clamp(0.0, 1.0)
 
     def forward(self, img0: Any, img1: Any, embt: Any, imgt: Any) -> Any:
@@ -306,20 +357,30 @@ class Model(nn.Module):
         padded_width = _next_multiple(value=width, multiple=PAD_MULTIPLE)
         padded_img0 = _pad_to_size(image=img0, height=padded_height, width=padded_width)
         padded_img1 = _pad_to_size(image=img1, height=padded_height, width=padded_width)
-        output = self._run_flownet(
+        padded_imgt = _pad_to_size(image=imgt, height=padded_height, width=padded_width)
+        output = self._run_flownet_training(
             img0=padded_img0,
             img1=padded_img1,
+            imgt=padded_imgt,
             timestep=timestep,
             scale_factor=1.0,
         )
-        padded_prediction, loss_distill = _extract_prediction_and_distillation_loss(output=output)
+        padded_prediction, padded_teacher_prediction, loss_distill = _extract_prediction_teacher_and_distillation_loss(
+            output=output
+        )
+        if padded_teacher_prediction is None:
+            raise RuntimeError("RIFE training forward expected merged_teacher from the official flownet output.")
         imgt_pred = padded_prediction[:, :, :height, :width].clamp(0.0, 1.0)
-        loss_rec = F.l1_loss(imgt_pred, imgt)
+        teacher_prediction = padded_teacher_prediction[:, :, :height, :width].clamp(0.0, 1.0)
+        loss_l1 = self.reconstruction_loss(imgt_pred, imgt)
+        loss_tea = self.reconstruction_loss(teacher_prediction, imgt)
+        loss_rec = loss_l1 + loss_tea
         loss_geo = loss_rec.new_zeros(())
-        if loss_distill is None:
-            loss_dis = loss_rec.new_zeros(())
-        else:
-            loss_dis = DISTILLATION_LOSS_WEIGHT * loss_distill
+        loss_dis = _scale_optional_loss(
+            reference_loss=loss_rec,
+            loss_value=loss_distill,
+            weight=DISTILLATION_LOSS_WEIGHT,
+        )
         return imgt_pred, loss_rec, loss_geo, loss_dis, None, None, None
 
 
