@@ -19,6 +19,7 @@ REQUIRED_EXTERNAL_FILES: tuple[Path, ...] = (
 )
 CHECKPOINT_FILENAME: str = "flownet.pkl"
 PAD_MULTIPLE: int = 32
+DISTILLATION_LOSS_WEIGHT: float = 0.01
 
 
 class RIFEExternalFilesError(RuntimeError):
@@ -116,6 +117,14 @@ def _convert_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
     return {key.replace("module.", ""): value for key, value in state_dict.items()}
 
 
+def _convert_wrapper_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
+    return {key.replace("module.", "", 1): value for key, value in state_dict.items()}
+
+
+def _uses_wrapper_state_dict_keys(state_dict: dict[str, Any]) -> bool:
+    return any(key.replace("module.", "", 1).startswith("flownet.") for key in state_dict)
+
+
 def _next_multiple(value: int, multiple: int) -> int:
     return ((value - 1) // multiple + 1) * multiple
 
@@ -133,6 +142,28 @@ def _pad_to_size(image: torch.Tensor, height: int, width: int) -> torch.Tensor:
     if padding == (0, 0, 0, 0):
         return image
     return F.pad(image, padding)
+
+
+def _select_merged_prediction(merged: Any) -> torch.Tensor:
+    if not isinstance(merged, (list, tuple)):
+        raise TypeError(f"RIFE flownet merged output must be a list or tuple, got {type(merged).__name__}")
+    if len(merged) == 0:
+        raise ValueError("RIFE flownet merged output must contain at least one prediction.")
+    if len(merged) > 3:
+        return merged[3]
+    return merged[-1]
+
+
+def _extract_prediction_and_distillation_loss(output: Any) -> tuple[torch.Tensor, Any | None]:
+    if not isinstance(output, (list, tuple)):
+        raise TypeError(f"RIFE flownet output must be a tuple or list, got {type(output).__name__}")
+    if len(output) == 3:
+        _flow, _mask, merged = output
+        return _select_merged_prediction(merged=merged), None
+    if len(output) == 6:
+        _flow, _mask, merged, _flow_teacher, _merged_teacher, loss_distill = output
+        return _select_merged_prediction(merged=merged), loss_distill
+    raise RuntimeError(f"Unsupported RIFE flownet output length={len(output)}.")
 
 
 def extract_scalar_timestep(embt: torch.Tensor) -> float:
@@ -162,26 +193,65 @@ class Model(nn.Module):
         self.flownet: nn.Module = ifnet_class()
         self._checkpoint_loaded: bool = False
 
+    def load_state_dict(self, state_dict: Any, strict: bool = True) -> Any:
+        result = super().load_state_dict(state_dict, strict=strict)
+        self._checkpoint_loaded = True
+        return result
+
     def load_external_checkpoint(self, checkpoint_path: Path, device: Any) -> None:
         if not checkpoint_path.exists():
-            raise FileNotFoundError(
-                "RIFE checkpoint directory is missing. "
-                f"Expected directory containing {CHECKPOINT_FILENAME}: path={checkpoint_path}"
-            )
-        if not checkpoint_path.is_dir():
-            raise NotADirectoryError(
-                "RIFE checkpoint_path must be a directory containing flownet.pkl, "
-                f"got path={checkpoint_path}"
-            )
+            raise FileNotFoundError(f"RIFE checkpoint path is missing: path={checkpoint_path}")
+        if checkpoint_path.is_dir():
+            flownet_path = checkpoint_path / CHECKPOINT_FILENAME
+            if not flownet_path.is_file():
+                raise FileNotFoundError(
+                    "RIFE checkpoint file is missing. "
+                    f"Expected official checkpoint at {flownet_path}"
+                )
+            state_dict = torch.load(str(flownet_path), map_location=device)
+            self._load_flownet_state_dict(state_dict=state_dict, checkpoint_path=flownet_path, device=device)
+            return
 
-        flownet_path = checkpoint_path / CHECKPOINT_FILENAME
-        if not flownet_path.is_file():
-            raise FileNotFoundError(
-                "RIFE checkpoint file is missing. "
-                f"Expected official checkpoint at {flownet_path}"
-            )
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"RIFE checkpoint_path must be a file or directory, got path={checkpoint_path}")
 
-        state_dict = torch.load(str(flownet_path), map_location=device)
+        checkpoint = torch.load(str(checkpoint_path), map_location=device)
+        if isinstance(checkpoint, dict) and "model" in checkpoint:
+            if not isinstance(checkpoint["model"], dict):
+                raise TypeError(
+                    "RIFE repo-native checkpoint 'model' value must be a state_dict mapping, "
+                    f"got {type(checkpoint['model']).__name__}: checkpoint_path={checkpoint_path}"
+                )
+            wrapper_state_dict = _convert_wrapper_state_dict_keys(state_dict=checkpoint["model"])
+            try:
+                self.load_state_dict(wrapper_state_dict, strict=True)
+            except RuntimeError as error:
+                raise RuntimeError(
+                    "RIFE repo-native checkpoint is incompatible with src.models.RIFE.Model. "
+                    f"checkpoint_path={checkpoint_path}"
+                ) from error
+            self.to(device)
+            self._checkpoint_loaded = True
+            return
+
+        if not isinstance(checkpoint, dict):
+            raise TypeError(f"RIFE checkpoint must be a state_dict mapping, got {type(checkpoint).__name__}")
+        if _uses_wrapper_state_dict_keys(state_dict=checkpoint):
+            wrapper_state_dict = _convert_wrapper_state_dict_keys(state_dict=checkpoint)
+            try:
+                self.load_state_dict(wrapper_state_dict, strict=True)
+            except RuntimeError as error:
+                raise RuntimeError(
+                    "RIFE wrapper state_dict is incompatible with src.models.RIFE.Model. "
+                    f"checkpoint_path={checkpoint_path}"
+                ) from error
+            self.to(device)
+            self._checkpoint_loaded = True
+            return
+
+        self._load_flownet_state_dict(state_dict=checkpoint, checkpoint_path=checkpoint_path, device=device)
+
+    def _load_flownet_state_dict(self, state_dict: Any, checkpoint_path: Path, device: Any) -> None:
         if not isinstance(state_dict, dict):
             raise TypeError(f"RIFE flownet checkpoint must be a state_dict mapping, got {type(state_dict).__name__}")
 
@@ -196,6 +266,11 @@ class Model(nn.Module):
         self.flownet.to(device)
         self._checkpoint_loaded = True
 
+    def _run_flownet(self, img0: torch.Tensor, img1: torch.Tensor, timestep: float, scale_factor: float) -> Any:
+        imgs = torch.cat((img0, img1), dim=1)
+        scale_list = [8.0 / scale_factor, 4.0 / scale_factor, 2.0 / scale_factor, 1.0 / scale_factor]
+        return self.flownet(imgs, timestep, scale_list)
+
     def inference(self, img0: Any, img1: Any, embt: Any, scale_factor: float) -> Any:
         if not self._checkpoint_loaded:
             raise RuntimeError("RIFE checkpoint is not loaded. Call load_external_checkpoint before inference.")
@@ -209,10 +284,43 @@ class Model(nn.Module):
         padded_width = _next_multiple(value=width, multiple=pad_multiple)
         padded_img0 = _pad_to_size(image=img0, height=padded_height, width=padded_width)
         padded_img1 = _pad_to_size(image=img1, height=padded_height, width=padded_width)
-        imgs = torch.cat((padded_img0, padded_img1), dim=1)
-        scale_list = [8.0 / scale_factor, 4.0 / scale_factor, 2.0 / scale_factor, 1.0 / scale_factor]
-        _flow, _mask, merged = self.flownet(imgs, timestep, scale_list)
-        return merged[3][:, :, :height, :width].clamp(0.0, 1.0)
+        output = self._run_flownet(
+            img0=padded_img0,
+            img1=padded_img1,
+            timestep=timestep,
+            scale_factor=scale_factor,
+        )
+        prediction, _loss_distill = _extract_prediction_and_distillation_loss(output=output)
+        return prediction[:, :, :height, :width].clamp(0.0, 1.0)
+
+    def forward(self, img0: Any, img1: Any, embt: Any, imgt: Any) -> Any:
+        if img0.shape[-2:] != img1.shape[-2:] or img0.shape[-2:] != imgt.shape[-2:]:
+            raise ValueError(
+                "RIFE training frames must share spatial shape, "
+                f"got img0={img0.shape} img1={img1.shape} imgt={imgt.shape}"
+            )
+        timestep = extract_scalar_timestep(embt=embt)
+        height = int(img0.shape[-2])
+        width = int(img0.shape[-1])
+        padded_height = _next_multiple(value=height, multiple=PAD_MULTIPLE)
+        padded_width = _next_multiple(value=width, multiple=PAD_MULTIPLE)
+        padded_img0 = _pad_to_size(image=img0, height=padded_height, width=padded_width)
+        padded_img1 = _pad_to_size(image=img1, height=padded_height, width=padded_width)
+        output = self._run_flownet(
+            img0=padded_img0,
+            img1=padded_img1,
+            timestep=timestep,
+            scale_factor=1.0,
+        )
+        padded_prediction, loss_distill = _extract_prediction_and_distillation_loss(output=output)
+        imgt_pred = padded_prediction[:, :, :height, :width].clamp(0.0, 1.0)
+        loss_rec = F.l1_loss(imgt_pred, imgt)
+        loss_geo = loss_rec.new_zeros(())
+        if loss_distill is None:
+            loss_dis = loss_rec.new_zeros(())
+        else:
+            loss_dis = DISTILLATION_LOSS_WEIGHT * loss_distill
+        return imgt_pred, loss_rec, loss_geo, loss_dis, None, None, None
 
 
 __all__ = ["Model", "RIFEExternalFilesError", "extract_scalar_timestep"]

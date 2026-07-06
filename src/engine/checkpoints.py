@@ -86,6 +86,16 @@ def load_training_state(
     if pretrained_checkpoint_path is not None:
         pretrained_path = Path(pretrained_checkpoint_path)
         logger.info("Loading pretrained checkpoint from %s", pretrained_path)
+        external_loader = getattr(model, "load_external_checkpoint", None)
+        if callable(external_loader):
+            external_loader(checkpoint_path=pretrained_path, device=device)
+            return TrainingState(
+                start_epoch=0,
+                global_step=0,
+                best_psnr=0.0,
+                mode="pretrained",
+            )
+
         checkpoint = torch.load(str(pretrained_path), map_location=device)
         model.load_state_dict(
             extract_pretrained_state_dict(

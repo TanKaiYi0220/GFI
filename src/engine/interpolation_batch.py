@@ -161,6 +161,16 @@ def _run_model_forward(
 ) -> tuple[Any, _InitFlowState]:
     import torch
 
+    if uses_image_only_vfi_model(model_name):
+        init_flow = _InitFlowState(
+            init_bmv=None,
+            init_fmv=None,
+            init_masks=None,
+            init_bmv_mask=None,
+            init_fmv_mask=None,
+        )
+        return model(img0, img1, embt, imgt), init_flow
+
     init_flow = _build_init_flow(
         model_name=model_name,
         source_bmv=source_bmv,
@@ -442,7 +452,8 @@ def run_training_batch(
         ground_truth_fmv=batch_inputs.fmv,
     )
     imgt_pred, loss_rec, loss_geo, loss_dis, up_flow0_1, up_flow1_1, up_mask_1 = model_output
-    if model_name == BASELINE_MODEL_NAME:
+    image_only_model = uses_image_only_vfi_model(model_name)
+    if model_name == BASELINE_MODEL_NAME or image_only_model:
         init_bmv = None
         init_fmv = None
         init_masks = None
@@ -477,8 +488,8 @@ def run_training_batch(
         imgt_pred=imgt_pred,
         embt=batch_inputs.embt,
         info=batch_inputs.info,
-        bmv=batch_inputs.bmv,
-        fmv=batch_inputs.fmv,
+        bmv=None if image_only_model else batch_inputs.bmv,
+        fmv=None if image_only_model else batch_inputs.fmv,
         init_bmv=init_bmv,
         init_fmv=init_fmv,
         init_masks=init_masks,
