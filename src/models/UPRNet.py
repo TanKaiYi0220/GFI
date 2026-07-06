@@ -139,6 +139,14 @@ def _convert_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
     return {key.replace("module.", "", 1): value for key, value in state_dict.items()}
 
 
+def _convert_wrapper_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
+    return {key.replace("module.", "", 1): value for key, value in state_dict.items()}
+
+
+def _uses_wrapper_state_dict_keys(state_dict: dict[str, Any]) -> bool:
+    return any(key.replace("module.", "", 1).startswith("official_model.") for key in state_dict)
+
+
 def extract_scalar_timestep(embt: torch.Tensor) -> float:
     if not torch.is_tensor(embt):
         raise TypeError(f"UPR-Net embt must be a torch.Tensor, got {type(embt).__name__}")
@@ -178,6 +186,15 @@ def _load_strict_model_state(model: nn.Module, checkpoint: dict[str, Any], check
     model.load_state_dict(converted_checkpoint, strict=True)
 
 
+def _build_model_config(model_size: str, pyr_level: int, nr_lvl_skipped: int) -> dict[str, Any]:
+    return {
+        "load_pretrain": False,
+        "model_size": model_size,
+        "pyr_level": pyr_level,
+        "nr_lvl_skipped": nr_lvl_skipped,
+    }
+
+
 class Model(nn.Module):
     def __init__(self, external_root: str, model_size: str, pyr_level: int, nr_lvl_skipped: int) -> None:
         super().__init__()
@@ -191,14 +208,15 @@ class Model(nn.Module):
         self.model_size: str = model_size
         self.pyr_level: int = pyr_level
         self.nr_lvl_skipped: int = nr_lvl_skipped
-        self.pipeline: Any | None = None
+        pipeline_class = _load_pipeline_class(external_root=self.external_root)
+        self.pipeline: Any = pipeline_class(_build_model_config(model_size, pyr_level, nr_lvl_skipped))
+        self.official_model: nn.Module = self.pipeline.model
         self._checkpoint_loaded: bool = False
 
-    def eval(self) -> Model:
-        super().eval()
-        if self.pipeline is not None:
-            self.pipeline.eval()
-        return self
+    def load_state_dict(self, state_dict: Any, strict: bool = True) -> Any:
+        result = super().load_state_dict(state_dict, strict=strict)
+        self._checkpoint_loaded = True
+        return result
 
     def load_external_checkpoint(self, checkpoint_path: Path, device: Any) -> None:
         if not checkpoint_path.exists():
@@ -206,26 +224,59 @@ class Model(nn.Module):
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"UPR-Net checkpoint_path must be a .pkl file, got path={checkpoint_path}")
 
-        pipeline_class = _load_pipeline_class(external_root=self.external_root)
-        model_config = {
-            "load_pretrain": False,
-            "model_size": self.model_size,
-            "pyr_level": self.pyr_level,
-            "nr_lvl_skipped": self.nr_lvl_skipped,
-        }
-        pipeline = pipeline_class(model_config)
         checkpoint = torch.load(str(checkpoint_path), map_location=device)
+        if isinstance(checkpoint, dict) and "model" in checkpoint:
+            if not isinstance(checkpoint["model"], dict):
+                raise TypeError(
+                    "UPR-Net repo-native checkpoint 'model' value must be a state_dict mapping, "
+                    f"got {type(checkpoint['model']).__name__}: checkpoint_path={checkpoint_path}"
+                )
+            self._load_wrapper_state_dict(
+                state_dict=checkpoint["model"],
+                checkpoint_path=checkpoint_path,
+                device=device,
+                checkpoint_kind="repo-native checkpoint",
+            )
+            return
+
         if not isinstance(checkpoint, dict):
             raise TypeError(f"UPR-Net checkpoint must be a state_dict mapping, got {type(checkpoint).__name__}")
 
-        _load_strict_model_state(model=pipeline.model, checkpoint=checkpoint, checkpoint_path=checkpoint_path)
-        pipeline.model.to(device)
-        pipeline.eval()
-        self.pipeline = pipeline
+        if _uses_wrapper_state_dict_keys(state_dict=checkpoint):
+            self._load_wrapper_state_dict(
+                state_dict=checkpoint,
+                checkpoint_path=checkpoint_path,
+                device=device,
+                checkpoint_kind="wrapper state_dict",
+            )
+            return
+
+        _load_strict_model_state(model=self.official_model, checkpoint=checkpoint, checkpoint_path=checkpoint_path)
+        self.official_model.to(device)
+        self.eval()
+        self._checkpoint_loaded = True
+
+    def _load_wrapper_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        checkpoint_path: Path,
+        device: Any,
+        checkpoint_kind: str,
+    ) -> None:
+        wrapper_state_dict = _convert_wrapper_state_dict_keys(state_dict=state_dict)
+        try:
+            self.load_state_dict(wrapper_state_dict, strict=True)
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"UPR-Net {checkpoint_kind} is incompatible with src.models.UPRNet.Model. "
+                f"checkpoint_path={checkpoint_path}"
+            ) from error
+        self.to(device)
+        self.eval()
         self._checkpoint_loaded = True
 
     def inference(self, img0: Any, img1: Any, embt: Any, scale_factor: float) -> Any:
-        if not self._checkpoint_loaded or self.pipeline is None:
+        if not self._checkpoint_loaded:
             raise RuntimeError("UPR-Net checkpoint is not loaded. Call load_external_checkpoint before inference.")
         if scale_factor != 1.0:
             raise ValueError(f"UPR-Net does not support scale_factor={scale_factor}; use scale_factor=1.0.")
@@ -248,6 +299,37 @@ class Model(nn.Module):
             nr_lvl_skipped=self.nr_lvl_skipped,
         )
         return imgt_pred[:, :, :height, :width].clamp(0.0, 1.0)
+
+    def forward(self, img0: Any, img1: Any, embt: Any, imgt: Any) -> Any:
+        if img0.shape[-2:] != img1.shape[-2:] or img0.shape[-2:] != imgt.shape[-2:]:
+            raise ValueError(
+                "UPR-Net training frames must share spatial shape, "
+                f"got img0={img0.shape} img1={img1.shape} imgt={imgt.shape}"
+            )
+
+        timestep = extract_scalar_timestep(embt=embt)
+        height = int(img0.shape[-2])
+        width = int(img0.shape[-1])
+        divisor = 2 ** (self.pyr_level - 1 + 2)
+        padded_height = _next_multiple(value=height, multiple=divisor)
+        padded_width = _next_multiple(value=width, multiple=divisor)
+        padded_img0 = _pad_to_size(image=img0, height=padded_height, width=padded_width)
+        padded_img1 = _pad_to_size(image=img1, height=padded_height, width=padded_width)
+
+        padded_prediction, _bi_flow, _info_dict = self.official_model(
+            padded_img0,
+            padded_img1,
+            time_period=timestep,
+            pyr_level=self.pyr_level,
+            nr_lvl_skipped=self.nr_lvl_skipped,
+        )
+        imgt_pred = padded_prediction[:, :, :height, :width].clamp(0.0, 1.0)
+        loss_interp_l2 = (((imgt_pred - imgt) ** 2 + 1e-6) ** 0.5).mean()
+        loss_ter = self.pipeline.ter(imgt_pred, imgt).mean()
+        loss_rec = loss_interp_l2 + loss_ter
+        loss_geo = loss_rec.new_zeros(())
+        loss_dis = loss_rec.new_zeros(())
+        return imgt_pred, loss_rec, loss_geo, loss_dis, None, None, None
 
 
 __all__ = ["Model", "UPRNetExternalFilesError", "extract_scalar_timestep"]
