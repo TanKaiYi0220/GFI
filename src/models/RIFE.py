@@ -268,13 +268,19 @@ def _call_flownet_inference(
 ) -> Any:
     parameter_names = _get_flownet_forward_parameter_names(flownet=flownet)
     if "scale" in parameter_names:
+        kwargs: dict[str, Any] = {"scale": scale_list}
         if "timestep" in parameter_names:
-            return flownet(imgs, scale=scale_list, timestep=timestep)
-        return flownet(imgs, scale=scale_list)
+            kwargs["timestep"] = timestep
+        if "training" in parameter_names:
+            kwargs["training"] = False
+        return flownet(imgs, **kwargs)
     if "scale_list" in parameter_names:
+        kwargs = {"scale_list": scale_list}
         if "timestep" in parameter_names:
-            return flownet(imgs, scale_list=scale_list, timestep=timestep)
-        return flownet(imgs, scale_list=scale_list)
+            kwargs["timestep"] = timestep
+        if "training" in parameter_names:
+            kwargs["training"] = False
+        return flownet(imgs, **kwargs)
     raise TypeError(f"Unsupported RIFE flownet forward signature: parameters={parameter_names}")
 
 
@@ -286,17 +292,19 @@ def _call_flownet_training(
 ) -> Any:
     parameter_names = _get_flownet_forward_parameter_names(flownet=flownet)
     if "scale" in parameter_names:
+        kwargs: dict[str, Any] = {"scale": scale_list}
         if "timestep" in parameter_names:
-            return flownet(imgs, scale=scale_list, timestep=timestep)
+            kwargs["timestep"] = timestep
         if "training" in parameter_names:
-            return flownet(imgs, scale=scale_list, training=True)
-        return flownet(imgs, scale=scale_list)
+            kwargs["training"] = True
+        return flownet(imgs, **kwargs)
     if "scale_list" in parameter_names:
+        kwargs = {"scale_list": scale_list}
         if "timestep" in parameter_names:
-            return flownet(imgs, scale_list=scale_list, timestep=timestep)
+            kwargs["timestep"] = timestep
         if "training" in parameter_names:
-            return flownet(imgs, scale_list=scale_list, training=True)
-        return flownet(imgs, scale_list=scale_list)
+            kwargs["training"] = True
+        return flownet(imgs, **kwargs)
     raise TypeError(f"Unsupported RIFE flownet forward signature: parameters={parameter_names}")
 
 
