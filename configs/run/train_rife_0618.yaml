@@ -14,7 +14,7 @@
   "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 16,
-  "output_dir": "outputs/RIFE_FineTuning_0618_deltaTime/",
+  "output_dir": "outputs/RIFE_FineTuning_0618_oracleTime/",
   "only_fps": 60,
   "input_fps": 30,
   "metrics": {
