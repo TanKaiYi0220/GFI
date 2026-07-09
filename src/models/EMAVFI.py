@@ -176,6 +176,14 @@ def _convert_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _convert_wrapper_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
+    return {key.replace("module.", "", 1): value for key, value in state_dict.items()}
+
+
+def _uses_wrapper_state_dict_keys(state_dict: dict[str, Any]) -> bool:
+    return any(key.replace("module.", "", 1).startswith("net.") for key in state_dict)
+
+
 def _load_strict_model_state(model: nn.Module, checkpoint: Any, checkpoint_path: Path) -> None:
     if isinstance(checkpoint, dict) and "model" in checkpoint:
         checkpoint = checkpoint["model"]
@@ -213,6 +221,93 @@ def _center_crop_to_size(image: torch.Tensor, height: int, width: int) -> torch.
     top = (image_height - height) // 2
     left = (image_width - width) // 2
     return image[:, :, top : top + height, left : left + width]
+
+
+def _build_laplacian_kernel(channels: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    kernel_values = [
+        [1.0, 4.0, 6.0, 4.0, 1.0],
+        [4.0, 16.0, 24.0, 16.0, 4.0],
+        [6.0, 24.0, 36.0, 24.0, 6.0],
+        [4.0, 16.0, 24.0, 16.0, 4.0],
+        [1.0, 4.0, 6.0, 4.0, 1.0],
+    ]
+    kernel = torch.tensor(kernel_values, device=device, dtype=dtype) / 256.0
+    return kernel.reshape(1, 1, 5, 5).repeat(channels, 1, 1, 1)
+
+
+def _laplacian_downsample(image: torch.Tensor) -> torch.Tensor:
+    return image[:, :, ::2, ::2]
+
+
+def _laplacian_upsample(image: torch.Tensor) -> torch.Tensor:
+    zeros = torch.zeros_like(image)
+    width_expanded = torch.stack((image, zeros), dim=-1).flatten(start_dim=-2)
+    height_expanded = torch.stack(
+        (width_expanded, torch.zeros_like(width_expanded)),
+        dim=-2,
+    ).flatten(start_dim=-3, end_dim=-2)
+    kernel = 4.0 * _build_laplacian_kernel(
+        channels=int(image.shape[1]),
+        device=image.device,
+        dtype=image.dtype,
+    )
+    return F.conv2d(F.pad(height_expanded, (2, 2, 2, 2), mode="reflect"), kernel, groups=int(image.shape[1]))
+
+
+def _laplacian_pyramid(image: torch.Tensor, max_levels: int) -> list[torch.Tensor]:
+    current = image
+    pyramid = []
+    kernel = _build_laplacian_kernel(
+        channels=int(image.shape[1]),
+        device=image.device,
+        dtype=image.dtype,
+    )
+    for _level in range(max_levels):
+        filtered = F.conv2d(F.pad(current, (2, 2, 2, 2), mode="reflect"), kernel, groups=int(image.shape[1]))
+        downsampled = _laplacian_downsample(image=filtered)
+        upsampled = _laplacian_upsample(image=downsampled)
+        upsampled = upsampled[:, :, : current.shape[-2], : current.shape[-1]]
+        pyramid.append(current - upsampled)
+        current = downsampled
+    return pyramid
+
+
+class LapLoss(nn.Module):
+    def __init__(self, max_levels: int, channels: int) -> None:
+        super().__init__()
+        self.max_levels: int = max_levels
+        self.channels: int = channels
+
+    def forward(self, input_image: torch.Tensor, target_image: torch.Tensor) -> torch.Tensor:
+        if input_image.shape != target_image.shape:
+            raise ValueError(
+                "LapLoss input and target shapes must match, "
+                f"got input_shape={tuple(input_image.shape)} target_shape={tuple(target_image.shape)}"
+            )
+        if int(input_image.shape[1]) != self.channels:
+            raise ValueError(
+                "LapLoss channel count mismatch, "
+                f"expected={self.channels} actual={int(input_image.shape[1])}"
+            )
+
+        input_pyramid = _laplacian_pyramid(image=input_image, max_levels=self.max_levels)
+        target_pyramid = _laplacian_pyramid(image=target_image, max_levels=self.max_levels)
+        loss = input_image.new_zeros(())
+        for input_level, target_level in zip(input_pyramid, target_pyramid):
+            loss = loss + F.l1_loss(input_level, target_level)
+        return loss
+
+
+def _calculate_training_reconstruction_loss(
+    reconstruction_loss: nn.Module,
+    imgt_pred: torch.Tensor,
+    merged_predictions: list[torch.Tensor],
+    imgt: torch.Tensor,
+) -> torch.Tensor:
+    loss_rec = reconstruction_loss(imgt_pred, imgt)
+    for merged_prediction in merged_predictions:
+        loss_rec = loss_rec + 0.5 * reconstruction_loss(merged_prediction, imgt)
+    return loss_rec
 
 
 def extract_scalar_timestep(embt: torch.Tensor) -> float:
@@ -255,38 +350,75 @@ class Model(nn.Module):
         self.tta: bool = tta
         self.fast_tta: bool = fast_tta
         self.pad_divisor: int = pad_divisor
-        self.net: nn.Module | None = None
+        self.net: nn.Module = _build_official_network(external_root=self.external_root, model_variant=model_variant)
+        self.reconstruction_loss: nn.Module = LapLoss(max_levels=5, channels=3)
         self._checkpoint_loaded: bool = False
 
-    def eval(self) -> Model:
-        super().eval()
-        if self.net is not None:
-            self.net.eval()
-        return self
+    def load_state_dict(self, state_dict: Any, strict: bool = True) -> Any:
+        result = super().load_state_dict(state_dict, strict=strict)
+        self._checkpoint_loaded = True
+        return result
 
     def load_external_checkpoint(self, checkpoint_path: Path, device: Any) -> None:
         torch_device = torch.device(device)
-        if torch_device.type != "cuda":
-            raise RuntimeError(
-                "Official EMA-VFI inference requires CUDA because the official model creates CUDA tensors internally. "
-                f"Got device={torch_device}."
-            )
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"EMA-VFI checkpoint file is missing: path={checkpoint_path}")
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"EMA-VFI checkpoint_path must be a .pkl file, got path={checkpoint_path}")
 
-        net = _build_official_network(external_root=self.external_root, model_variant=self.model_variant)
         checkpoint = torch.load(str(checkpoint_path), map_location=torch_device)
-        _load_strict_model_state(model=net, checkpoint=checkpoint, checkpoint_path=checkpoint_path)
-        net.to(torch_device)
-        net.eval()
-        self.net = net
+        if isinstance(checkpoint, dict) and "model" in checkpoint:
+            if not isinstance(checkpoint["model"], dict):
+                raise TypeError(
+                    "EMA-VFI repo-native checkpoint 'model' value must be a state_dict mapping, "
+                    f"got {type(checkpoint['model']).__name__}: checkpoint_path={checkpoint_path}"
+                )
+            if _uses_wrapper_state_dict_keys(state_dict=checkpoint["model"]):
+                self._load_wrapper_state_dict(
+                    state_dict=checkpoint["model"],
+                    checkpoint_path=checkpoint_path,
+                    device=torch_device,
+                    checkpoint_kind="repo-native checkpoint",
+                )
+                return
+
+        if not isinstance(checkpoint, dict):
+            raise TypeError(f"EMA-VFI checkpoint must be a state_dict mapping, got {type(checkpoint).__name__}")
+
+        if _uses_wrapper_state_dict_keys(state_dict=checkpoint):
+            self._load_wrapper_state_dict(
+                state_dict=checkpoint,
+                checkpoint_path=checkpoint_path,
+                device=torch_device,
+                checkpoint_kind="wrapper state_dict",
+            )
+            return
+
+        _load_strict_model_state(model=self.net, checkpoint=checkpoint, checkpoint_path=checkpoint_path)
+        self.net.to(torch_device)
+        self.eval()
+        self._checkpoint_loaded = True
+
+    def _load_wrapper_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        checkpoint_path: Path,
+        device: torch.device,
+        checkpoint_kind: str,
+    ) -> None:
+        wrapper_state_dict = _convert_wrapper_state_dict_keys(state_dict=state_dict)
+        try:
+            self.load_state_dict(wrapper_state_dict, strict=True)
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"EMA-VFI {checkpoint_kind} is incompatible with src.models.EMAVFI.Model. "
+                f"checkpoint_path={checkpoint_path}"
+            ) from error
+        self.to(device)
+        self.eval()
         self._checkpoint_loaded = True
 
     def _infer_padded(self, imgs: torch.Tensor, timestep: float) -> torch.Tensor:
-        if self.net is None:
-            raise RuntimeError("EMA-VFI checkpoint is not loaded. Call load_external_checkpoint before inference.")
         if self.fast_tta:
             flipped_imgs = imgs.flip(2).flip(3)
             input_images = torch.cat((imgs, flipped_imgs), dim=0)
@@ -302,7 +434,7 @@ class Model(nn.Module):
         return (pred + pred2.flip(2).flip(3)) / 2.0
 
     def inference(self, img0: Any, img1: Any, embt: Any, scale_factor: float) -> Any:
-        if not self._checkpoint_loaded or self.net is None:
+        if not self._checkpoint_loaded:
             raise RuntimeError("EMA-VFI checkpoint is not loaded. Call load_external_checkpoint before inference.")
         if scale_factor != 1.0:
             raise ValueError(f"EMA-VFI does not support scale_factor={scale_factor}; use scale_factor=1.0.")
@@ -321,5 +453,39 @@ class Model(nn.Module):
         padded_prediction = self._infer_padded(imgs=torch.cat((padded_img0, padded_img1), dim=1), timestep=timestep)
         return _center_crop_to_size(image=padded_prediction, height=height, width=width).clamp(0.0, 1.0)
 
+    def forward(self, img0: Any, img1: Any, embt: Any, imgt: Any) -> Any:
+        if img0.shape[-2:] != img1.shape[-2:] or img0.shape[-2:] != imgt.shape[-2:]:
+            raise ValueError(
+                "EMA-VFI training frames must share spatial shape, "
+                f"got img0={img0.shape} img1={img1.shape} imgt={imgt.shape}"
+            )
+        if img0.device.type != "cuda" or img1.device.type != "cuda" or imgt.device.type != "cuda":
+            raise RuntimeError("Official EMA-VFI training requires CUDA input tensors.")
 
-__all__ = ["Model", "EMAVFIExternalFilesError", "extract_scalar_timestep"]
+        timestep = extract_scalar_timestep(embt=embt)
+        height = int(img0.shape[-2])
+        width = int(img0.shape[-1])
+        padded_height = _next_multiple(value=height, multiple=self.pad_divisor)
+        padded_width = _next_multiple(value=width, multiple=self.pad_divisor)
+        padded_img0 = _center_replicate_pad_to_size(image=img0, height=padded_height, width=padded_width)
+        padded_img1 = _center_replicate_pad_to_size(image=img1, height=padded_height, width=padded_width)
+        imgs = torch.cat((padded_img0, padded_img1), dim=1)
+
+        _flow, _mask, merged, padded_prediction = self.net(imgs, timestep=timestep)
+        imgt_pred = _center_crop_to_size(image=padded_prediction, height=height, width=width).clamp(0.0, 1.0)
+        cropped_merged_predictions = [
+            _center_crop_to_size(image=merged_prediction, height=height, width=width)
+            for merged_prediction in merged
+        ]
+        loss_rec = _calculate_training_reconstruction_loss(
+            reconstruction_loss=self.reconstruction_loss,
+            imgt_pred=imgt_pred,
+            merged_predictions=cropped_merged_predictions,
+            imgt=imgt,
+        )
+        loss_geo = loss_rec.new_zeros(())
+        loss_dis = loss_rec.new_zeros(())
+        return imgt_pred, loss_rec, loss_geo, loss_dis, None, None, None
+
+
+__all__ = ["Model", "EMAVFIExternalFilesError", "LapLoss", "extract_scalar_timestep"]
