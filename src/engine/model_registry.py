@@ -8,6 +8,7 @@ RESIDUAL_FLOW_APPROX_MODEL_NAME: str = "IFRNet_Residual_FlowApprox"
 RIFE_MODEL_NAME: str = "RIFE"
 UPRNET_MODEL_NAME: str = "UPRNet"
 EMAVFI_MODEL_NAME: str = "EMAVFI"
+SGMVFI_MODEL_NAME: str = "SGMVFI"
 
 TRAIN_MODEL_NAMES: tuple[str, ...] = (
     BASELINE_MODEL_NAME,
@@ -16,11 +17,12 @@ TRAIN_MODEL_NAMES: tuple[str, ...] = (
     RIFE_MODEL_NAME,
     UPRNET_MODEL_NAME,
     EMAVFI_MODEL_NAME,
+    SGMVFI_MODEL_NAME,
 )
 INFERENCE_MODEL_NAMES: tuple[str, ...] = TRAIN_MODEL_NAMES
 MODEL_NAMES: tuple[str, ...] = INFERENCE_MODEL_NAMES
 FLOW_APPROX_MODEL_NAMES: tuple[str, ...] = (RESIDUAL_FLOW_APPROX_MODEL_NAME,)
-IMAGE_ONLY_VFI_MODEL_NAMES: tuple[str, ...] = (RIFE_MODEL_NAME, UPRNET_MODEL_NAME, EMAVFI_MODEL_NAME)
+IMAGE_ONLY_VFI_MODEL_NAMES: tuple[str, ...] = (RIFE_MODEL_NAME, UPRNET_MODEL_NAME, EMAVFI_MODEL_NAME, SGMVFI_MODEL_NAME)
 
 
 def uses_flow_approx_model(model_name: str) -> bool:
@@ -56,6 +58,10 @@ def resolve_model_class(model_name: str) -> type[Any]:
         from src.models.EMAVFI import Model as EMAVFIModel
 
         return EMAVFIModel
+    if model_name == SGMVFI_MODEL_NAME:
+        from src.models.SGMVFI import Model as SGMVFIModel
+
+        return SGMVFIModel
 
     available_models = ", ".join(MODEL_NAMES)
     raise KeyError(f"Unknown model '{model_name}'. Available models: {available_models}")

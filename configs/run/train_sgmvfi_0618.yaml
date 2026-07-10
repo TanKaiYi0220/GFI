@@ -1,0 +1,60 @@
+{
+  "mode": "train",
+  "model_name": "SGMVFI",
+  "model_init_args": {
+    "external_root": "src/models/external/SGM-VFI",
+    "model_variant": "ours_small",
+    "num_key_points": 0.5,
+    "tta": false,
+    "fast_tta": false,
+    "pad_divisor": 32,
+    "gmflow_checkpoint_path": "src/models/external/SGM-VFI/pretrained/gmflow_sintel-0c07dcb3.pth",
+    "local_checkpoint_path": "src/models/external/SGM-VFI/log/ours-local/ckpt/ours-local.pth",
+    "freeze_pretrained_branches": true
+  },
+  "root_dir": "data/VFX_0416_oracleTime_clean",
+  "dataset_root_dir": "/workspace/datasets/",
+  "train_preset": "train_vfx_0416",
+  "test_preset": "test_vfx_0416",
+  "epochs": 100,
+  "eval_interval": 5,
+  "lr_start": 2e-5,
+  "lr_end": 1e-5,
+  "seed": 1234,
+  "batch_size": 16,
+  "output_dir": "outputs/SGMVFI_FineTuning_0618_oracleTime/",
+  "only_fps": 60,
+  "input_fps": 30,
+  "metrics": {
+    "enable_psnr": true,
+    "enable_ssim": true,
+    "enable_lpips": true,
+    "enable_flip": true,
+    "enable_psnr_div": false,
+    "enable_flolpips": true,
+    "enable_vfips": false,
+    "lpips_net": "alex",
+    "flip_dynamic_range": "LDR",
+    "flip_pixels_per_degree": 67.0,
+    "flip_tonemapper": "ACES",
+    "psnr_div_divergence_threshold": 0.01,
+    "flolpips_repo_path": "/workspace/src/flolpips",
+    "vfips_repo_path": "/workspace/src/VFIPS",
+    "vfips_checkpoint_path": "/workspace/src/VFIPS/exp/eccv_ms_multiscale_v33/model.pytorch",
+    "vfips_clip_length": 12,
+    "vfips_stride": 12
+  },
+  "scale_factor": 1.0,
+  "flow_approx_method": "combination",
+  "resume_path": null,
+  "pretrained_checkpoint_path": "src/models/external/SGM-VFI/log/ours-1-2-points/ckpt/ours-1-2-points.pth",
+  "sample_train_frames": [
+    "ARPG_2_4_Medium_5_0502",
+    "ARPG_2_4_Medium_5_0504"
+  ],
+  "sample_test_frames": [
+    "ARPG_3_3_Easy_5_0546",
+    "ARPG_3_3_Easy_5_0552"
+  ],
+  "sample_interval_epoch": 5
+}
