@@ -177,7 +177,7 @@ def _convert_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
 
 
 def _convert_wrapper_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
-    return {key.replace("module.", "", 1): value for key, value in state_dict.items()}
+    return _convert_state_dict_keys(state_dict=state_dict)
 
 
 def _uses_wrapper_state_dict_keys(state_dict: dict[str, Any]) -> bool:
@@ -355,6 +355,8 @@ class Model(nn.Module):
         self._checkpoint_loaded: bool = False
 
     def load_state_dict(self, state_dict: Any, strict: bool = True) -> Any:
+        if isinstance(state_dict, dict):
+            state_dict = _convert_wrapper_state_dict_keys(state_dict=state_dict)
         result = super().load_state_dict(state_dict, strict=strict)
         self._checkpoint_loaded = True
         return result
