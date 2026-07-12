@@ -48,6 +48,17 @@ class MetricRunConfig:
 
 
 @dataclass(frozen=True)
+class RgbSequenceConfig:
+    enabled: bool
+    output_dir: Path
+    record_filter: str | None
+    mode_filter: str | None
+    dedupe_endpoints: bool
+    export_target: bool
+    export_prediction: bool
+
+
+@dataclass(frozen=True)
 class TrainRunConfig:
     mode: str
     model: ModelRunConfig
@@ -96,6 +107,7 @@ class InferenceRunConfig:
     save_topk_worst_psnr: int
     save_topk_best_psnr: int
     save_topk_largest_flow_diff: int
+    rgb_sequence: RgbSequenceConfig
     input_config: dict[str, Any]
 
 
@@ -129,6 +141,12 @@ def read_optional_bool(config_values: dict[str, Any], key: str) -> bool | None:
     if key not in config_values or config_values[key] is None:
         return None
     return parse_bool_value(config_values[key], key)
+
+
+def read_optional_string(config_values: dict[str, Any], key: str) -> str | None:
+    if key not in config_values or config_values[key] is None:
+        return None
+    return str(config_values[key])
 
 
 def require_train_model_name(model_name: str) -> None:
@@ -295,6 +313,33 @@ def build_train_run_config(args: argparse.Namespace, config_defaults: dict[str, 
     )
 
 
+def build_rgb_sequence_config(
+    config_values: dict[str, Any],
+    project_root: Path,
+    inference_output_dir: Path,
+) -> RgbSequenceConfig:
+    raw_config = config_values.get("rgb_sequence", {})
+    if raw_config is None:
+        raw_config = {}
+    if not isinstance(raw_config, dict):
+        raise TypeError(f"rgb_sequence must be a mapping, got {type(raw_config).__name__}")
+
+    enabled = parse_bool_value(raw_config.get("enabled", False), "rgb_sequence.enabled")
+    output_dir = _resolve_project_path(
+        project_root=project_root,
+        path_value=raw_config.get("output_dir", inference_output_dir / "rgb_sequence"),
+    )
+    return RgbSequenceConfig(
+        enabled=enabled,
+        output_dir=output_dir,
+        record_filter=read_optional_string(raw_config, "record_filter"),
+        mode_filter=read_optional_string(raw_config, "mode_filter"),
+        dedupe_endpoints=parse_bool_value(raw_config.get("dedupe_endpoints", True), "rgb_sequence.dedupe_endpoints"),
+        export_target=parse_bool_value(raw_config.get("export_target", True), "rgb_sequence.export_target"),
+        export_prediction=parse_bool_value(raw_config.get("export_prediction", True), "rgb_sequence.export_prediction"),
+    )
+
+
 def build_inference_run_config(config_path: Path, project_root: Path) -> InferenceRunConfig:
     resolved_config_path = config_path if config_path.is_absolute() else project_root / config_path
     config = load_yaml_file(resolved_config_path)
@@ -309,6 +354,7 @@ def build_inference_run_config(config_path: Path, project_root: Path) -> Inferen
 
     metric_config = read_metric_config(config)
     require_psnr_enabled(metric_config, "inference")
+    output_dir = _resolve_project_path(project_root=project_root, path_value=config["output_dir"])
 
     return InferenceRunConfig(
         mode=str(config["mode"]),
@@ -319,7 +365,7 @@ def build_inference_run_config(config_path: Path, project_root: Path) -> Inferen
         root_dir=_resolve_project_path(project_root=project_root, path_value=config["root_dir"]),
         dataset_root_dir=_resolve_project_path(project_root=project_root, path_value=config["dataset_root_dir"]),
         checkpoint_path=_resolve_project_path(project_root=project_root, path_value=config["checkpoint_path"]),
-        output_dir=_resolve_project_path(project_root=project_root, path_value=config["output_dir"]),
+        output_dir=output_dir,
         seed=int(config["seed"]),
         batch_size=int(config["batch_size"]),
         only_fps=int(config["only_fps"]),
@@ -330,6 +376,11 @@ def build_inference_run_config(config_path: Path, project_root: Path) -> Inferen
         save_topk_worst_psnr=int(config.get("save_topk_worst_psnr", 3)),
         save_topk_best_psnr=int(config.get("save_topk_best_psnr", 0)),
         save_topk_largest_flow_diff=int(config.get("save_topk_largest_flow_diff", 3)),
+        rgb_sequence=build_rgb_sequence_config(
+            config_values=config,
+            project_root=project_root,
+            inference_output_dir=output_dir,
+        ),
         input_config=dict(config),
     )
 
@@ -399,6 +450,16 @@ def build_inference_dry_run_summary(config: InferenceRunConfig) -> dict[str, obj
         summary["eval_convex_upsampling"] = config.model.eval_convex_upsampling
     if len(config.model.model_init_args) > 0:
         summary["model_init_args"] = dict(config.model.model_init_args)
+    if config.rgb_sequence.enabled:
+        summary["rgb_sequence"] = {
+            "enabled": config.rgb_sequence.enabled,
+            "output_dir": str(config.rgb_sequence.output_dir),
+            "record_filter": config.rgb_sequence.record_filter,
+            "mode_filter": config.rgb_sequence.mode_filter,
+            "dedupe_endpoints": config.rgb_sequence.dedupe_endpoints,
+            "export_target": config.rgb_sequence.export_target,
+            "export_prediction": config.rgb_sequence.export_prediction,
+        }
 
     return summary
 

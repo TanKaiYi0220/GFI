@@ -37,6 +37,7 @@ from src.engine.model_registry import set_model_convex_upsampling
 from src.engine.model_registry import uses_image_only_vfi_model
 from src.engine.run_config import build_inference_dry_run_summary
 from src.engine.run_config import build_inference_run_config
+from src.engine.run_config import RgbSequenceConfig
 from src.utils.logger import build_logger
 from src.utils.seed import set_seed
 # Model variants:
@@ -387,6 +388,81 @@ def validate_flow_specific_requests(model_name: str, save_topk_largest_flow_diff
         )
 
 
+def build_path_safe_tag(value: Any) -> str:
+    return str(value).replace("/", "__").replace("\\", "__")
+
+
+def should_export_rgb_sequence(config: RgbSequenceConfig, record: Any, mode_name: Any) -> bool:
+    if not config.enabled:
+        return False
+    if config.record_filter is not None and str(record) != config.record_filter:
+        return False
+    if config.mode_filter is not None and str(mode_name) != config.mode_filter:
+        return False
+    return True
+
+
+def tensor_image_to_uint8(image: Any, np: Any) -> Any:
+    return np.round(image.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+
+
+def save_rgb_endpoint_frame(
+    output_dir: Path,
+    frame_index: int,
+    image: Any,
+    written_endpoint_frames: set[int],
+    dedupe_endpoints: bool,
+    save_image: Any,
+    np: Any,
+) -> None:
+    if dedupe_endpoints and frame_index in written_endpoint_frames:
+        return
+
+    save_image(output_dir / f"frame_{frame_index:04d}.png", tensor_image_to_uint8(image=image, np=np))
+    written_endpoint_frames.add(frame_index)
+
+
+def save_rgb_sequence_sample(
+    config: RgbSequenceConfig,
+    inference_preset: Any,
+    record: Any,
+    mode_name: Any,
+    frame_0_index: int,
+    frame_1_index: int,
+    frame_2_index: int,
+    img0: Any,
+    imgt: Any,
+    img1: Any,
+    imgt_pred: Any,
+    written_endpoint_frames: set[int],
+    save_image: Any,
+    np: Any,
+) -> None:
+    output_dir = config.output_dir / str(inference_preset) / str(record) / build_path_safe_tag(value=mode_name)
+    save_rgb_endpoint_frame(
+        output_dir=output_dir,
+        frame_index=frame_0_index,
+        image=img0,
+        written_endpoint_frames=written_endpoint_frames,
+        dedupe_endpoints=config.dedupe_endpoints,
+        save_image=save_image,
+        np=np,
+    )
+    if config.export_target:
+        save_image(output_dir / f"frame_{frame_1_index:04d}_t.png", tensor_image_to_uint8(image=imgt, np=np))
+    if config.export_prediction:
+        save_image(output_dir / f"frame_{frame_1_index:04d}_p.png", tensor_image_to_uint8(image=imgt_pred, np=np))
+    save_rgb_endpoint_frame(
+        output_dir=output_dir,
+        frame_index=frame_2_index,
+        image=img1,
+        written_endpoint_frames=written_endpoint_frames,
+        dedupe_endpoints=config.dedupe_endpoints,
+        save_image=save_image,
+        np=np,
+    )
+
+
 def save_selected_sample_artifacts(
     cv2: Any,
     flow_diff_percentile: float,
@@ -647,6 +723,12 @@ def main(argv: list[str] | None = None) -> None:
             pending_psnr_div_target_y = None
             pending_psnr_div_prediction_y = None
             pending_psnr_div_prediction_rgb = None
+            export_rgb_sequence = should_export_rgb_sequence(
+                config=run_config.rgb_sequence,
+                record=record,
+                mode_name=mode_name,
+            )
+            written_rgb_endpoint_frames: set[int] = set()
 
             for batch in progress:
                 inference_result = run_inference_batch(
@@ -673,6 +755,9 @@ def main(argv: list[str] | None = None) -> None:
 
                 for batch_index in range(int(imgt_pred.shape[0])):
                     row = group_dataframe.iloc[sample_offset + batch_index]
+                    frame_0_index = int(row["img0"])
+                    frame_1_index = int(row["img1"])
+                    frame_2_index = int(row["img2"])
                     frame_range = f"frame_{int(row['img0']):04d}_{int(row['img2']):04d}"
                     sample_metric_values = {metric_name: float(metric_values[batch_index]) for metric_name, metric_values in batch_metric_values.items()}
                     for metric_name, metric_value in sample_metric_values.items():
@@ -725,12 +810,29 @@ def main(argv: list[str] | None = None) -> None:
                         "flow_diff_1_to_2_changed_ratio": diff_1_to_2["diff_changed_ratio"],
                         "flow_diff_1_to_2_percentile_value": diff_1_to_2["diff_percentile_value"],
                     }
+                    if export_rgb_sequence:
+                        save_rgb_sequence_sample(
+                            config=run_config.rgb_sequence,
+                            inference_preset=inference_preset,
+                            record=record,
+                            mode_name=mode_name,
+                            frame_0_index=frame_0_index,
+                            frame_1_index=frame_1_index,
+                            frame_2_index=frame_2_index,
+                            img0=inference_result.img0[batch_index],
+                            imgt=imgt[batch_index],
+                            img1=inference_result.img1[batch_index],
+                            imgt_pred=imgt_pred[batch_index],
+                            written_endpoint_frames=written_rgb_endpoint_frames,
+                            save_image=save_image,
+                            np=np,
+                        )
                     if vfips_enabled:
                         append_vfips_sample(
                             vfips_segments=vfips_segments,
                             sample_index=int(sample_row["sample_index"]),
-                            frame_0_index=int(row["img0"]),
-                            frame_2_index=int(row["img2"]),
+                            frame_0_index=frame_0_index,
+                            frame_2_index=frame_2_index,
                             img0=inference_result.img0[batch_index],
                             imgt=imgt[batch_index],
                             img1=inference_result.img1[batch_index],
