@@ -397,7 +397,7 @@ git commit -m "Add benchmark game-motion batch loading"
 **Interfaces:**
 - Produces: `BenchmarkPhaseBatchInputs`
 - Produces: `prepare_benchmark_batch_inputs(config: InferenceRunConfig, batch: Any, device: Any) -> BenchmarkPhaseBatchInputs`
-- Produces: `build_benchmark_init_flow(config: InferenceRunConfig, model_name: str, batch_inputs: BenchmarkPhaseBatchInputs) -> Any`
+- Produces: `build_benchmark_init_flow(config: InferenceRunConfig, phase_inputs: BenchmarkPhaseBatchInputs) -> BenchmarkPhaseBatchInputs`
 - Produces: `run_benchmark_model_phase(config: InferenceRunConfig, model: Any, batch_inputs: BenchmarkPhaseBatchInputs, init_flow: Any) -> Any`
 - Produces: `PhaseDurations(transfer_ms: float, flow_approx_ms: float, model_ms: float, total_ms: float)`
 
