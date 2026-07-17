@@ -14,8 +14,10 @@ from PIL import Image
 
 from benchmarks.common import BenchmarkBatch
 from benchmarks.common import BenchmarkSample
+from benchmarks.common import build_batch_report_metadata
 from benchmarks.common import build_inference_batch
 from benchmarks.common import build_report_paths
+from benchmarks.common import build_batch_report_row
 from benchmarks.common import build_benchmark_batches
 from benchmarks.common import discover_benchmark_samples
 from benchmarks.common import format_timing_summary
@@ -24,7 +26,7 @@ from benchmarks.common import resolve_rgb_path
 from benchmarks.common import summarize_phase_rows
 from benchmarks.common import summarize_benchmark_calls
 from benchmarks.common import summarize_durations_ms
-from src.engine.run_config import FlowApproxConfig
+from src.engine.run_config import build_flow_approx_config
 from src.engine.run_config import InferenceRunConfig
 from src.engine.run_config import MetricRunConfig
 from src.engine.run_config import ModelRunConfig
@@ -67,6 +69,13 @@ def test_model_benchmark_entrypoints_support_file_script_help(script_path: Path)
 
 
 def _build_inference_config(model_name: str) -> InferenceRunConfig:
+    return _build_inference_config_with_flow_approx(model_name=model_name, flow_approx_values={})
+
+
+def _build_inference_config_with_flow_approx(
+    model_name: str,
+    flow_approx_values: dict[str, object],
+) -> InferenceRunConfig:
     return InferenceRunConfig(
         mode="inference",
         model=ModelRunConfig(
@@ -74,14 +83,7 @@ def _build_inference_config(model_name: str) -> InferenceRunConfig:
             model_init_args={},
             eval_convex_upsampling=None,
         ),
-        flow_approx=FlowApproxConfig(
-            method="combination",
-            splatting_fill_strategy="none",
-            effective_splatting_fill_strategy="",
-            init_flow_downscale_strategy="bilinear",
-            effective_init_flow_downscale_strategy="",
-            init_flow_mask_epsilon=1e-6,
-        ),
+        flow_approx=build_flow_approx_config(model_name=model_name, config_values=flow_approx_values),
         metrics=MetricRunConfig(values={"psnr": True}),
         inference_presets=["benchmark"],
         root_dir=Path("."),
@@ -243,6 +245,7 @@ def test_format_timing_summary_includes_config_and_checkpoint() -> None:
             "fps_total": 50.0,
             "fps_model_only": 52.63157894736842,
         },
+        report_metadata={},
     )
 
     assert summary["model_label"] == "UPRNet"
@@ -287,7 +290,7 @@ def test_build_benchmark_batches_keeps_tensors_on_cpu_before_measurement(tmp_pat
         )
     ]
 
-    batches = build_benchmark_batches(samples=samples, batch_size=1)
+    batches = build_benchmark_batches(samples=samples, batch_size=1, config=_build_inference_config(model_name="UPRNet"))
 
     assert len(batches) == 1
     assert batches[0].img0.device.type == "cpu"
@@ -318,7 +321,7 @@ def test_build_benchmark_batches_rejects_incompatible_image_shapes(tmp_path: Pat
     ]
 
     with pytest.raises(ValueError, match="share shape"):
-        build_benchmark_batches(samples=samples, batch_size=1)
+        build_benchmark_batches(samples=samples, batch_size=1, config=_build_inference_config(model_name="UPRNet"))
 
 
 def test_build_benchmark_batches_rejects_mixed_shapes_across_run(tmp_path: Path) -> None:
@@ -362,7 +365,7 @@ def test_build_benchmark_batches_rejects_mixed_shapes_across_run(tmp_path: Path)
     ]
 
     with pytest.raises(ValueError, match="entire run must share shape"):
-        build_benchmark_batches(samples=samples, batch_size=1)
+        build_benchmark_batches(samples=samples, batch_size=1, config=_build_inference_config(model_name="UPRNet"))
 
 
 def test_build_benchmark_batches_loads_motion_and_depth_with_existing_loader(
@@ -393,7 +396,14 @@ def test_build_benchmark_batches_loads_motion_and_depth_with_existing_loader(
     monkeypatch.setattr("benchmarks.common.load_backward_velocity", fake_load_backward_velocity)
 
     samples = discover_benchmark_samples(input_dir=tmp_path)
-    batches = build_benchmark_batches(samples=samples, batch_size=1)
+    batches = build_benchmark_batches(
+        samples=samples,
+        batch_size=1,
+        config=_build_inference_config_with_flow_approx(
+            model_name="IFRNet_Residual_FlowApprox",
+            flow_approx_values={"flow_approx_method": "linear_splatting"},
+        ),
+    )
 
     assert batches[0].bmv_30 is not None
     assert tuple(batches[0].bmv_30.shape) == (1, 2, 3, 4)
@@ -430,7 +440,53 @@ def test_build_benchmark_batches_rejects_motion_and_depth_shape_mismatch(
     samples = discover_benchmark_samples(input_dir=tmp_path)
 
     with pytest.raises(ValueError, match="sample_0001.*motion_shape=.*depth_shape=.*expected_image_shape=\\(3, 4\\)"):
-        build_benchmark_batches(samples=samples, batch_size=1)
+        build_benchmark_batches(
+            samples=samples,
+            batch_size=1,
+            config=_build_inference_config_with_flow_approx(
+                model_name="IFRNet_Residual_FlowApprox",
+                flow_approx_values={"flow_approx_method": "linear_splatting"},
+            ),
+        )
+
+
+def test_build_benchmark_batches_skips_optional_exr_loading_for_image_only_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_sample_dir = tmp_path / "sample_0001"
+    second_sample_dir = tmp_path / "sample_0002"
+    first_sample_dir.mkdir()
+    second_sample_dir.mkdir()
+    (second_sample_dir / "fps_30").mkdir()
+    for sample_dir, img0_value, img2_value in (
+        (first_sample_dir, 10, 20),
+        (second_sample_dir, 30, 40),
+    ):
+        _write_rgb_image(sample_dir / "img0.png", width=4, height=3, value=img0_value)
+        _write_rgb_image(sample_dir / "img2.png", width=4, height=3, value=img2_value)
+    (second_sample_dir / "fps_30" / "backwardVel_Depth_1.exr").write_bytes(b"fake-exr")
+    (second_sample_dir / "meta.json").write_text(
+        json.dumps({"frame_30_1_idx": 1}),
+        encoding="utf-8",
+    )
+
+    def fail_if_optional_exr_is_loaded(_velocity_path: Path) -> tuple[Any, Any]:
+        raise AssertionError("image-only benchmark batches must not load optional EXR tensors")
+
+    monkeypatch.setattr("benchmarks.common.load_backward_velocity", fail_if_optional_exr_is_loaded)
+
+    samples = discover_benchmark_samples(input_dir=tmp_path)
+
+    batches = build_benchmark_batches(samples=samples, batch_size=2, config=_build_inference_config(model_name="UPRNet"))
+
+    assert len(batches) == 1
+    assert batches[0].bmv_30 is None
+    assert batches[0].fmv_30 is None
+    assert batches[0].bmv_60 is None
+    assert batches[0].fmv_60 is None
+    assert batches[0].source_depth0 is None
+    assert batches[0].source_depth1 is None
 
 
 def test_build_inference_batch_returns_flow_aware_tuple_for_flow_approx_model() -> None:
@@ -467,11 +523,20 @@ def test_build_inference_batch_returns_flow_aware_tuple_for_flow_approx_model() 
     }
 
 
-def test_build_inference_batch_reports_missing_required_exr_context_for_flow_aware_model(tmp_path: Path) -> None:
+def test_build_inference_batch_reports_missing_required_exr_context_for_flow_aware_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sample_dir = tmp_path / "sample_0001"
     sample_dir.mkdir()
+    (sample_dir / "fps_30").mkdir()
     _write_rgb_image(sample_dir / "img0.png", width=4, height=3, value=10)
     _write_rgb_image(sample_dir / "img2.png", width=4, height=3, value=20)
+    for motion_path in (
+        sample_dir / "fps_30" / "backwardVel_Depth_123.exr",
+        sample_dir / "fps_30" / "forwardVel_Depth_122.exr",
+    ):
+        motion_path.write_bytes(b"fake-exr")
     (sample_dir / "meta.json").write_text(
         json.dumps(
             {
@@ -483,15 +548,67 @@ def test_build_inference_batch_reports_missing_required_exr_context_for_flow_awa
         encoding="utf-8",
     )
 
+    def fake_load_backward_velocity(_velocity_path: Path) -> tuple[Any, Any]:
+        motion = torch.zeros((3, 4, 2), dtype=torch.float32).numpy()
+        depth = torch.ones((3, 4), dtype=torch.float32).numpy()
+        return motion, depth
+
+    monkeypatch.setattr("benchmarks.common.load_backward_velocity", fake_load_backward_velocity)
+
     samples = discover_benchmark_samples(input_dir=tmp_path)
-    batches = build_benchmark_batches(samples=samples, batch_size=1)
-    config = _build_inference_config(model_name="IFRNet_Residual_FlowApprox")
+    config = _build_inference_config_with_flow_approx(
+        model_name="IFRNet_Residual_FlowApprox",
+        flow_approx_values={"flow_approx_method": "linear_splatting", "splatting_fill_strategy": "ground_truth"},
+    )
+    batches = build_benchmark_batches(samples=samples, batch_size=1, config=config)
 
     with pytest.raises(
         ValueError,
         match="sample_0001.*bmv_60.*fps_60.*backwardVel_Depth_245\\.exr",
     ):
         build_inference_batch(config=config, batch=batches[0])
+
+
+def test_build_inference_batch_uses_only_30fps_source_motion_for_non_ground_truth_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample_dir = tmp_path / "sample_0001"
+    sample_dir.mkdir()
+    (sample_dir / "fps_30").mkdir()
+    _write_rgb_image(sample_dir / "img0.png", width=4, height=3, value=10)
+    _write_rgb_image(sample_dir / "img2.png", width=4, height=3, value=20)
+    for motion_path in (
+        sample_dir / "fps_30" / "backwardVel_Depth_1.exr",
+        sample_dir / "fps_30" / "forwardVel_Depth_0.exr",
+    ):
+        motion_path.write_bytes(b"fake-exr")
+    (sample_dir / "meta.json").write_text(
+        json.dumps({"frame_30_0_idx": 0, "frame_30_1_idx": 1}),
+        encoding="utf-8",
+    )
+
+    def fake_load_backward_velocity(_velocity_path: Path) -> tuple[Any, Any]:
+        motion = torch.zeros((3, 4, 2), dtype=torch.float32).numpy()
+        depth = torch.ones((3, 4), dtype=torch.float32).numpy()
+        return motion, depth
+
+    monkeypatch.setattr("benchmarks.common.load_backward_velocity", fake_load_backward_velocity)
+
+    config = _build_inference_config(model_name="IFRNet_Residual_FlowApprox")
+    samples = discover_benchmark_samples(input_dir=tmp_path)
+    batches = build_benchmark_batches(samples=samples, batch_size=1, config=config)
+
+    inference_batch = build_inference_batch(config=config, batch=batches[0])
+    _img0, _imgt, _img1, bmv_60, fmv_60, bmv_30, fmv_30, _embt, info = inference_batch
+
+    assert tuple(bmv_60.shape) == (1, 2, 3, 4)
+    assert tuple(fmv_60.shape) == (1, 2, 3, 4)
+    assert float(bmv_60.sum().item()) == 0.0
+    assert float(fmv_60.sum().item()) == 0.0
+    assert torch.equal(bmv_30, batches[0].bmv_30)
+    assert torch.equal(fmv_30, batches[0].fmv_30)
+    assert info == {"source_depth0": None, "source_depth1": None}
 
 
 def test_measure_batch_phases_reports_zero_flow_for_image_only_models(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -731,6 +848,55 @@ def test_phase_report_rows_include_transfer_flow_and_model_fields() -> None:
     assert summary["total_mean_ms"] == pytest.approx(10.0)
     assert summary["flow_approx_percent"] == pytest.approx(20.0)
     assert summary["model_percent"] == pytest.approx(70.0)
+
+
+def test_report_metadata_includes_motion_and_depth_shapes_when_present() -> None:
+    batch = BenchmarkBatch(
+        sample_names=["sample_0001"],
+        img0=torch.ones((1, 3, 2, 4), dtype=torch.float32),
+        img1=torch.full((1, 3, 2, 4), 2.0, dtype=torch.float32),
+        embt=torch.full((1, 1, 1, 1), 0.25, dtype=torch.float32),
+        image_shape=(2, 4),
+        bmv_30=torch.full((1, 2, 2, 4), 3.0, dtype=torch.float32),
+        fmv_30=torch.full((1, 2, 2, 4), 4.0, dtype=torch.float32),
+        bmv_60=None,
+        fmv_60=None,
+        source_depth0=torch.full((1, 1, 2, 4), 7.0, dtype=torch.float32),
+        source_depth1=torch.full((1, 1, 2, 4), 8.0, dtype=torch.float32),
+        required_tensor_contexts={},
+    )
+    phase_summary = {
+        "transfer_mean_ms": 1.0,
+        "flow_approx_mean_ms": 2.0,
+        "model_mean_ms": 7.0,
+        "total_mean_ms": 10.0,
+        "flow_approx_percent": 20.0,
+        "model_percent": 70.0,
+        "fps_total": 100.0,
+        "fps_model_only": 125.0,
+    }
+    stats = summarize_durations_ms(durations_ms=[10.0, 10.0], batch_size=1)
+
+    row = build_batch_report_row(batch_index=0, batch=batch, phase_summary=phase_summary)
+    summary = format_timing_summary(
+        model_label="IFRNet_Residual_FlowApprox",
+        config_path=Path("configs/run/inference_ifrnet_residual_flowapprox.yaml"),
+        checkpoint_path=Path("checkpoint.pt"),
+        device_name="cpu",
+        gpu_name="",
+        input_shape=batch.image_shape,
+        warmup=1,
+        repeat=2,
+        batch_size=1,
+        stats=stats,
+        phase_summary=phase_summary,
+        report_metadata=build_batch_report_metadata(batch=batch),
+    )
+
+    assert row["motion_shape"] == "(2, 2, 4)"
+    assert row["depth_shape"] == "(1, 2, 4)"
+    assert summary["motion_shape"] == "(2, 2, 4)"
+    assert summary["depth_shape"] == "(1, 2, 4)"
 
 
 def test_benchmark_materialized_inputs_are_git_ignored() -> None:

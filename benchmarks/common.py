@@ -23,6 +23,7 @@ from PIL import Image
 from src.data.dataset_loader import depth_to_tensor
 from src.data.dataset_loader import flow_to_tensor
 from src.data.image_ops import load_backward_velocity
+from src.engine.flow_approx import is_splatting_flow_approx_method
 from src.engine.checkpoints import load_inference_checkpoint
 from src.engine.interpolation_batch import build_benchmark_init_flow
 from src.engine.interpolation_batch import prepare_benchmark_batch_inputs
@@ -77,6 +78,13 @@ class BenchmarkRunArgs:
     repeat: int
     batch_size: int
     device: str
+
+
+@dataclass(frozen=True)
+class BenchmarkTensorPolicy:
+    requires_source_motion: bool
+    requires_ground_truth_motion: bool
+    requires_source_depth: bool
 
 
 @dataclass(frozen=True)
@@ -281,12 +289,30 @@ def discover_benchmark_samples(input_dir: Path) -> list[BenchmarkSample]:
     return samples
 
 
-def build_benchmark_batches(samples: list[BenchmarkSample], batch_size: int) -> list[BenchmarkBatch]:
+def build_benchmark_tensor_policy(config: InferenceRunConfig) -> BenchmarkTensorPolicy:
+    if not uses_flow_approx_model(config.model.model_name):
+        return BenchmarkTensorPolicy(
+            requires_source_motion=False,
+            requires_ground_truth_motion=False,
+            requires_source_depth=False,
+        )
+
+    requires_source_depth = is_splatting_flow_approx_method(config.flow_approx.method)
+    requires_ground_truth_motion = config.flow_approx.effective_splatting_fill_strategy == "ground_truth"
+    return BenchmarkTensorPolicy(
+        requires_source_motion=True,
+        requires_ground_truth_motion=requires_ground_truth_motion,
+        requires_source_depth=requires_source_depth,
+    )
+
+
+def build_benchmark_batches(samples: list[BenchmarkSample], batch_size: int, config: InferenceRunConfig) -> list[BenchmarkBatch]:
     if batch_size <= 0:
         raise ValueError(f"Benchmark batch_size must be positive, got {batch_size}")
 
     batches: list[BenchmarkBatch] = []
     expected_image_shape: tuple[int, int] | None = None
+    tensor_policy = build_benchmark_tensor_policy(config=config)
     for start_index in range(0, len(samples), batch_size):
         batch_samples = samples[start_index : start_index + batch_size]
         img0_tensors = [load_rgb_tensor(image_path=sample.img0_path) for sample in batch_samples]
@@ -314,43 +340,55 @@ def build_benchmark_batches(samples: list[BenchmarkSample], batch_size: int) -> 
                 img1=torch.stack(img1_tensors, dim=0),
                 embt=embt,
                 image_shape=image_shape,
-                bmv_30=stack_optional_batch_tensor(
+                bmv_30=None
+                if not tensor_policy.requires_source_motion
+                else stack_optional_batch_tensor(
                     samples=batch_samples,
                     tensor_name="bmv_30",
                     tensor_builder=load_bmv_30_tensor,
                     expected_image_shape=image_shape,
                 ),
-                fmv_30=stack_optional_batch_tensor(
+                fmv_30=None
+                if not tensor_policy.requires_source_motion
+                else stack_optional_batch_tensor(
                     samples=batch_samples,
                     tensor_name="fmv_30",
                     tensor_builder=load_fmv_30_tensor,
                     expected_image_shape=image_shape,
                 ),
-                bmv_60=stack_optional_batch_tensor(
+                bmv_60=None
+                if not tensor_policy.requires_ground_truth_motion
+                else stack_optional_batch_tensor(
                     samples=batch_samples,
                     tensor_name="bmv_60",
                     tensor_builder=load_bmv_60_tensor,
                     expected_image_shape=image_shape,
                 ),
-                fmv_60=stack_optional_batch_tensor(
+                fmv_60=None
+                if not tensor_policy.requires_ground_truth_motion
+                else stack_optional_batch_tensor(
                     samples=batch_samples,
                     tensor_name="fmv_60",
                     tensor_builder=load_fmv_60_tensor,
                     expected_image_shape=image_shape,
                 ),
-                source_depth0=stack_optional_batch_tensor(
+                source_depth0=None
+                if not tensor_policy.requires_source_depth
+                else stack_optional_batch_tensor(
                     samples=batch_samples,
                     tensor_name="source_depth0",
                     tensor_builder=load_source_depth0_tensor,
                     expected_image_shape=image_shape,
                 ),
-                source_depth1=stack_optional_batch_tensor(
+                source_depth1=None
+                if not tensor_policy.requires_source_depth
+                else stack_optional_batch_tensor(
                     samples=batch_samples,
                     tensor_name="source_depth1",
                     tensor_builder=load_source_depth1_tensor,
                     expected_image_shape=image_shape,
                 ),
-                required_tensor_contexts=build_required_tensor_contexts(batch_samples),
+                required_tensor_contexts=build_required_tensor_contexts(samples=batch_samples, tensor_policy=tensor_policy),
             )
         )
     return batches
@@ -490,13 +528,21 @@ def stack_optional_batch_tensor(
     return torch.stack([tensor for _sample_name, tensor in tensors_by_sample if tensor is not None], dim=0)
 
 
-def build_required_tensor_contexts(samples: list[BenchmarkSample]) -> dict[str, list[str]]:
-    return {
-        "bmv_30": build_tensor_context_entries(samples, "bmv_30", "bmv_30_expected_path"),
-        "fmv_30": build_tensor_context_entries(samples, "fmv_30", "fmv_30_expected_path"),
-        "bmv_60": build_tensor_context_entries(samples, "bmv_60", "bmv_60_expected_path"),
-        "fmv_60": build_tensor_context_entries(samples, "fmv_60", "fmv_60_expected_path"),
-    }
+def build_required_tensor_contexts(
+    samples: list[BenchmarkSample],
+    tensor_policy: BenchmarkTensorPolicy,
+) -> dict[str, list[str]]:
+    contexts: dict[str, list[str]] = {}
+    if tensor_policy.requires_source_motion:
+        contexts["bmv_30"] = build_tensor_context_entries(samples, "bmv_30", "bmv_30_expected_path")
+        contexts["fmv_30"] = build_tensor_context_entries(samples, "fmv_30", "fmv_30_expected_path")
+    if tensor_policy.requires_ground_truth_motion:
+        contexts["bmv_60"] = build_tensor_context_entries(samples, "bmv_60", "bmv_60_expected_path")
+        contexts["fmv_60"] = build_tensor_context_entries(samples, "fmv_60", "fmv_60_expected_path")
+    if tensor_policy.requires_source_depth:
+        contexts["source_depth0"] = build_tensor_context_entries(samples, "source_depth0", "fmv_30_expected_path")
+        contexts["source_depth1"] = build_tensor_context_entries(samples, "source_depth1", "bmv_30_expected_path")
+    return contexts
 
 
 def build_tensor_context_entries(samples: list[BenchmarkSample], tensor_name: str, expected_path_field: str) -> list[str]:
@@ -558,23 +604,63 @@ def require_batch_tensor(
     return tensor
 
 
-def build_inference_batch(config: InferenceRunConfig, batch: BenchmarkBatch) -> tuple[torch.Tensor, ...]:
+def build_flow_placeholder_tensor(batch: BenchmarkBatch) -> torch.Tensor:
     batch_size = int(batch.img0.shape[0])
     height = int(batch.img0.shape[-2])
     width = int(batch.img0.shape[-1])
+    return torch.zeros((batch_size, 2, height, width), dtype=batch.img0.dtype)
+
+
+def build_inference_batch(config: InferenceRunConfig, batch: BenchmarkBatch) -> tuple[torch.Tensor, ...]:
     imgt = torch.zeros_like(batch.img0)
-    flow = torch.zeros((batch_size, 2, height, width), dtype=batch.img0.dtype)
+    flow = build_flow_placeholder_tensor(batch=batch)
     if uses_flow_approx_model(config.model.model_name):
+        tensor_policy = build_benchmark_tensor_policy(config=config)
+        source_depth0 = batch.source_depth0
+        source_depth1 = batch.source_depth1
+        if tensor_policy.requires_source_depth:
+            source_depth0 = require_batch_tensor(
+                batch.source_depth0,
+                "source_depth0",
+                batch.sample_names,
+                batch.required_tensor_contexts,
+            )
+            source_depth1 = require_batch_tensor(
+                batch.source_depth1,
+                "source_depth1",
+                batch.sample_names,
+                batch.required_tensor_contexts,
+            )
+
+        ground_truth_bmv = batch.bmv_60
+        if ground_truth_bmv is None:
+            ground_truth_bmv = flow
+        ground_truth_fmv = batch.fmv_60
+        if ground_truth_fmv is None:
+            ground_truth_fmv = flow.clone()
+        if tensor_policy.requires_ground_truth_motion:
+            ground_truth_bmv = require_batch_tensor(
+                batch.bmv_60,
+                "bmv_60",
+                batch.sample_names,
+                batch.required_tensor_contexts,
+            )
+            ground_truth_fmv = require_batch_tensor(
+                batch.fmv_60,
+                "fmv_60",
+                batch.sample_names,
+                batch.required_tensor_contexts,
+            )
         return (
             batch.img0,
             imgt,
             batch.img1,
-            require_batch_tensor(batch.bmv_60, "bmv_60", batch.sample_names, batch.required_tensor_contexts),
-            require_batch_tensor(batch.fmv_60, "fmv_60", batch.sample_names, batch.required_tensor_contexts),
+            ground_truth_bmv,
+            ground_truth_fmv,
             require_batch_tensor(batch.bmv_30, "bmv_30", batch.sample_names, batch.required_tensor_contexts),
             require_batch_tensor(batch.fmv_30, "fmv_30", batch.sample_names, batch.required_tensor_contexts),
             batch.embt,
-            {"source_depth0": batch.source_depth0, "source_depth1": batch.source_depth1},
+            {"source_depth0": source_depth0, "source_depth1": source_depth1},
         )
     return batch.img0, imgt, batch.img1, flow, flow.clone(), batch.embt, {}
 
@@ -780,6 +866,7 @@ def format_timing_summary(
     batch_size: int,
     stats: TimingStats,
     phase_summary: dict[str, float],
+    report_metadata: dict[str, object],
 ) -> dict[str, object]:
     return {
         "model_label": model_label,
@@ -806,6 +893,55 @@ def format_timing_summary(
         "model_percent": phase_summary["model_percent"],
         "fps_total": phase_summary["fps_total"],
         "fps_model_only": phase_summary["fps_model_only"],
+        **report_metadata,
+    }
+
+
+def format_batch_tensor_shape(tensor: torch.Tensor | None) -> str | None:
+    if tensor is None:
+        return None
+    return str(tuple(int(size) for size in tensor.shape[1:]))
+
+
+def build_batch_report_metadata(batch: BenchmarkBatch) -> dict[str, object]:
+    motion_tensor = batch.bmv_30
+    if motion_tensor is None:
+        motion_tensor = batch.fmv_30
+    if motion_tensor is None:
+        motion_tensor = batch.bmv_60
+    if motion_tensor is None:
+        motion_tensor = batch.fmv_60
+
+    depth_tensor = batch.source_depth0
+    if depth_tensor is None:
+        depth_tensor = batch.source_depth1
+
+    return {
+        "motion_shape": format_batch_tensor_shape(tensor=motion_tensor),
+        "depth_shape": format_batch_tensor_shape(tensor=depth_tensor),
+    }
+
+
+def build_batch_report_row(
+    batch_index: int,
+    batch: BenchmarkBatch,
+    phase_summary: dict[str, float],
+) -> dict[str, object]:
+    return {
+        "batch_index": batch_index,
+        "sample_names": "|".join(batch.sample_names),
+        "height": batch.image_shape[0],
+        "width": batch.image_shape[1],
+        "batch_size": len(batch.sample_names),
+        "transfer_mean_ms": phase_summary["transfer_mean_ms"],
+        "flow_approx_mean_ms": phase_summary["flow_approx_mean_ms"],
+        "model_mean_ms": phase_summary["model_mean_ms"],
+        "total_mean_ms": phase_summary["total_mean_ms"],
+        "flow_approx_percent": phase_summary["flow_approx_percent"],
+        "model_percent": phase_summary["model_percent"],
+        "fps_total": phase_summary["fps_total"],
+        "fps_model_only": phase_summary["fps_model_only"],
+        **build_batch_report_metadata(batch=batch),
     }
 
 
@@ -839,7 +975,7 @@ def run_benchmark(default_config: str, model_label: str, argv: list[str] | None)
     require_available_device(device=device)
     config = build_inference_run_config(config_path=args.config_path, project_root=PROJECT_ROOT)
     samples = discover_benchmark_samples(input_dir=args.input_dir)
-    batches = build_benchmark_batches(samples=samples, batch_size=args.batch_size)
+    batches = build_benchmark_batches(samples=samples, batch_size=args.batch_size, config=config)
     model = load_benchmark_model(config=config, device=device)
 
     rows: list[dict[str, object]] = []
@@ -870,23 +1006,7 @@ def run_benchmark(default_config: str, model_label: str, argv: list[str] | None)
         all_durations_ms.extend(total_durations_ms)
         all_sample_counts.extend([len(batch.sample_names)] * len(durations))
         all_phase_rows.extend(phase_rows)
-        rows.append(
-            {
-                "batch_index": batch_index,
-                "sample_names": "|".join(batch.sample_names),
-                "height": batch.image_shape[0],
-                "width": batch.image_shape[1],
-                "batch_size": len(batch.sample_names),
-                "transfer_mean_ms": phase_summary["transfer_mean_ms"],
-                "flow_approx_mean_ms": phase_summary["flow_approx_mean_ms"],
-                "model_mean_ms": phase_summary["model_mean_ms"],
-                "total_mean_ms": phase_summary["total_mean_ms"],
-                "flow_approx_percent": phase_summary["flow_approx_percent"],
-                "model_percent": phase_summary["model_percent"],
-                "fps_total": phase_summary["fps_total"],
-                "fps_model_only": phase_summary["fps_model_only"],
-            }
-        )
+        rows.append(build_batch_report_row(batch_index=batch_index, batch=batch, phase_summary=phase_summary))
 
     summary_stats = summarize_benchmark_calls(durations_ms=all_durations_ms, sample_counts=all_sample_counts)
     summary_phase = summarize_phase_rows(rows=all_phase_rows)
@@ -902,6 +1022,7 @@ def run_benchmark(default_config: str, model_label: str, argv: list[str] | None)
         batch_size=args.batch_size,
         stats=summary_stats,
         phase_summary=summary_phase,
+        report_metadata=build_batch_report_metadata(batch=batches[0]),
     )
     csv_path, json_path = write_benchmark_reports(
         output_dir=args.output_dir,
