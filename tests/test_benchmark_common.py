@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from benchmarks.common import build_report_paths
 from benchmarks.common import discover_benchmark_samples
+from benchmarks.common import format_timing_summary
 from benchmarks.common import summarize_durations_ms
 
 
@@ -63,3 +65,37 @@ def test_summarize_durations_ms_reports_batch_fps() -> None:
 def test_summarize_durations_ms_rejects_invalid_values(durations_ms: list[float]) -> None:
     with pytest.raises(ValueError, match='finite|non-negative'):
         summarize_durations_ms(durations_ms=durations_ms, batch_size=2)
+
+
+def test_format_timing_summary_includes_config_and_checkpoint() -> None:
+    stats = summarize_durations_ms(durations_ms=[20.0, 20.0], batch_size=1)
+
+    summary = format_timing_summary(
+        model_label="UPRNet",
+        config_path=Path("configs/run/inference_uprnet_official.yaml"),
+        checkpoint_path=Path("src/models/external/UPR-Net/checkpoints/upr-base.pkl"),
+        device_name="cuda",
+        gpu_name="NVIDIA RTX",
+        input_shape=(720, 1280),
+        warmup=5,
+        repeat=30,
+        batch_size=1,
+        stats=stats,
+    )
+
+    assert summary["model_label"] == "UPRNet"
+    assert summary["config_path"] == "configs/run/inference_uprnet_official.yaml"
+    assert summary["checkpoint_path"] == "src/models/external/UPR-Net/checkpoints/upr-base.pkl"
+    assert summary["mean_ms"] == 20.0
+    assert summary["fps"] == 50.0
+
+
+def test_build_report_paths_uses_model_label_and_timestamp(tmp_path: Path) -> None:
+    csv_path, json_path = build_report_paths(
+        output_dir=tmp_path,
+        model_label="UPRNet",
+        timestamp="20260717_010203",
+    )
+
+    assert csv_path == tmp_path / "benchmark_uprnet_20260717_010203.csv"
+    assert json_path == tmp_path / "benchmark_uprnet_20260717_010203.json"
