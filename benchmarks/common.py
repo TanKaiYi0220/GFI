@@ -148,6 +148,7 @@ def build_benchmark_batches(samples: list[BenchmarkSample], batch_size: int) -> 
         raise ValueError(f"Benchmark batch_size must be positive, got {batch_size}")
 
     batches: list[BenchmarkBatch] = []
+    expected_image_shape: tuple[int, int] | None = None
     for start_index in range(0, len(samples), batch_size):
         batch_samples = samples[start_index : start_index + batch_size]
         img0_tensors = [load_rgb_tensor(image_path=sample.img0_path) for sample in batch_samples]
@@ -159,6 +160,14 @@ def build_benchmark_batches(samples: list[BenchmarkSample], batch_size: int) -> 
                 f"sample_names={[sample.name for sample in batch_samples]}, shapes={sorted(shapes)}"
             )
         image_shape = next(iter(shapes))
+        if expected_image_shape is None:
+            expected_image_shape = image_shape
+        elif image_shape != expected_image_shape:
+            raise ValueError(
+                "All benchmark images in one entire run must share shape, "
+                f"expected_shape={expected_image_shape}, sample_names={[sample.name for sample in batch_samples]}, "
+                f"actual_shape={image_shape}"
+            )
         embt = torch.tensor([sample.timestep for sample in batch_samples], dtype=torch.float32).view(-1, 1, 1, 1)
         batches.append(
             BenchmarkBatch(

@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib
 import json
 import math
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,28 @@ def test_model_benchmark_entrypoints_import() -> None:
     ):
         module = importlib.import_module(module_name)
         assert callable(module.main)
+
+
+@pytest.mark.parametrize(
+    "script_path",
+    [
+        Path("benchmarks/benchmark_rife.py"),
+        Path("benchmarks/benchmark_uprnet.py"),
+        Path("benchmarks/benchmark_emavfi.py"),
+        Path("benchmarks/benchmark_sgmvfi.py"),
+    ],
+)
+def test_model_benchmark_entrypoints_support_file_script_help(script_path: Path) -> None:
+    completed = subprocess.run(
+        [sys.executable, str(script_path), "--help"],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "Benchmark" in completed.stdout
 
 
 def _build_inference_config(model_name: str) -> InferenceRunConfig:
@@ -213,6 +237,34 @@ def test_build_benchmark_batches_rejects_incompatible_image_shapes(tmp_path: Pat
     ]
 
     with pytest.raises(ValueError, match="share shape"):
+        build_benchmark_batches(samples=samples, batch_size=1)
+
+
+def test_build_benchmark_batches_rejects_mixed_shapes_across_run(tmp_path: Path) -> None:
+    first_sample_dir = tmp_path / "sample_0001"
+    second_sample_dir = tmp_path / "sample_0002"
+    first_sample_dir.mkdir()
+    second_sample_dir.mkdir()
+    _write_rgb_image(first_sample_dir / "img0.png", width=4, height=3, value=10)
+    _write_rgb_image(first_sample_dir / "img2.png", width=4, height=3, value=20)
+    _write_rgb_image(second_sample_dir / "img0.png", width=5, height=3, value=30)
+    _write_rgb_image(second_sample_dir / "img2.png", width=5, height=3, value=40)
+    samples = [
+        BenchmarkSample(
+            name="sample_0001",
+            img0_path=first_sample_dir / "img0.png",
+            img2_path=first_sample_dir / "img2.png",
+            timestep=0.25,
+        ),
+        BenchmarkSample(
+            name="sample_0002",
+            img0_path=second_sample_dir / "img0.png",
+            img2_path=second_sample_dir / "img2.png",
+            timestep=0.5,
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="entire run must share shape"):
         build_benchmark_batches(samples=samples, batch_size=1)
 
 
