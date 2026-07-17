@@ -24,9 +24,13 @@ from src.data.dataset_loader import depth_to_tensor
 from src.data.dataset_loader import flow_to_tensor
 from src.data.image_ops import load_backward_velocity
 from src.engine.checkpoints import load_inference_checkpoint
+from src.engine.interpolation_batch import build_benchmark_init_flow
+from src.engine.interpolation_batch import prepare_benchmark_batch_inputs
+from src.engine.interpolation_batch import run_benchmark_model_phase
 from src.engine.model_registry import resolve_model_class
 from src.engine.model_registry import set_model_convex_upsampling
 from src.engine.model_registry import uses_flow_approx_model
+from src.engine.model_registry import uses_image_only_vfi_model
 from src.engine.run_config import InferenceRunConfig
 from src.engine.run_config import build_inference_run_config
 
@@ -55,6 +59,14 @@ class TimingStats:
     min_ms: float
     max_ms: float
     fps: float
+
+
+@dataclass(frozen=True)
+class PhaseDurations:
+    transfer_ms: float
+    flow_approx_ms: float
+    model_ms: float
+    total_ms: float
 
 
 @dataclass(frozen=True)
@@ -589,27 +601,104 @@ def run_single_inference(
     return run_inference_batch_wrapper(config=config, model=model, batch=inference_batch, device=device)
 
 
-def measure_batch_ms(
+def measure_batch_phases(
     model: torch.nn.Module,
     config: InferenceRunConfig,
     batch: BenchmarkBatch,
     warmup: int,
     repeat: int,
     device: torch.device,
-) -> list[float]:
+) -> list[PhaseDurations]:
+    inference_batch = build_inference_batch(config=config, batch=batch)
+
     with inference_context():
         for _index in range(warmup):
-            run_single_inference(model=model, config=config, batch=batch, device=device)
+            phase_inputs = prepare_benchmark_batch_inputs(config=config, batch=inference_batch, device=device)
+            init_flow = None
+            if not uses_image_only_vfi_model(config.model.model_name):
+                init_flow = build_benchmark_init_flow(config=config, phase_inputs=phase_inputs)
+            run_benchmark_model_phase(
+                config=config,
+                model=model,
+                batch_inputs=phase_inputs,
+                init_flow=init_flow,
+            )
         synchronize_device(device=device)
 
-        durations_ms: list[float] = []
+        durations_ms: list[PhaseDurations] = []
         for _index in range(repeat):
             synchronize_device(device=device)
             start_time = time.perf_counter()
-            run_single_inference(model=model, config=config, batch=batch, device=device)
+            phase_inputs = prepare_benchmark_batch_inputs(config=config, batch=inference_batch, device=device)
             synchronize_device(device=device)
-            durations_ms.append((time.perf_counter() - start_time) * 1000.0)
+            transfer_ms = (time.perf_counter() - start_time) * 1000.0
+
+            flow_approx_ms = 0.0
+            init_flow = None
+            if not uses_image_only_vfi_model(config.model.model_name):
+                synchronize_device(device=device)
+                flow_start_time = time.perf_counter()
+                init_flow = build_benchmark_init_flow(config=config, phase_inputs=phase_inputs)
+                synchronize_device(device=device)
+                flow_approx_ms = (time.perf_counter() - flow_start_time) * 1000.0
+
+            synchronize_device(device=device)
+            model_start_time = time.perf_counter()
+            run_benchmark_model_phase(
+                config=config,
+                model=model,
+                batch_inputs=phase_inputs,
+                init_flow=init_flow,
+            )
+            synchronize_device(device=device)
+            model_ms = (time.perf_counter() - model_start_time) * 1000.0
+            total_ms = transfer_ms + flow_approx_ms + model_ms
+            durations_ms.append(
+                PhaseDurations(
+                    transfer_ms=transfer_ms,
+                    flow_approx_ms=flow_approx_ms,
+                    model_ms=model_ms,
+                    total_ms=total_ms,
+                )
+            )
     return durations_ms
+
+
+def summarize_phase_rows(rows: list[dict[str, object]]) -> dict[str, float]:
+    if len(rows) == 0:
+        raise ValueError("Cannot summarize empty phase rows.")
+
+    transfer_durations = [float(row["transfer_ms"]) for row in rows]
+    flow_approx_durations = [float(row["flow_approx_ms"]) for row in rows]
+    model_durations = [float(row["model_ms"]) for row in rows]
+    total_durations = [float(row["total_ms"]) for row in rows]
+    batch_sizes = [int(row["batch_size"]) for row in rows]
+
+    total_duration_ms = float(sum(total_durations))
+    if total_duration_ms <= 0.0:
+        raise ValueError(f"Phase total duration must be positive, got {total_duration_ms}")
+
+    model_duration_ms = float(sum(model_durations))
+    if model_duration_ms <= 0.0:
+        raise ValueError(f"Phase model duration must be positive, got {model_duration_ms}")
+
+    total_samples = sum(batch_sizes)
+    if total_samples <= 0:
+        raise ValueError(f"Phase total sample count must be positive, got {total_samples}")
+
+    flow_approx_mean_ms = float(statistics.mean(flow_approx_durations))
+    model_mean_ms = float(statistics.mean(model_durations))
+    total_mean_ms = float(statistics.mean(total_durations))
+    return {
+        "transfer_mean_ms": float(statistics.mean(transfer_durations)),
+        "flow_approx_mean_ms": flow_approx_mean_ms,
+        "model_mean_ms": model_mean_ms,
+        "total_mean_ms": total_mean_ms,
+        "flow_approx_percent": float((flow_approx_mean_ms / total_mean_ms) * 100.0),
+        "model_percent": float((model_mean_ms / total_mean_ms) * 100.0),
+        "fps_total": float(total_samples * 1000.0 / total_duration_ms),
+        "fps_model_only": float(total_samples * 1000.0 / model_duration_ms),
+    }
 
 
 def percentile_nearest(values: list[float], percentile: float) -> float:
@@ -690,6 +779,7 @@ def format_timing_summary(
     repeat: int,
     batch_size: int,
     stats: TimingStats,
+    phase_summary: dict[str, float],
 ) -> dict[str, object]:
     return {
         "model_label": model_label,
@@ -708,6 +798,14 @@ def format_timing_summary(
         "min_ms": stats.min_ms,
         "max_ms": stats.max_ms,
         "fps": stats.fps,
+        "transfer_mean_ms": phase_summary["transfer_mean_ms"],
+        "flow_approx_mean_ms": phase_summary["flow_approx_mean_ms"],
+        "model_mean_ms": phase_summary["model_mean_ms"],
+        "total_mean_ms": phase_summary["total_mean_ms"],
+        "flow_approx_percent": phase_summary["flow_approx_percent"],
+        "model_percent": phase_summary["model_percent"],
+        "fps_total": phase_summary["fps_total"],
+        "fps_model_only": phase_summary["fps_model_only"],
     }
 
 
@@ -747,8 +845,9 @@ def run_benchmark(default_config: str, model_label: str, argv: list[str] | None)
     rows: list[dict[str, object]] = []
     all_durations_ms: list[float] = []
     all_sample_counts: list[int] = []
+    all_phase_rows: list[dict[str, object]] = []
     for batch_index, batch in enumerate(batches):
-        durations_ms = measure_batch_ms(
+        durations = measure_batch_phases(
             model=model,
             config=config,
             batch=batch,
@@ -756,9 +855,22 @@ def run_benchmark(default_config: str, model_label: str, argv: list[str] | None)
             repeat=args.repeat,
             device=device,
         )
-        stats = summarize_durations_ms(durations_ms=durations_ms, batch_size=len(batch.sample_names))
-        all_durations_ms.extend(durations_ms)
-        all_sample_counts.extend([len(batch.sample_names)] * len(durations_ms))
+        phase_rows = [
+            {
+                "transfer_ms": duration.transfer_ms,
+                "flow_approx_ms": duration.flow_approx_ms,
+                "model_ms": duration.model_ms,
+                "total_ms": duration.total_ms,
+                "batch_size": len(batch.sample_names),
+            }
+            for duration in durations
+        ]
+        phase_summary = summarize_phase_rows(rows=phase_rows)
+        total_durations_ms = [duration.total_ms for duration in durations]
+        stats = summarize_durations_ms(durations_ms=total_durations_ms, batch_size=len(batch.sample_names))
+        all_durations_ms.extend(total_durations_ms)
+        all_sample_counts.extend([len(batch.sample_names)] * len(durations))
+        all_phase_rows.extend(phase_rows)
         rows.append(
             {
                 "batch_index": batch_index,
@@ -766,16 +878,19 @@ def run_benchmark(default_config: str, model_label: str, argv: list[str] | None)
                 "height": batch.image_shape[0],
                 "width": batch.image_shape[1],
                 "batch_size": len(batch.sample_names),
-                "mean_ms": stats.mean_ms,
-                "median_ms": stats.median_ms,
-                "p90_ms": stats.p90_ms,
-                "min_ms": stats.min_ms,
-                "max_ms": stats.max_ms,
-                "fps": stats.fps,
+                "transfer_mean_ms": phase_summary["transfer_mean_ms"],
+                "flow_approx_mean_ms": phase_summary["flow_approx_mean_ms"],
+                "model_mean_ms": phase_summary["model_mean_ms"],
+                "total_mean_ms": phase_summary["total_mean_ms"],
+                "flow_approx_percent": phase_summary["flow_approx_percent"],
+                "model_percent": phase_summary["model_percent"],
+                "fps_total": phase_summary["fps_total"],
+                "fps_model_only": phase_summary["fps_model_only"],
             }
         )
 
     summary_stats = summarize_benchmark_calls(durations_ms=all_durations_ms, sample_counts=all_sample_counts)
+    summary_phase = summarize_phase_rows(rows=all_phase_rows)
     summary = format_timing_summary(
         model_label=model_label,
         config_path=args.config_path,
@@ -787,6 +902,7 @@ def run_benchmark(default_config: str, model_label: str, argv: list[str] | None)
         repeat=args.repeat,
         batch_size=args.batch_size,
         stats=summary_stats,
+        phase_summary=summary_phase,
     )
     csv_path, json_path = write_benchmark_reports(
         output_dir=args.output_dir,

@@ -64,6 +64,12 @@ class _PreparedBatchInputs:
     source_depth1: Any | None
 
 
+@dataclass(frozen=True)
+class BenchmarkPhaseBatchInputs:
+    inputs: _PreparedBatchInputs
+    init_flow: _InitFlowState | None
+
+
 def _build_exact_imgt_merge(
     img0: Any,
     img1: Any,
@@ -382,6 +388,27 @@ def _run_model_inference(
         ground_truth_bmv=batch_inputs.bmv,
         ground_truth_fmv=batch_inputs.fmv,
     )
+    return _run_model_inference_with_init_flow(
+        model_name=model_name,
+        model=model,
+        batch_inputs=batch_inputs,
+        flow_approx=flow_approx,
+        scale_factor=scale_factor,
+        init_flow=init_flow,
+    )
+
+
+def _run_model_inference_with_init_flow(
+    model_name: str,
+    model: Any,
+    batch_inputs: _PreparedBatchInputs,
+    flow_approx: FlowApproxConfig,
+    scale_factor: float,
+    init_flow: _InitFlowState | None,
+) -> InterpolationBatchResult:
+    if init_flow is None:
+        raise ValueError(f"Benchmark/model inference requires prebuilt init_flow for model_name={model_name}")
+
     imgt_pred, up_flow0_1, up_flow1_1, up_mask_1, _up_res_1, imgt_merge = model.inference(
         batch_inputs.img0,
         batch_inputs.img1,
@@ -418,6 +445,76 @@ def _run_model_inference(
             batch_inputs.embt,
             init_flow.init_masks,
         ),
+    )
+
+
+def prepare_benchmark_batch_inputs(config: InferenceRunConfig, batch: Any, device: Any) -> BenchmarkPhaseBatchInputs:
+    inputs = _prepare_batch_inputs(
+        model_name=config.model.model_name,
+        batch=batch,
+        device=device,
+        flow_approx_method=config.flow_approx.method,
+    )
+    return BenchmarkPhaseBatchInputs(inputs=inputs, init_flow=None)
+
+
+def build_benchmark_init_flow(
+    config: InferenceRunConfig,
+    phase_inputs: BenchmarkPhaseBatchInputs,
+) -> BenchmarkPhaseBatchInputs:
+    if uses_image_only_vfi_model(config.model.model_name):
+        return phase_inputs
+
+    init_flow = _build_init_flow(
+        model_name=config.model.model_name,
+        source_bmv=phase_inputs.inputs.source_bmv,
+        source_fmv=phase_inputs.inputs.source_fmv,
+        embt=phase_inputs.inputs.embt,
+        flow_approx=config.flow_approx,
+        source_depth0=phase_inputs.inputs.source_depth0,
+        source_depth1=phase_inputs.inputs.source_depth1,
+        ground_truth_bmv=phase_inputs.inputs.bmv,
+        ground_truth_fmv=phase_inputs.inputs.fmv,
+    )
+    return BenchmarkPhaseBatchInputs(inputs=phase_inputs.inputs, init_flow=init_flow)
+
+
+def run_benchmark_model_phase(
+    config: InferenceRunConfig,
+    model: Any,
+    batch_inputs: BenchmarkPhaseBatchInputs,
+    init_flow: Any,
+) -> Any:
+    if uses_image_only_vfi_model(config.model.model_name):
+        return _run_model_inference(
+            model_name=config.model.model_name,
+            model=model,
+            batch_inputs=batch_inputs.inputs,
+            flow_approx=config.flow_approx,
+            scale_factor=config.scale_factor,
+        )
+
+    if config.model.model_name == BASELINE_MODEL_NAME:
+        return _run_model_inference(
+            model_name=config.model.model_name,
+            model=model,
+            batch_inputs=batch_inputs.inputs,
+            flow_approx=config.flow_approx,
+            scale_factor=config.scale_factor,
+        )
+
+    resolved_init_flow = init_flow
+    if isinstance(init_flow, BenchmarkPhaseBatchInputs):
+        resolved_init_flow = init_flow.init_flow
+    if resolved_init_flow is None:
+        resolved_init_flow = batch_inputs.init_flow
+    return _run_model_inference_with_init_flow(
+        model_name=config.model.model_name,
+        model=model,
+        batch_inputs=batch_inputs.inputs,
+        flow_approx=config.flow_approx,
+        scale_factor=config.scale_factor,
+        init_flow=resolved_init_flow,
     )
 
 

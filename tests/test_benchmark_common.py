@@ -19,8 +19,9 @@ from benchmarks.common import build_report_paths
 from benchmarks.common import build_benchmark_batches
 from benchmarks.common import discover_benchmark_samples
 from benchmarks.common import format_timing_summary
-from benchmarks.common import measure_batch_ms
+from benchmarks.common import measure_batch_phases
 from benchmarks.common import resolve_rgb_path
+from benchmarks.common import summarize_phase_rows
 from benchmarks.common import summarize_benchmark_calls
 from benchmarks.common import summarize_durations_ms
 from src.engine.run_config import FlowApproxConfig
@@ -230,6 +231,16 @@ def test_format_timing_summary_includes_config_and_checkpoint() -> None:
         repeat=30,
         batch_size=1,
         stats=stats,
+        phase_summary={
+            "transfer_mean_ms": 1.0,
+            "flow_approx_mean_ms": 0.0,
+            "model_mean_ms": 19.0,
+            "total_mean_ms": 20.0,
+            "flow_approx_percent": 0.0,
+            "model_percent": 95.0,
+            "fps_total": 50.0,
+            "fps_model_only": 52.63157894736842,
+        },
     )
 
     assert summary["model_label"] == "UPRNet"
@@ -237,6 +248,8 @@ def test_format_timing_summary_includes_config_and_checkpoint() -> None:
     assert summary["checkpoint_path"] == "src/models/external/UPR-Net/checkpoints/upr-base.pkl"
     assert summary["mean_ms"] == 20.0
     assert summary["fps"] == 50.0
+    assert summary["transfer_mean_ms"] == pytest.approx(1.0)
+    assert summary["fps_model_only"] == pytest.approx(52.63157894736842)
 
 
 def test_build_report_paths_uses_model_label_and_timestamp(tmp_path: Path) -> None:
@@ -479,7 +492,7 @@ def test_build_inference_batch_reports_missing_required_exr_context_for_flow_awa
         build_inference_batch(config=config, batch=batches[0])
 
 
-def test_measure_batch_ms_uses_run_inference_batch_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_measure_batch_phases_reports_zero_flow_for_image_only_models(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _build_inference_config(model_name="UPRNet")
     batch = BenchmarkBatch(
         sample_names=["sample_0001"],
@@ -501,12 +514,11 @@ def test_measure_batch_ms_uses_run_inference_batch_wrapper(monkeypatch: pytest.M
 
     calls: list[dict[str, Any]] = []
 
-    def fake_run_inference_batch(
+    def fake_prepare_benchmark_batch_inputs(
         config: InferenceRunConfig,
-        model: Any,
         batch: tuple[torch.Tensor, ...],
         device: torch.device,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         img0, imgt, img1, bmv, fmv, embt, info = batch
         calls.append(
             {
@@ -520,11 +532,26 @@ def test_measure_batch_ms_uses_run_inference_batch_wrapper(monkeypatch: pytest.M
                 "info": info,
             }
         )
+        return {"prepared": True}
+
+    def fake_build_benchmark_init_flow(config: InferenceRunConfig, phase_inputs: dict[str, Any]) -> dict[str, Any]:
+        raise AssertionError("image-only models should not measure flow approximation")
+
+    def fake_run_benchmark_model_phase(
+        config: InferenceRunConfig,
+        model: Any,
+        batch_inputs: dict[str, Any],
+        init_flow: Any,
+    ) -> dict[str, str]:
+        assert batch_inputs == {"prepared": True}
+        assert init_flow is None
         return {"status": "ok"}
 
-    monkeypatch.setattr("benchmarks.common.run_inference_batch_wrapper", fake_run_inference_batch)
+    monkeypatch.setattr("benchmarks.common.prepare_benchmark_batch_inputs", fake_prepare_benchmark_batch_inputs)
+    monkeypatch.setattr("benchmarks.common.build_benchmark_init_flow", fake_build_benchmark_init_flow)
+    monkeypatch.setattr("benchmarks.common.run_benchmark_model_phase", fake_run_benchmark_model_phase)
 
-    durations_ms = measure_batch_ms(
+    durations = measure_batch_phases(
         model=ModelWithoutDirectInference(),
         config=config,
         batch=batch,
@@ -533,7 +560,7 @@ def test_measure_batch_ms_uses_run_inference_batch_wrapper(monkeypatch: pytest.M
         device=torch.device("cpu"),
     )
 
-    assert len(durations_ms) == 2
+    assert len(durations) == 2
     assert len(calls) == 3
     assert all(call["device"] == "cpu" for call in calls)
     assert all(call["img0_device"] == "cpu" for call in calls)
@@ -543,6 +570,7 @@ def test_measure_batch_ms_uses_run_inference_batch_wrapper(monkeypatch: pytest.M
     assert all(call["bmv_shape"] == (1, 2, 2, 4) for call in calls)
     assert all(call["fmv_shape"] == (1, 2, 2, 4) for call in calls)
     assert all(call["info"] == {} for call in calls)
+    assert all(duration.flow_approx_ms == 0.0 for duration in durations)
 
 
 def test_summarize_benchmark_calls_uses_actual_processed_sample_count() -> None:
@@ -557,6 +585,27 @@ def test_summarize_benchmark_calls_uses_actual_processed_sample_count() -> None:
     assert stats.min_ms == pytest.approx(10.0)
     assert stats.max_ms == pytest.approx(30.0)
     assert stats.fps == pytest.approx((5 * 1000.0) / 60.0)
+
+
+def test_phase_report_rows_include_transfer_flow_and_model_fields() -> None:
+    rows = [
+        {
+            "transfer_ms": 1.0,
+            "flow_approx_ms": 2.0,
+            "model_ms": 7.0,
+            "total_ms": 10.0,
+            "batch_size": 1,
+        }
+    ]
+
+    summary = summarize_phase_rows(rows=rows)
+
+    assert summary["transfer_mean_ms"] == pytest.approx(1.0)
+    assert summary["flow_approx_mean_ms"] == pytest.approx(2.0)
+    assert summary["model_mean_ms"] == pytest.approx(7.0)
+    assert summary["total_mean_ms"] == pytest.approx(10.0)
+    assert summary["flow_approx_percent"] == pytest.approx(20.0)
+    assert summary["model_percent"] == pytest.approx(70.0)
 
 
 def test_benchmark_materialized_inputs_are_git_ignored() -> None:
