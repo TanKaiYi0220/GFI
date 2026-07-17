@@ -37,6 +37,7 @@ def test_model_benchmark_entrypoints_import() -> None:
         "benchmarks.benchmark_uprnet",
         "benchmarks.benchmark_emavfi",
         "benchmarks.benchmark_sgmvfi",
+        "benchmarks.benchmark_flowapprox",
     ):
         module = importlib.import_module(module_name)
         assert callable(module.main)
@@ -49,6 +50,7 @@ def test_model_benchmark_entrypoints_import() -> None:
         Path("benchmarks/benchmark_uprnet.py"),
         Path("benchmarks/benchmark_emavfi.py"),
         Path("benchmarks/benchmark_sgmvfi.py"),
+        Path("benchmarks/benchmark_flowapprox.py"),
     ],
 )
 def test_model_benchmark_entrypoints_support_file_script_help(script_path: Path) -> None:
