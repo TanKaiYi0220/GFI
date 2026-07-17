@@ -573,6 +573,129 @@ def test_measure_batch_phases_reports_zero_flow_for_image_only_models(monkeypatc
     assert all(duration.flow_approx_ms == 0.0 for duration in durations)
 
 
+def test_measure_batch_phases_skips_flow_phase_for_ifrnet_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _build_inference_config(model_name="IFRNet")
+    batch = BenchmarkBatch(
+        sample_names=["sample_0001"],
+        img0=torch.ones((1, 3, 2, 4), dtype=torch.float32),
+        img1=torch.full((1, 3, 2, 4), 2.0, dtype=torch.float32),
+        embt=torch.full((1, 1, 1, 1), 0.25, dtype=torch.float32),
+        image_shape=(2, 4),
+        bmv_30=None,
+        fmv_30=None,
+        bmv_60=None,
+        fmv_60=None,
+        source_depth0=None,
+        source_depth1=None,
+        required_tensor_contexts={},
+    )
+
+    def fake_prepare_benchmark_batch_inputs(
+        config: InferenceRunConfig,
+        batch: tuple[torch.Tensor, ...],
+        device: torch.device,
+    ) -> dict[str, str]:
+        return {"prepared": "baseline"}
+
+    def fake_build_benchmark_init_flow(config: InferenceRunConfig, phase_inputs: dict[str, str]) -> dict[str, str]:
+        raise AssertionError("baseline IFRNet should not enter the benchmark flow-approx phase")
+
+    model_phase_calls: list[Any] = []
+
+    def fake_run_benchmark_model_phase(
+        config: InferenceRunConfig,
+        model: Any,
+        batch_inputs: dict[str, str],
+        init_flow: Any,
+    ) -> dict[str, str]:
+        model_phase_calls.append(init_flow)
+        assert batch_inputs == {"prepared": "baseline"}
+        assert init_flow is None
+        return {"status": "ok"}
+
+    monkeypatch.setattr("benchmarks.common.prepare_benchmark_batch_inputs", fake_prepare_benchmark_batch_inputs)
+    monkeypatch.setattr("benchmarks.common.build_benchmark_init_flow", fake_build_benchmark_init_flow)
+    monkeypatch.setattr("benchmarks.common.run_benchmark_model_phase", fake_run_benchmark_model_phase)
+
+    durations = measure_batch_phases(
+        model=object(),
+        config=config,
+        batch=batch,
+        warmup=1,
+        repeat=2,
+        device=torch.device("cpu"),
+    )
+
+    assert len(model_phase_calls) == 3
+    assert all(init_flow is None for init_flow in model_phase_calls)
+    assert all(duration.flow_approx_ms == 0.0 for duration in durations)
+
+
+def test_measure_batch_phases_keeps_flow_approx_work_out_of_model_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_inference_config(model_name="IFRNet_Residual_FlowApprox")
+    batch = BenchmarkBatch(
+        sample_names=["sample_0001"],
+        img0=torch.ones((1, 3, 2, 4), dtype=torch.float32),
+        img1=torch.full((1, 3, 2, 4), 2.0, dtype=torch.float32),
+        embt=torch.full((1, 1, 1, 1), 0.25, dtype=torch.float32),
+        image_shape=(2, 4),
+        bmv_30=torch.full((1, 2, 2, 4), 3.0, dtype=torch.float32),
+        fmv_30=torch.full((1, 2, 2, 4), 4.0, dtype=torch.float32),
+        bmv_60=torch.full((1, 2, 2, 4), 5.0, dtype=torch.float32),
+        fmv_60=torch.full((1, 2, 2, 4), 6.0, dtype=torch.float32),
+        source_depth0=torch.full((1, 1, 2, 4), 7.0, dtype=torch.float32),
+        source_depth1=torch.full((1, 1, 2, 4), 8.0, dtype=torch.float32),
+        required_tensor_contexts={},
+    )
+
+    build_calls: list[dict[str, Any]] = []
+    model_phase_calls: list[dict[str, Any]] = []
+
+    def fake_prepare_benchmark_batch_inputs(
+        config: InferenceRunConfig,
+        batch: tuple[torch.Tensor, ...],
+        device: torch.device,
+    ) -> dict[str, str]:
+        return {"prepared": "flow-approx"}
+
+    def fake_build_benchmark_init_flow(config: InferenceRunConfig, phase_inputs: dict[str, str]) -> dict[str, Any]:
+        build_index = len(build_calls)
+        init_flow = {"init_flow_id": build_index}
+        build_calls.append({"phase_inputs": phase_inputs, "init_flow": init_flow})
+        return init_flow
+
+    def fake_run_benchmark_model_phase(
+        config: InferenceRunConfig,
+        model: Any,
+        batch_inputs: dict[str, str],
+        init_flow: Any,
+    ) -> dict[str, str]:
+        model_phase_calls.append({"batch_inputs": batch_inputs, "init_flow": init_flow})
+        assert batch_inputs == {"prepared": "flow-approx"}
+        assert init_flow == build_calls[len(model_phase_calls) - 1]["init_flow"]
+        return {"status": "ok"}
+
+    monkeypatch.setattr("benchmarks.common.prepare_benchmark_batch_inputs", fake_prepare_benchmark_batch_inputs)
+    monkeypatch.setattr("benchmarks.common.build_benchmark_init_flow", fake_build_benchmark_init_flow)
+    monkeypatch.setattr("benchmarks.common.run_benchmark_model_phase", fake_run_benchmark_model_phase)
+
+    durations = measure_batch_phases(
+        model=object(),
+        config=config,
+        batch=batch,
+        warmup=1,
+        repeat=2,
+        device=torch.device("cpu"),
+    )
+
+    assert len(build_calls) == 3
+    assert len(model_phase_calls) == 3
+    assert all(duration.flow_approx_ms >= 0.0 for duration in durations)
+    assert all(call["init_flow"] is not None for call in model_phase_calls)
+
+
 def test_summarize_benchmark_calls_uses_actual_processed_sample_count() -> None:
     stats = summarize_benchmark_calls(
         durations_ms=[10.0, 30.0, 20.0],

@@ -30,7 +30,6 @@ from src.engine.interpolation_batch import run_benchmark_model_phase
 from src.engine.model_registry import resolve_model_class
 from src.engine.model_registry import set_model_convex_upsampling
 from src.engine.model_registry import uses_flow_approx_model
-from src.engine.model_registry import uses_image_only_vfi_model
 from src.engine.run_config import InferenceRunConfig
 from src.engine.run_config import build_inference_run_config
 
@@ -610,12 +609,13 @@ def measure_batch_phases(
     device: torch.device,
 ) -> list[PhaseDurations]:
     inference_batch = build_inference_batch(config=config, batch=batch)
+    measure_flow_approx_phase = uses_flow_approx_model(config.model.model_name)
 
     with inference_context():
         for _index in range(warmup):
             phase_inputs = prepare_benchmark_batch_inputs(config=config, batch=inference_batch, device=device)
             init_flow = None
-            if not uses_image_only_vfi_model(config.model.model_name):
+            if measure_flow_approx_phase:
                 init_flow = build_benchmark_init_flow(config=config, phase_inputs=phase_inputs)
             run_benchmark_model_phase(
                 config=config,
@@ -635,7 +635,7 @@ def measure_batch_phases(
 
             flow_approx_ms = 0.0
             init_flow = None
-            if not uses_image_only_vfi_model(config.model.model_name):
+            if measure_flow_approx_phase:
                 synchronize_device(device=device)
                 flow_start_time = time.perf_counter()
                 init_flow = build_benchmark_init_flow(config=config, phase_inputs=phase_inputs)
@@ -867,7 +867,6 @@ def run_benchmark(default_config: str, model_label: str, argv: list[str] | None)
         ]
         phase_summary = summarize_phase_rows(rows=phase_rows)
         total_durations_ms = [duration.total_ms for duration in durations]
-        stats = summarize_durations_ms(durations_ms=total_durations_ms, batch_size=len(batch.sample_names))
         all_durations_ms.extend(total_durations_ms)
         all_sample_counts.extend([len(batch.sample_names)] * len(durations))
         all_phase_rows.extend(phase_rows)

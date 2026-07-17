@@ -462,7 +462,7 @@ def build_benchmark_init_flow(
     config: InferenceRunConfig,
     phase_inputs: BenchmarkPhaseBatchInputs,
 ) -> BenchmarkPhaseBatchInputs:
-    if uses_image_only_vfi_model(config.model.model_name):
+    if uses_image_only_vfi_model(config.model.model_name) or not uses_flow_approx_model(config.model.model_name):
         return phase_inputs
 
     init_flow = _build_init_flow(
