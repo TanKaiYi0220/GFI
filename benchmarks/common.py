@@ -41,6 +41,10 @@ class BenchmarkSample:
     fmv_30_path: Path | None
     bmv_60_path: Path | None
     fmv_60_path: Path | None
+    bmv_30_expected_path: Path | None
+    fmv_30_expected_path: Path | None
+    bmv_60_expected_path: Path | None
+    fmv_60_expected_path: Path | None
 
 
 @dataclass(frozen=True)
@@ -77,6 +81,7 @@ class BenchmarkBatch:
     fmv_60: torch.Tensor | None
     source_depth0: torch.Tensor | None
     source_depth1: torch.Tensor | None
+    required_tensor_contexts: dict[str, list[str]]
 
 
 def parse_benchmark_args(default_config: str, model_label: str, argv: list[str] | None) -> BenchmarkRunArgs:
@@ -170,6 +175,19 @@ def resolve_motion_path(
     return motion_path if motion_path.is_file() else None
 
 
+def resolve_expected_motion_path(
+    sample_dir: Path,
+    fps_dir: str,
+    modality_name: str,
+    frame_key: str,
+    meta: dict[str, object],
+) -> Path | None:
+    if frame_key not in meta:
+        return None
+    frame_index = int(meta[frame_key])
+    return sample_dir / fps_dir / f"{modality_name}_{frame_index}.exr"
+
+
 def discover_benchmark_samples(input_dir: Path) -> list[BenchmarkSample]:
     if not input_dir.exists():
         raise FileNotFoundError(f"Benchmark input directory is missing: path={input_dir}")
@@ -219,6 +237,34 @@ def discover_benchmark_samples(input_dir: Path) -> list[BenchmarkSample]:
                     frame_key="frame_60_1_idx",
                     meta=meta,
                 ),
+                bmv_30_expected_path=resolve_expected_motion_path(
+                    sample_dir=sample_dir,
+                    fps_dir="fps_30",
+                    modality_name="backwardVel_Depth",
+                    frame_key="frame_30_1_idx",
+                    meta=meta,
+                ),
+                fmv_30_expected_path=resolve_expected_motion_path(
+                    sample_dir=sample_dir,
+                    fps_dir="fps_30",
+                    modality_name="forwardVel_Depth",
+                    frame_key="frame_30_0_idx",
+                    meta=meta,
+                ),
+                bmv_60_expected_path=resolve_expected_motion_path(
+                    sample_dir=sample_dir,
+                    fps_dir="fps_60",
+                    modality_name="backwardVel_Depth",
+                    frame_key="frame_60_1_idx",
+                    meta=meta,
+                ),
+                fmv_60_expected_path=resolve_expected_motion_path(
+                    sample_dir=sample_dir,
+                    fps_dir="fps_60",
+                    modality_name="forwardVel_Depth",
+                    frame_key="frame_60_1_idx",
+                    meta=meta,
+                ),
             )
         )
     return samples
@@ -261,32 +307,39 @@ def build_benchmark_batches(samples: list[BenchmarkSample], batch_size: int) -> 
                     samples=batch_samples,
                     tensor_name="bmv_30",
                     tensor_builder=load_bmv_30_tensor,
+                    expected_image_shape=image_shape,
                 ),
                 fmv_30=stack_optional_batch_tensor(
                     samples=batch_samples,
                     tensor_name="fmv_30",
                     tensor_builder=load_fmv_30_tensor,
+                    expected_image_shape=image_shape,
                 ),
                 bmv_60=stack_optional_batch_tensor(
                     samples=batch_samples,
                     tensor_name="bmv_60",
                     tensor_builder=load_bmv_60_tensor,
+                    expected_image_shape=image_shape,
                 ),
                 fmv_60=stack_optional_batch_tensor(
                     samples=batch_samples,
                     tensor_name="fmv_60",
                     tensor_builder=load_fmv_60_tensor,
+                    expected_image_shape=image_shape,
                 ),
                 source_depth0=stack_optional_batch_tensor(
                     samples=batch_samples,
                     tensor_name="source_depth0",
                     tensor_builder=load_source_depth0_tensor,
+                    expected_image_shape=image_shape,
                 ),
                 source_depth1=stack_optional_batch_tensor(
                     samples=batch_samples,
                     tensor_name="source_depth1",
                     tensor_builder=load_source_depth1_tensor,
+                    expected_image_shape=image_shape,
                 ),
+                required_tensor_contexts=build_required_tensor_contexts(batch_samples),
             )
         )
     return batches
@@ -297,45 +350,114 @@ def load_motion_and_depth_tensors(motion_path: Path) -> tuple[torch.Tensor, torc
     return flow_to_tensor(motion), depth_to_tensor(depth)
 
 
-def load_bmv_30_tensor(sample: BenchmarkSample) -> torch.Tensor | None:
+def validate_motion_and_depth_tensor_shapes(
+    sample_name: str,
+    tensor_name: str,
+    motion_path: Path,
+    motion_tensor: torch.Tensor,
+    depth_tensor: torch.Tensor,
+    expected_image_shape: tuple[int, int],
+) -> None:
+    expected_motion_shape = (2, int(expected_image_shape[0]), int(expected_image_shape[1]))
+    expected_depth_shape = (1, int(expected_image_shape[0]), int(expected_image_shape[1]))
+    actual_motion_shape = tuple(int(size) for size in motion_tensor.shape)
+    actual_depth_shape = tuple(int(size) for size in depth_tensor.shape)
+    if actual_motion_shape != expected_motion_shape or actual_depth_shape != expected_depth_shape:
+        raise ValueError(
+            "Benchmark motion/depth tensor shape mismatch: "
+            f"sample_name={sample_name}, tensor_name={tensor_name}, motion_path={motion_path}, "
+            f"motion_shape={actual_motion_shape}, depth_shape={actual_depth_shape}, "
+            f"expected_image_shape={expected_image_shape}"
+        )
+
+
+def load_validated_motion_and_depth_tensors(
+    sample: BenchmarkSample,
+    tensor_name: str,
+    motion_path: Path,
+    expected_image_shape: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    motion_tensor, depth_tensor = load_motion_and_depth_tensors(motion_path)
+    validate_motion_and_depth_tensor_shapes(
+        sample_name=sample.name,
+        tensor_name=tensor_name,
+        motion_path=motion_path,
+        motion_tensor=motion_tensor,
+        depth_tensor=depth_tensor,
+        expected_image_shape=expected_image_shape,
+    )
+    return motion_tensor, depth_tensor
+
+
+def load_bmv_30_tensor(sample: BenchmarkSample, expected_image_shape: tuple[int, int]) -> torch.Tensor | None:
     if sample.bmv_30_path is None:
         return None
-    motion, _depth = load_motion_and_depth_tensors(sample.bmv_30_path)
+    motion, _depth = load_validated_motion_and_depth_tensors(
+        sample=sample,
+        tensor_name="bmv_30",
+        motion_path=sample.bmv_30_path,
+        expected_image_shape=expected_image_shape,
+    )
     return motion
 
 
-def load_fmv_30_tensor(sample: BenchmarkSample) -> torch.Tensor | None:
+def load_fmv_30_tensor(sample: BenchmarkSample, expected_image_shape: tuple[int, int]) -> torch.Tensor | None:
     if sample.fmv_30_path is None:
         return None
-    motion, _depth = load_motion_and_depth_tensors(sample.fmv_30_path)
+    motion, _depth = load_validated_motion_and_depth_tensors(
+        sample=sample,
+        tensor_name="fmv_30",
+        motion_path=sample.fmv_30_path,
+        expected_image_shape=expected_image_shape,
+    )
     return motion
 
 
-def load_bmv_60_tensor(sample: BenchmarkSample) -> torch.Tensor | None:
+def load_bmv_60_tensor(sample: BenchmarkSample, expected_image_shape: tuple[int, int]) -> torch.Tensor | None:
     if sample.bmv_60_path is None:
         return None
-    motion, _depth = load_motion_and_depth_tensors(sample.bmv_60_path)
+    motion, _depth = load_validated_motion_and_depth_tensors(
+        sample=sample,
+        tensor_name="bmv_60",
+        motion_path=sample.bmv_60_path,
+        expected_image_shape=expected_image_shape,
+    )
     return motion
 
 
-def load_fmv_60_tensor(sample: BenchmarkSample) -> torch.Tensor | None:
+def load_fmv_60_tensor(sample: BenchmarkSample, expected_image_shape: tuple[int, int]) -> torch.Tensor | None:
     if sample.fmv_60_path is None:
         return None
-    motion, _depth = load_motion_and_depth_tensors(sample.fmv_60_path)
+    motion, _depth = load_validated_motion_and_depth_tensors(
+        sample=sample,
+        tensor_name="fmv_60",
+        motion_path=sample.fmv_60_path,
+        expected_image_shape=expected_image_shape,
+    )
     return motion
 
 
-def load_source_depth0_tensor(sample: BenchmarkSample) -> torch.Tensor | None:
+def load_source_depth0_tensor(sample: BenchmarkSample, expected_image_shape: tuple[int, int]) -> torch.Tensor | None:
     if sample.fmv_30_path is None:
         return None
-    _motion, depth = load_motion_and_depth_tensors(sample.fmv_30_path)
+    _motion, depth = load_validated_motion_and_depth_tensors(
+        sample=sample,
+        tensor_name="source_depth0",
+        motion_path=sample.fmv_30_path,
+        expected_image_shape=expected_image_shape,
+    )
     return depth
 
 
-def load_source_depth1_tensor(sample: BenchmarkSample) -> torch.Tensor | None:
+def load_source_depth1_tensor(sample: BenchmarkSample, expected_image_shape: tuple[int, int]) -> torch.Tensor | None:
     if sample.bmv_30_path is None:
         return None
-    _motion, depth = load_motion_and_depth_tensors(sample.bmv_30_path)
+    _motion, depth = load_validated_motion_and_depth_tensors(
+        sample=sample,
+        tensor_name="source_depth1",
+        motion_path=sample.bmv_30_path,
+        expected_image_shape=expected_image_shape,
+    )
     return depth
 
 
@@ -343,8 +465,9 @@ def stack_optional_batch_tensor(
     samples: list[BenchmarkSample],
     tensor_name: str,
     tensor_builder: Any,
+    expected_image_shape: tuple[int, int],
 ) -> torch.Tensor | None:
-    tensors_by_sample = [(sample.name, tensor_builder(sample)) for sample in samples]
+    tensors_by_sample = [(sample.name, tensor_builder(sample, expected_image_shape)) for sample in samples]
     present_sample_names = [sample_name for sample_name, tensor in tensors_by_sample if tensor is not None]
     if len(present_sample_names) == 0:
         return None
@@ -352,8 +475,27 @@ def stack_optional_batch_tensor(
         raise ValueError(
             f"Benchmark batch has mixed optional tensor availability: tensor_name={tensor_name}, "
             f"sample_names={[sample.name for sample in samples]}, present_sample_names={present_sample_names}"
-        )
+    )
     return torch.stack([tensor for _sample_name, tensor in tensors_by_sample if tensor is not None], dim=0)
+
+
+def build_required_tensor_contexts(samples: list[BenchmarkSample]) -> dict[str, list[str]]:
+    return {
+        "bmv_30": build_tensor_context_entries(samples, "bmv_30", "bmv_30_expected_path"),
+        "fmv_30": build_tensor_context_entries(samples, "fmv_30", "fmv_30_expected_path"),
+        "bmv_60": build_tensor_context_entries(samples, "bmv_60", "bmv_60_expected_path"),
+        "fmv_60": build_tensor_context_entries(samples, "fmv_60", "fmv_60_expected_path"),
+    }
+
+
+def build_tensor_context_entries(samples: list[BenchmarkSample], tensor_name: str, expected_path_field: str) -> list[str]:
+    context_entries: list[str] = []
+    for sample in samples:
+        expected_path = getattr(sample, expected_path_field)
+        context_entries.append(
+            f"sample_name={sample.name}, tensor_name={tensor_name}, expected_path={expected_path}"
+        )
+    return context_entries
 
 
 def require_available_device(device: torch.device) -> None:
@@ -390,11 +532,17 @@ def load_benchmark_model(config: InferenceRunConfig, device: torch.device) -> to
     return model
 
 
-def require_batch_tensor(tensor: torch.Tensor | None, tensor_name: str, sample_names: list[str]) -> torch.Tensor:
+def require_batch_tensor(
+    tensor: torch.Tensor | None,
+    tensor_name: str,
+    sample_names: list[str],
+    required_tensor_contexts: dict[str, list[str]],
+) -> torch.Tensor:
     if tensor is None:
+        context_entries = required_tensor_contexts.get(tensor_name, [])
         raise ValueError(
             f"Benchmark batch is missing required tensor for flow-aware inference: "
-            f"tensor_name={tensor_name}, sample_names={sample_names}"
+            f"tensor_name={tensor_name}, sample_names={sample_names}, contexts={context_entries}"
         )
     return tensor
 
@@ -410,10 +558,10 @@ def build_inference_batch(config: InferenceRunConfig, batch: BenchmarkBatch) -> 
             batch.img0,
             imgt,
             batch.img1,
-            require_batch_tensor(batch.bmv_60, "bmv_60", batch.sample_names),
-            require_batch_tensor(batch.fmv_60, "fmv_60", batch.sample_names),
-            require_batch_tensor(batch.bmv_30, "bmv_30", batch.sample_names),
-            require_batch_tensor(batch.fmv_30, "fmv_30", batch.sample_names),
+            require_batch_tensor(batch.bmv_60, "bmv_60", batch.sample_names, batch.required_tensor_contexts),
+            require_batch_tensor(batch.fmv_60, "fmv_60", batch.sample_names, batch.required_tensor_contexts),
+            require_batch_tensor(batch.bmv_30, "bmv_30", batch.sample_names, batch.required_tensor_contexts),
+            require_batch_tensor(batch.fmv_30, "fmv_30", batch.sample_names, batch.required_tensor_contexts),
             batch.embt,
             {"source_depth0": batch.source_depth0, "source_depth1": batch.source_depth1},
         )
