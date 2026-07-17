@@ -7,6 +7,7 @@ import math
 import statistics
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -142,7 +143,7 @@ def discover_benchmark_samples(input_dir: Path) -> list[BenchmarkSample]:
     return samples
 
 
-def build_benchmark_batches(samples: list[BenchmarkSample], batch_size: int, device: torch.device) -> list[BenchmarkBatch]:
+def build_benchmark_batches(samples: list[BenchmarkSample], batch_size: int) -> list[BenchmarkBatch]:
     if batch_size <= 0:
         raise ValueError(f"Benchmark batch_size must be positive, got {batch_size}")
 
@@ -162,9 +163,9 @@ def build_benchmark_batches(samples: list[BenchmarkSample], batch_size: int, dev
         batches.append(
             BenchmarkBatch(
                 sample_names=[sample.name for sample in batch_samples],
-                img0=torch.stack(img0_tensors, dim=0).to(device),
-                img1=torch.stack(img1_tensors, dim=0).to(device),
-                embt=embt.to(device),
+                img0=torch.stack(img0_tensors, dim=0),
+                img1=torch.stack(img1_tensors, dim=0),
+                embt=embt,
                 image_shape=image_shape,
             )
         )
@@ -181,6 +182,16 @@ def synchronize_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def inference_context() -> Any:
+    inference_mode = getattr(torch, "inference_mode", None)
+    if callable(inference_mode):
+        return inference_mode()
+    no_grad = getattr(torch, "no_grad", None)
+    if callable(no_grad):
+        return no_grad()
+    return nullcontext()
+
+
 def load_benchmark_model(config: InferenceRunConfig, device: torch.device) -> torch.nn.Module:
     model_class = resolve_model_class(config.model.model_name)
     model = model_class(**config.model.model_init_args).to(device)
@@ -195,14 +206,34 @@ def load_benchmark_model(config: InferenceRunConfig, device: torch.device) -> to
     return model
 
 
-def run_single_inference(model: torch.nn.Module, config: InferenceRunConfig, batch: BenchmarkBatch) -> torch.Tensor:
-    inference = getattr(model, "inference", None)
-    if not callable(inference):
-        raise TypeError(f"Benchmark model type {type(model).__name__} does not provide inference().")
-    prediction = inference(batch.img0, batch.img1, batch.embt, config.scale_factor)
-    if not isinstance(prediction, torch.Tensor):
-        raise TypeError(f"Benchmark model inference must return a tensor, got {type(prediction).__name__}")
-    return prediction
+def build_inference_batch(batch: BenchmarkBatch) -> tuple[torch.Tensor, ...]:
+    batch_size = int(batch.img0.shape[0])
+    height = int(batch.img0.shape[-2])
+    width = int(batch.img0.shape[-1])
+    imgt = torch.zeros_like(batch.img0)
+    flow = torch.zeros((batch_size, 2, height, width), dtype=batch.img0.dtype)
+    return batch.img0, imgt, batch.img1, flow, flow.clone(), batch.embt, {}
+
+
+def run_inference_batch_wrapper(
+    config: InferenceRunConfig,
+    model: torch.nn.Module,
+    batch: tuple[torch.Tensor, ...],
+    device: torch.device,
+) -> Any:
+    from src.engine.interpolation_batch import run_inference_batch
+
+    return run_inference_batch(config=config, model=model, batch=batch, device=device)
+
+
+def run_single_inference(
+    model: torch.nn.Module,
+    config: InferenceRunConfig,
+    batch: BenchmarkBatch,
+    device: torch.device,
+) -> Any:
+    inference_batch = build_inference_batch(batch=batch)
+    return run_inference_batch_wrapper(config=config, model=model, batch=inference_batch, device=device)
 
 
 def measure_batch_ms(
@@ -213,16 +244,16 @@ def measure_batch_ms(
     repeat: int,
     device: torch.device,
 ) -> list[float]:
-    with torch.inference_mode():
+    with inference_context():
         for _index in range(warmup):
-            run_single_inference(model=model, config=config, batch=batch)
+            run_single_inference(model=model, config=config, batch=batch, device=device)
         synchronize_device(device=device)
 
         durations_ms: list[float] = []
         for _index in range(repeat):
             synchronize_device(device=device)
             start_time = time.perf_counter()
-            run_single_inference(model=model, config=config, batch=batch)
+            run_single_inference(model=model, config=config, batch=batch, device=device)
             synchronize_device(device=device)
             durations_ms.append((time.perf_counter() - start_time) * 1000.0)
     return durations_ms
@@ -256,6 +287,34 @@ def summarize_durations_ms(durations_ms: list[float], batch_size: int) -> Timing
         min_ms=float(min(durations_ms)),
         max_ms=float(max(durations_ms)),
         fps=float(batch_size * 1000.0 / mean_ms),
+    )
+
+
+def summarize_benchmark_calls(durations_ms: list[float], sample_counts: list[int]) -> TimingStats:
+    if len(durations_ms) == 0:
+        raise ValueError("Cannot summarize an empty benchmark duration list.")
+    if len(durations_ms) != len(sample_counts):
+        raise ValueError(
+            "Benchmark durations and sample counts must have the same length: "
+            f"durations={len(durations_ms)}, sample_counts={len(sample_counts)}"
+        )
+    total_duration_ms = float(sum(durations_ms))
+    if total_duration_ms <= 0.0:
+        raise ValueError(f"Benchmark total duration must be positive, got {total_duration_ms}")
+    total_samples = 0
+    for sample_count in sample_counts:
+        if sample_count <= 0:
+            raise ValueError(f"Benchmark sample counts must be positive, got {sample_count}")
+        total_samples += sample_count
+
+    stats = summarize_durations_ms(durations_ms=durations_ms, batch_size=1)
+    return TimingStats(
+        mean_ms=stats.mean_ms,
+        median_ms=stats.median_ms,
+        p90_ms=stats.p90_ms,
+        min_ms=stats.min_ms,
+        max_ms=stats.max_ms,
+        fps=float(total_samples * 1000.0 / total_duration_ms),
     )
 
 
@@ -329,11 +388,12 @@ def run_benchmark(default_config: str, model_label: str, argv: list[str] | None)
     require_available_device(device=device)
     config = build_inference_run_config(config_path=args.config_path, project_root=PROJECT_ROOT)
     samples = discover_benchmark_samples(input_dir=args.input_dir)
-    batches = build_benchmark_batches(samples=samples, batch_size=args.batch_size, device=device)
+    batches = build_benchmark_batches(samples=samples, batch_size=args.batch_size)
     model = load_benchmark_model(config=config, device=device)
 
     rows: list[dict[str, object]] = []
     all_durations_ms: list[float] = []
+    all_sample_counts: list[int] = []
     for batch_index, batch in enumerate(batches):
         durations_ms = measure_batch_ms(
             model=model,
@@ -345,6 +405,7 @@ def run_benchmark(default_config: str, model_label: str, argv: list[str] | None)
         )
         stats = summarize_durations_ms(durations_ms=durations_ms, batch_size=len(batch.sample_names))
         all_durations_ms.extend(durations_ms)
+        all_sample_counts.extend([len(batch.sample_names)] * len(durations_ms))
         rows.append(
             {
                 "batch_index": batch_index,
@@ -361,7 +422,7 @@ def run_benchmark(default_config: str, model_label: str, argv: list[str] | None)
             }
         )
 
-    summary_stats = summarize_durations_ms(durations_ms=all_durations_ms, batch_size=args.batch_size)
+    summary_stats = summarize_benchmark_calls(durations_ms=all_durations_ms, sample_counts=all_sample_counts)
     summary = format_timing_summary(
         model_label=model_label,
         config_path=args.config_path,

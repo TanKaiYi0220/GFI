@@ -3,13 +3,76 @@
 import json
 import math
 from pathlib import Path
+from typing import Any
 
 import pytest
+import torch
+from PIL import Image
 
+from benchmarks.common import BenchmarkBatch
+from benchmarks.common import BenchmarkSample
 from benchmarks.common import build_report_paths
+from benchmarks.common import build_benchmark_batches
 from benchmarks.common import discover_benchmark_samples
 from benchmarks.common import format_timing_summary
+from benchmarks.common import measure_batch_ms
+from benchmarks.common import summarize_benchmark_calls
 from benchmarks.common import summarize_durations_ms
+from src.engine.run_config import FlowApproxConfig
+from src.engine.run_config import InferenceRunConfig
+from src.engine.run_config import MetricRunConfig
+from src.engine.run_config import ModelRunConfig
+from src.engine.run_config import RgbSequenceConfig
+
+
+def _build_inference_config(model_name: str) -> InferenceRunConfig:
+    return InferenceRunConfig(
+        mode="inference",
+        model=ModelRunConfig(
+            model_name=model_name,
+            model_init_args={},
+            eval_convex_upsampling=None,
+        ),
+        flow_approx=FlowApproxConfig(
+            method="combination",
+            splatting_fill_strategy="none",
+            effective_splatting_fill_strategy="",
+            init_flow_downscale_strategy="bilinear",
+            effective_init_flow_downscale_strategy="",
+            init_flow_mask_epsilon=1e-6,
+        ),
+        metrics=MetricRunConfig(values={"psnr": True}),
+        inference_presets=["benchmark"],
+        root_dir=Path("."),
+        dataset_root_dir=Path("."),
+        checkpoint_path=Path("checkpoint.pt"),
+        output_dir=Path("outputs"),
+        seed=0,
+        batch_size=1,
+        only_fps=30,
+        input_fps=15,
+        scale_factor=1.0,
+        flow_diff_threshold=1.0,
+        flow_diff_percentile=99.0,
+        save_topk_worst_psnr=0,
+        save_topk_best_psnr=0,
+        save_topk_largest_flow_diff=0,
+        rgb_sequence=RgbSequenceConfig(
+            enabled=False,
+            output_dir=Path("outputs/rgb"),
+            record_filter=None,
+            mode_filter=None,
+            dedupe_endpoints=True,
+            export_target=False,
+            export_prediction=False,
+        ),
+        input_config={},
+    )
+
+
+def _write_rgb_image(image_path: Path, width: int, height: int, value: int) -> None:
+    image = Image.new("RGB", (width, height), color=(value, value, value))
+    image.save(image_path)
 
 
 def test_discover_benchmark_samples_reads_sorted_samples_and_default_timestep(tmp_path: Path) -> None:
@@ -99,3 +162,116 @@ def test_build_report_paths_uses_model_label_and_timestamp(tmp_path: Path) -> No
 
     assert csv_path == tmp_path / "benchmark_uprnet_20260717_010203.csv"
     assert json_path == tmp_path / "benchmark_uprnet_20260717_010203.json"
+
+
+def test_build_benchmark_batches_keeps_tensors_on_cpu_before_measurement(tmp_path: Path) -> None:
+    sample_dir = tmp_path / "sample_0001"
+    sample_dir.mkdir()
+    _write_rgb_image(sample_dir / "img0.png", width=4, height=3, value=10)
+    _write_rgb_image(sample_dir / "img2.png", width=4, height=3, value=20)
+    samples = [
+        BenchmarkSample(
+            name="sample_0001",
+            img0_path=sample_dir / "img0.png",
+            img2_path=sample_dir / "img2.png",
+            timestep=0.25,
+        )
+    ]
+
+    batches = build_benchmark_batches(samples=samples, batch_size=1)
+
+    assert len(batches) == 1
+    assert batches[0].img0.device.type == "cpu"
+    assert batches[0].img1.device.type == "cpu"
+    assert batches[0].embt.device.type == "cpu"
+
+
+def test_build_benchmark_batches_rejects_incompatible_image_shapes(tmp_path: Path) -> None:
+    sample_dir = tmp_path / "sample_0001"
+    sample_dir.mkdir()
+    _write_rgb_image(sample_dir / "img0.png", width=4, height=3, value=10)
+    _write_rgb_image(sample_dir / "img2.png", width=5, height=3, value=20)
+    samples = [
+        BenchmarkSample(
+            name="sample_0001",
+            img0_path=sample_dir / "img0.png",
+            img2_path=sample_dir / "img2.png",
+            timestep=0.25,
+        )
+    ]
+
+    with pytest.raises(ValueError, match="share shape"):
+        build_benchmark_batches(samples=samples, batch_size=1)
+
+
+def test_measure_batch_ms_uses_run_inference_batch_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _build_inference_config(model_name="UPRNet")
+    batch = BenchmarkBatch(
+        sample_names=["sample_0001"],
+        img0=torch.ones((1, 3, 2, 4), dtype=torch.float32),
+        img1=torch.full((1, 3, 2, 4), 2.0, dtype=torch.float32),
+        embt=torch.full((1, 1, 1, 1), 0.25, dtype=torch.float32),
+        image_shape=(2, 4),
+    )
+
+    class ModelWithoutDirectInference:
+        pass
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_inference_batch(
+        config: InferenceRunConfig,
+        model: Any,
+        batch: tuple[torch.Tensor, ...],
+        device: torch.device,
+    ) -> dict[str, str]:
+        img0, imgt, img1, bmv, fmv, embt, info = batch
+        calls.append(
+            {
+                "device": str(device),
+                "img0_device": img0.device.type,
+                "imgt_sum": float(imgt.sum().item()),
+                "img1_device": img1.device.type,
+                "bmv_shape": tuple(int(size) for size in bmv.shape),
+                "fmv_shape": tuple(int(size) for size in fmv.shape),
+                "embt_device": embt.device.type,
+                "info": info,
+            }
+        )
+        return {"status": "ok"}
+
+    monkeypatch.setattr("benchmarks.common.run_inference_batch_wrapper", fake_run_inference_batch)
+
+    durations_ms = measure_batch_ms(
+        model=ModelWithoutDirectInference(),
+        config=config,
+        batch=batch,
+        warmup=1,
+        repeat=2,
+        device=torch.device("cpu"),
+    )
+
+    assert len(durations_ms) == 2
+    assert len(calls) == 3
+    assert all(call["device"] == "cpu" for call in calls)
+    assert all(call["img0_device"] == "cpu" for call in calls)
+    assert all(call["img1_device"] == "cpu" for call in calls)
+    assert all(call["embt_device"] == "cpu" for call in calls)
+    assert all(call["imgt_sum"] == 0.0 for call in calls)
+    assert all(call["bmv_shape"] == (1, 2, 2, 4) for call in calls)
+    assert all(call["fmv_shape"] == (1, 2, 2, 4) for call in calls)
+    assert all(call["info"] == {} for call in calls)
+
+
+def test_summarize_benchmark_calls_uses_actual_processed_sample_count() -> None:
+    stats = summarize_benchmark_calls(
+        durations_ms=[10.0, 30.0, 20.0],
+        sample_counts=[2, 2, 1],
+    )
+
+    assert stats.mean_ms == pytest.approx(20.0)
+    assert stats.median_ms == pytest.approx(20.0)
+    assert stats.p90_ms == pytest.approx(30.0)
+    assert stats.min_ms == pytest.approx(10.0)
+    assert stats.max_ms == pytest.approx(30.0)
+    assert stats.fps == pytest.approx((5 * 1000.0) / 60.0)
