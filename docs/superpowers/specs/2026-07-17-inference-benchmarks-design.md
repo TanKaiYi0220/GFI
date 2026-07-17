@@ -28,27 +28,34 @@ benchmarks/
   benchmark_sgmvfi.py
   inputs/
     sample_0001/
-      img0.png
-      img2.png
+      colorNoScreenUI_244.png
+      colorNoScreenUI_246.png
       meta.json
-      bmv_30.npy
-      fmv_30.npy
-      bmv_60.npy
-      fmv_60.npy
-      depth0.npy
-      depth1.npy
+      fps_30/
+        backwardVel_Depth_123.exr
+        forwardVel_Depth_122.exr
+      fps_60/
+        backwardVel_Depth_245.exr
+        forwardVel_Depth_245.exr
   outputs/
 ```
 
 Each `benchmark_xxx.py` is a thin model-specific entrypoint. Shared argument parsing, input loading, model loading, timing, and report writing live in `benchmarks/common.py`.
 
+The `fps_30/` and `fps_60/` folders are benchmark-local aliases for materialized samples. When samples are referenced directly from the dataset root, `meta.json` may instead point to the original record/mode directories; the EXR basenames and frame-index mapping remain the same as the training dataloader.
+
 ## Input Contract
 
-Each sample directory must contain `img0.png` and `img2.png`. Optional `meta.json` may define:
+Each sample directory must contain two RGB input images. The default loader accepts either benchmark aliases (`img0.png` and `img2.png`) or the dataset naming style (`colorNoScreenUI_{frame_idx}.png`) declared in `meta.json`. Optional `meta.json` may define:
 
 ```json
 {
-  "timestep": 0.5
+  "timestep": 0.5,
+  "frame_60_0_idx": 244,
+  "frame_60_1_idx": 245,
+  "frame_60_2_idx": 246,
+  "frame_30_0_idx": 122,
+  "frame_30_1_idx": 123
 }
 ```
 
@@ -57,11 +64,11 @@ If `meta.json` is missing, the timestep is `0.5`. Inputs are loaded as RGB tenso
 Motion files are required only for models/configs that need them:
 
 - `RIFE`, `UPRNet`, `EMAVFI`, `SGMVFI`: RGB-only benchmark samples are valid.
-- `IFRNet` and `IFRNet_Residual`: RGB samples are valid; `bmv_60.npy` and `fmv_60.npy` may be loaded when comparing against ground-truth game motion.
-- `IFRNet_Residual_FlowApprox`: `bmv_30.npy` and `fmv_30.npy` are required.
-- Splatting flow approximation modes that need depth require `depth0.npy` and `depth1.npy`.
+- `IFRNet` and `IFRNet_Residual`: RGB samples are valid; `fps_60/backwardVel_Depth_{frame_60_1_idx}.exr` and `fps_60/forwardVel_Depth_{frame_60_1_idx}.exr` may be loaded when comparing against ground-truth game motion.
+- `IFRNet_Residual_FlowApprox`: source 30fps game motion is required from `fps_30/backwardVel_Depth_{frame_30_1_idx}.exr` and `fps_30/forwardVel_Depth_{frame_30_0_idx}.exr`, matching `FlowEstimationTrainDataset`.
+- Splatting flow approximation modes that need depth read source depths from the same 30fps EXR files; no separate depth files are part of the default benchmark contract.
 
-Motion arrays use shape `[2, H, W]` and match the RGB input resolution. Depth arrays use shape `[1, H, W]` or `[H, W]`; the benchmark normalizes depth to `[1, H, W]` internally. All samples in one benchmark run must share the same RGB and motion/depth shapes.
+The benchmark should reuse the existing EXR loading convention from `src.data.dataset_loader`: `backwardVel_Depth_{frame_idx}.exr` and `forwardVel_Depth_{frame_idx}.exr` are decoded through `load_backward_velocity`, which returns a `[H, W, 2]` game-motion field plus the matching depth channel. The benchmark then converts motion to `[2, H, W]` tensors and depth to `[1, H, W]`, matching the training pipeline. All samples in one benchmark run must share the same RGB and motion/depth shapes.
 
 ## CLI
 
