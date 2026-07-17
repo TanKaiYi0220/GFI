@@ -1,5 +1,6 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import importlib
 import json
 import math
 from pathlib import Path
@@ -23,6 +24,17 @@ from src.engine.run_config import InferenceRunConfig
 from src.engine.run_config import MetricRunConfig
 from src.engine.run_config import ModelRunConfig
 from src.engine.run_config import RgbSequenceConfig
+
+
+def test_model_benchmark_entrypoints_import() -> None:
+    for module_name in (
+        "benchmarks.benchmark_rife",
+        "benchmarks.benchmark_uprnet",
+        "benchmarks.benchmark_emavfi",
+        "benchmarks.benchmark_sgmvfi",
+    ):
+        module = importlib.import_module(module_name)
+        assert callable(module.main)
 
 
 def _build_inference_config(model_name: str) -> InferenceRunConfig:
