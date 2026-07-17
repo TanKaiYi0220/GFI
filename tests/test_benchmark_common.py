@@ -137,6 +137,41 @@ def test_discover_benchmark_samples_fails_when_required_image_is_missing(tmp_pat
         discover_benchmark_samples(input_dir=tmp_path)
 
 
+def test_discover_benchmark_samples_accepts_dataset_style_rgb_and_motion_paths(tmp_path: Path) -> None:
+    sample_dir = tmp_path / "sample_0001"
+    sample_dir.mkdir()
+    (sample_dir / "fps_30").mkdir()
+    (sample_dir / "fps_60").mkdir()
+    _write_rgb_image(sample_dir / "colorNoScreenUI_244.png", width=4, height=3, value=10)
+    _write_rgb_image(sample_dir / "colorNoScreenUI_246.png", width=4, height=3, value=20)
+    (sample_dir / "fps_30" / "backwardVel_Depth_123.exr").write_bytes(b"fake-exr")
+    (sample_dir / "fps_30" / "forwardVel_Depth_122.exr").write_bytes(b"fake-exr")
+    (sample_dir / "fps_60" / "backwardVel_Depth_245.exr").write_bytes(b"fake-exr")
+    (sample_dir / "fps_60" / "forwardVel_Depth_245.exr").write_bytes(b"fake-exr")
+    (sample_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "timestep": 0.5,
+                "frame_60_0_idx": 244,
+                "frame_60_1_idx": 245,
+                "frame_60_2_idx": 246,
+                "frame_30_0_idx": 122,
+                "frame_30_1_idx": 123,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    samples = discover_benchmark_samples(input_dir=tmp_path)
+
+    assert samples[0].img0_path.name == "colorNoScreenUI_244.png"
+    assert samples[0].img2_path.name == "colorNoScreenUI_246.png"
+    assert samples[0].bmv_30_path is not None
+    assert samples[0].bmv_30_path.name == "backwardVel_Depth_123.exr"
+    assert samples[0].fmv_30_path is not None
+    assert samples[0].fmv_30_path.name == "forwardVel_Depth_122.exr"
+
+
 @pytest.mark.parametrize('timestep', [math.nan])
 def test_read_sample_timestep_rejects_non_finite_values(tmp_path: Path, timestep: float) -> None:
     sample_dir = tmp_path / 'sample_0001'
@@ -211,6 +246,10 @@ def test_build_benchmark_batches_keeps_tensors_on_cpu_before_measurement(tmp_pat
             img0_path=sample_dir / "img0.png",
             img2_path=sample_dir / "img2.png",
             timestep=0.25,
+            bmv_30_path=None,
+            fmv_30_path=None,
+            bmv_60_path=None,
+            fmv_60_path=None,
         )
     ]
 
@@ -233,6 +272,10 @@ def test_build_benchmark_batches_rejects_incompatible_image_shapes(tmp_path: Pat
             img0_path=sample_dir / "img0.png",
             img2_path=sample_dir / "img2.png",
             timestep=0.25,
+            bmv_30_path=None,
+            fmv_30_path=None,
+            bmv_60_path=None,
+            fmv_60_path=None,
         )
     ]
 
@@ -255,12 +298,20 @@ def test_build_benchmark_batches_rejects_mixed_shapes_across_run(tmp_path: Path)
             img0_path=first_sample_dir / "img0.png",
             img2_path=first_sample_dir / "img2.png",
             timestep=0.25,
+            bmv_30_path=None,
+            fmv_30_path=None,
+            bmv_60_path=None,
+            fmv_60_path=None,
         ),
         BenchmarkSample(
             name="sample_0002",
             img0_path=second_sample_dir / "img0.png",
             img2_path=second_sample_dir / "img2.png",
             timestep=0.5,
+            bmv_30_path=None,
+            fmv_30_path=None,
+            bmv_60_path=None,
+            fmv_60_path=None,
         ),
     ]
 

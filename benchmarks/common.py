@@ -33,6 +33,10 @@ class BenchmarkSample:
     img0_path: Path
     img2_path: Path
     timestep: float
+    bmv_30_path: Path | None
+    fmv_30_path: Path | None
+    bmv_60_path: Path | None
+    fmv_60_path: Path | None
 
 
 @dataclass(frozen=True)
@@ -100,18 +104,62 @@ def load_rgb_tensor(image_path: Path) -> torch.Tensor:
 
 
 def read_sample_timestep(sample_dir: Path) -> float:
+    meta = read_sample_meta(sample_dir=sample_dir)
+    return resolve_timestep(meta=meta, sample_dir=sample_dir)
+
+
+def resolve_timestep(meta: dict[str, object], sample_dir: Path) -> float:
+    timestep = float(meta.get("timestep", 0.5))
+    if not math.isfinite(timestep):
+        raise ValueError(f"Benchmark timestep must be finite, got {timestep}: path={sample_dir / 'meta.json'}")
+    if timestep < 0.0 or timestep > 1.0:
+        raise ValueError(f"Benchmark timestep must be in [0, 1], got {timestep}: path={sample_dir / 'meta.json'}")
+    return timestep
+
+
+def read_sample_meta(sample_dir: Path) -> dict[str, object]:
     meta_path = sample_dir / "meta.json"
     if not meta_path.exists():
-        return 0.5
+        return {}
     raw_meta = json.loads(meta_path.read_text(encoding="utf-8"))
     if not isinstance(raw_meta, dict):
         raise TypeError(f"Benchmark sample meta.json must contain a mapping: path={meta_path}")
-    timestep = float(raw_meta.get("timestep", 0.5))
-    if not math.isfinite(timestep):
-        raise ValueError(f"Benchmark timestep must be finite, got {timestep}: path={meta_path}")
-    if timestep < 0.0 or timestep > 1.0:
-        raise ValueError(f"Benchmark timestep must be in [0, 1], got {timestep}: path={meta_path}")
-    return timestep
+    return raw_meta
+
+
+def resolve_frame_index(meta: dict[str, object], frame_key: str, meta_path_context: Path) -> int:
+    if frame_key not in meta:
+        raise KeyError(f"Benchmark sample meta is missing {frame_key}: sample={meta_path_context}")
+    return int(meta[frame_key])
+
+
+def resolve_rgb_path(sample_dir: Path, alias_name: str, frame_key: str, meta: dict[str, object]) -> Path:
+    alias_path = sample_dir / alias_name
+    if alias_path.is_file():
+        return alias_path
+    if frame_key not in meta:
+        raise FileNotFoundError(f"Benchmark sample is missing {alias_name}: path={alias_path}")
+    frame_index = resolve_frame_index(meta=meta, frame_key=frame_key, meta_path_context=sample_dir)
+    dataset_style_path = sample_dir / f"colorNoScreenUI_{frame_index}.png"
+    if not dataset_style_path.is_file():
+        raise FileNotFoundError(
+            f"Benchmark sample is missing RGB input: alias={alias_path}, dataset_style={dataset_style_path}"
+        )
+    return dataset_style_path
+
+
+def resolve_motion_path(
+    sample_dir: Path,
+    fps_dir: str,
+    modality_name: str,
+    frame_key: str,
+    meta: dict[str, object],
+) -> Path | None:
+    if frame_key not in meta:
+        return None
+    frame_index = int(meta[frame_key])
+    motion_path = sample_dir / fps_dir / f"{modality_name}_{frame_index}.exr"
+    return motion_path if motion_path.is_file() else None
 
 
 def discover_benchmark_samples(input_dir: Path) -> list[BenchmarkSample]:
@@ -126,18 +174,43 @@ def discover_benchmark_samples(input_dir: Path) -> list[BenchmarkSample]:
 
     samples: list[BenchmarkSample] = []
     for sample_dir in sample_dirs:
-        img0_path = sample_dir / "img0.png"
-        img2_path = sample_dir / "img2.png"
-        if not img0_path.is_file():
-            raise FileNotFoundError(f"Benchmark sample is missing img0.png: path={img0_path}")
-        if not img2_path.is_file():
-            raise FileNotFoundError(f"Benchmark sample is missing img2.png: path={img2_path}")
+        meta = read_sample_meta(sample_dir=sample_dir)
+        img0_path = resolve_rgb_path(sample_dir=sample_dir, alias_name="img0.png", frame_key="frame_60_0_idx", meta=meta)
+        img2_path = resolve_rgb_path(sample_dir=sample_dir, alias_name="img2.png", frame_key="frame_60_2_idx", meta=meta)
         samples.append(
             BenchmarkSample(
                 name=sample_dir.name,
                 img0_path=img0_path,
                 img2_path=img2_path,
-                timestep=read_sample_timestep(sample_dir=sample_dir),
+                timestep=resolve_timestep(meta=meta, sample_dir=sample_dir),
+                bmv_30_path=resolve_motion_path(
+                    sample_dir=sample_dir,
+                    fps_dir="fps_30",
+                    modality_name="backwardVel_Depth",
+                    frame_key="frame_30_1_idx",
+                    meta=meta,
+                ),
+                fmv_30_path=resolve_motion_path(
+                    sample_dir=sample_dir,
+                    fps_dir="fps_30",
+                    modality_name="forwardVel_Depth",
+                    frame_key="frame_30_0_idx",
+                    meta=meta,
+                ),
+                bmv_60_path=resolve_motion_path(
+                    sample_dir=sample_dir,
+                    fps_dir="fps_60",
+                    modality_name="backwardVel_Depth",
+                    frame_key="frame_60_1_idx",
+                    meta=meta,
+                ),
+                fmv_60_path=resolve_motion_path(
+                    sample_dir=sample_dir,
+                    fps_dir="fps_60",
+                    modality_name="forwardVel_Depth",
+                    frame_key="frame_60_1_idx",
+                    meta=meta,
+                ),
             )
         )
     return samples
