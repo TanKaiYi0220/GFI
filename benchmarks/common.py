@@ -137,8 +137,6 @@ def resolve_rgb_path(sample_dir: Path, alias_name: str, frame_key: str, meta: di
     alias_path = sample_dir / alias_name
     if alias_path.is_file():
         return alias_path
-    if frame_key not in meta:
-        raise FileNotFoundError(f"Benchmark sample is missing {alias_name}: path={alias_path}")
     frame_index = resolve_frame_index(meta=meta, frame_key=frame_key, meta_path_context=sample_dir)
     dataset_style_path = sample_dir / f"colorNoScreenUI_{frame_index}.png"
     if not dataset_style_path.is_file():

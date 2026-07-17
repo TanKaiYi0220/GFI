@@ -19,6 +19,7 @@ from benchmarks.common import build_benchmark_batches
 from benchmarks.common import discover_benchmark_samples
 from benchmarks.common import format_timing_summary
 from benchmarks.common import measure_batch_ms
+from benchmarks.common import resolve_rgb_path
 from benchmarks.common import summarize_benchmark_calls
 from benchmarks.common import summarize_durations_ms
 from src.engine.run_config import FlowApproxConfig
@@ -132,9 +133,18 @@ def test_discover_benchmark_samples_fails_when_required_image_is_missing(tmp_pat
     sample_dir = tmp_path / 'sample_0001'
     sample_dir.mkdir()
     (sample_dir / 'img0.png').write_bytes(b'not-used-by-discovery')
+    (sample_dir / 'meta.json').write_text(json.dumps({'frame_60_2_idx': 246}), encoding='utf-8')
 
     with pytest.raises(FileNotFoundError, match='img2.png'):
         discover_benchmark_samples(input_dir=tmp_path)
+
+
+def test_resolve_rgb_path_raises_key_error_when_dataset_style_frame_key_is_missing(tmp_path: Path) -> None:
+    sample_dir = tmp_path / "sample_0001"
+    sample_dir.mkdir()
+
+    with pytest.raises(KeyError, match="frame_60_2_idx"):
+        resolve_rgb_path(sample_dir=sample_dir, alias_name="img2.png", frame_key="frame_60_2_idx", meta={})
 
 
 def test_discover_benchmark_samples_accepts_dataset_style_rgb_and_motion_paths(tmp_path: Path) -> None:
@@ -170,6 +180,10 @@ def test_discover_benchmark_samples_accepts_dataset_style_rgb_and_motion_paths(t
     assert samples[0].bmv_30_path.name == "backwardVel_Depth_123.exr"
     assert samples[0].fmv_30_path is not None
     assert samples[0].fmv_30_path.name == "forwardVel_Depth_122.exr"
+    assert samples[0].bmv_60_path is not None
+    assert samples[0].bmv_60_path.name == "backwardVel_Depth_245.exr"
+    assert samples[0].fmv_60_path is not None
+    assert samples[0].fmv_60_path.name == "forwardVel_Depth_245.exr"
 
 
 @pytest.mark.parametrize('timestep', [math.nan])
