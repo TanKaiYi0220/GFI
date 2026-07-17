@@ -14,6 +14,7 @@ from PIL import Image
 
 from benchmarks.common import BenchmarkBatch
 from benchmarks.common import BenchmarkSample
+from benchmarks.common import build_inference_batch
 from benchmarks.common import build_report_paths
 from benchmarks.common import build_benchmark_batches
 from benchmarks.common import discover_benchmark_samples
@@ -333,6 +334,75 @@ def test_build_benchmark_batches_rejects_mixed_shapes_across_run(tmp_path: Path)
         build_benchmark_batches(samples=samples, batch_size=1)
 
 
+def test_build_benchmark_batches_loads_motion_and_depth_with_existing_loader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample_dir = tmp_path / "sample_0001"
+    sample_dir.mkdir()
+    (sample_dir / "fps_30").mkdir()
+    (sample_dir / "fps_60").mkdir()
+    _write_rgb_image(sample_dir / "img0.png", width=4, height=3, value=10)
+    _write_rgb_image(sample_dir / "img2.png", width=4, height=3, value=20)
+    for motion_path in (
+        sample_dir / "fps_30" / "backwardVel_Depth_1.exr",
+        sample_dir / "fps_30" / "forwardVel_Depth_0.exr",
+    ):
+        motion_path.write_bytes(b"fake-exr")
+    (sample_dir / "meta.json").write_text(
+        json.dumps({"frame_30_0_idx": 0, "frame_30_1_idx": 1}),
+        encoding="utf-8",
+    )
+
+    def fake_load_backward_velocity(velocity_path: Path) -> tuple[Any, Any]:
+        motion = torch.zeros((3, 4, 2), dtype=torch.float32).numpy()
+        depth = torch.ones((3, 4), dtype=torch.float32).numpy()
+        return motion, depth
+
+    monkeypatch.setattr("benchmarks.common.load_backward_velocity", fake_load_backward_velocity)
+
+    samples = discover_benchmark_samples(input_dir=tmp_path)
+    batches = build_benchmark_batches(samples=samples, batch_size=1)
+
+    assert batches[0].bmv_30 is not None
+    assert tuple(batches[0].bmv_30.shape) == (1, 2, 3, 4)
+    assert batches[0].source_depth1 is not None
+    assert tuple(batches[0].source_depth1.shape) == (1, 1, 3, 4)
+
+
+def test_build_inference_batch_returns_flow_aware_tuple_for_flow_approx_model() -> None:
+    config = _build_inference_config(model_name="IFRNet_Residual_FlowApprox")
+    batch = BenchmarkBatch(
+        sample_names=["sample_0001"],
+        img0=torch.ones((1, 3, 2, 4), dtype=torch.float32),
+        img1=torch.full((1, 3, 2, 4), 2.0, dtype=torch.float32),
+        embt=torch.full((1, 1, 1, 1), 0.25, dtype=torch.float32),
+        image_shape=(2, 4),
+        bmv_30=torch.full((1, 2, 2, 4), 3.0, dtype=torch.float32),
+        fmv_30=torch.full((1, 2, 2, 4), 4.0, dtype=torch.float32),
+        bmv_60=torch.full((1, 2, 2, 4), 5.0, dtype=torch.float32),
+        fmv_60=torch.full((1, 2, 2, 4), 6.0, dtype=torch.float32),
+        source_depth0=torch.full((1, 1, 2, 4), 7.0, dtype=torch.float32),
+        source_depth1=torch.full((1, 1, 2, 4), 8.0, dtype=torch.float32),
+    )
+
+    inference_batch = build_inference_batch(config=config, batch=batch)
+    img0, imgt, img1, bmv_60, fmv_60, bmv_30, fmv_30, embt, info = inference_batch
+
+    assert torch.equal(img0, batch.img0)
+    assert torch.equal(img1, batch.img1)
+    assert float(imgt.sum().item()) == 0.0
+    assert torch.equal(bmv_60, batch.bmv_60)
+    assert torch.equal(fmv_60, batch.fmv_60)
+    assert torch.equal(bmv_30, batch.bmv_30)
+    assert torch.equal(fmv_30, batch.fmv_30)
+    assert torch.equal(embt, batch.embt)
+    assert info == {
+        "source_depth0": batch.source_depth0,
+        "source_depth1": batch.source_depth1,
+    }
+
+
 def test_measure_batch_ms_uses_run_inference_batch_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _build_inference_config(model_name="UPRNet")
     batch = BenchmarkBatch(
@@ -341,6 +411,12 @@ def test_measure_batch_ms_uses_run_inference_batch_wrapper(monkeypatch: pytest.M
         img1=torch.full((1, 3, 2, 4), 2.0, dtype=torch.float32),
         embt=torch.full((1, 1, 1, 1), 0.25, dtype=torch.float32),
         image_shape=(2, 4),
+        bmv_30=None,
+        fmv_30=None,
+        bmv_60=None,
+        fmv_60=None,
+        source_depth0=None,
+        source_depth1=None,
     )
 
     class ModelWithoutDirectInference:
