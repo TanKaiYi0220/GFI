@@ -11,6 +11,8 @@ outputs/
 analysis_outputs/
 inference_outputs/
 compare_outputs/
+benchmarks/inputs/
+benchmarks/outputs/
 data/
 dataset/
 datasets/

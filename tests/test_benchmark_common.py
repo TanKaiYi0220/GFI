@@ -339,3 +339,16 @@ def test_summarize_benchmark_calls_uses_actual_processed_sample_count() -> None:
     assert stats.min_ms == pytest.approx(10.0)
     assert stats.max_ms == pytest.approx(30.0)
     assert stats.fps == pytest.approx((5 * 1000.0) / 60.0)
+
+
+def test_benchmark_materialized_inputs_are_git_ignored() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        ["git", "check-ignore", "benchmarks/inputs/sample_0001/img0.png"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
