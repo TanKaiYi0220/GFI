@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import math
 import statistics
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,8 @@ def read_sample_timestep(sample_dir: Path) -> float:
     if not isinstance(raw_meta, dict):
         raise TypeError(f'Benchmark sample meta.json must contain a mapping: path={meta_path}')
     timestep = float(raw_meta.get('timestep', 0.5))
+    if not math.isfinite(timestep):
+        raise ValueError(f'Benchmark timestep must be finite, got {timestep}: path={meta_path}')
     if timestep < 0.0 or timestep > 1.0:
         raise ValueError(f'Benchmark timestep must be in [0, 1], got {timestep}: path={meta_path}')
     return timestep
@@ -79,6 +82,12 @@ def summarize_durations_ms(durations_ms: list[float], batch_size: int) -> Timing
         raise ValueError('Cannot summarize an empty benchmark duration list.')
     if batch_size <= 0:
         raise ValueError(f'Benchmark batch_size must be positive, got {batch_size}')
+    for duration_ms in durations_ms:
+        if not math.isfinite(duration_ms) or duration_ms < 0.0:
+            raise ValueError(
+                f'Benchmark durations must be finite and non-negative, got {duration_ms}: '
+                f'durations_ms={durations_ms}, batch_size={batch_size}'
+            )
 
     mean_ms = float(statistics.mean(durations_ms))
     return TimingStats(

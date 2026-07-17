@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,18 @@ def test_discover_benchmark_samples_fails_when_required_image_is_missing(tmp_pat
         discover_benchmark_samples(input_dir=tmp_path)
 
 
+@pytest.mark.parametrize('timestep', [math.nan])
+def test_read_sample_timestep_rejects_non_finite_values(tmp_path: Path, timestep: float) -> None:
+    sample_dir = tmp_path / 'sample_0001'
+    sample_dir.mkdir()
+    (sample_dir / 'img0.png').write_bytes(b'not-used-by-discovery')
+    (sample_dir / 'img2.png').write_bytes(b'not-used-by-discovery')
+    (sample_dir / 'meta.json').write_text(json.dumps({'timestep': timestep}), encoding='utf-8')
+
+    with pytest.raises(ValueError, match='finite'):
+        discover_benchmark_samples(input_dir=tmp_path)
+
+
 def test_summarize_durations_ms_reports_batch_fps() -> None:
     stats = summarize_durations_ms(durations_ms=[10.0, 20.0, 30.0], batch_size=2)
 
@@ -44,3 +57,9 @@ def test_summarize_durations_ms_reports_batch_fps() -> None:
     assert stats.min_ms == pytest.approx(10.0)
     assert stats.max_ms == pytest.approx(30.0)
     assert stats.fps == pytest.approx(100.0)
+
+
+@pytest.mark.parametrize('durations_ms', [[-1.0], [math.nan], [math.inf]])
+def test_summarize_durations_ms_rejects_invalid_values(durations_ms: list[float]) -> None:
+    with pytest.raises(ValueError, match='finite|non-negative'):
+        summarize_durations_ms(durations_ms=durations_ms, batch_size=2)
