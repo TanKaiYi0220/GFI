@@ -39,6 +39,7 @@ from src.engine.run_config import build_inference_dry_run_summary
 from src.engine.run_config import build_inference_run_config
 from src.engine.run_config import RgbSequenceConfig
 from src.utils.logger import build_logger
+from src.utils.model_stats import build_model_parameter_summary
 from src.utils.seed import set_seed
 # Model variants:
 # - IFRNet: baseline
@@ -681,6 +682,12 @@ def main(argv: list[str] | None = None) -> None:
     dataframe = filter_valid_dataframe(dataframe)
     model_class = resolve_model_class(run_config.model.model_name)
     model = model_class(**run_config.model.model_init_args).to(device)
+    model_parameter_summary = build_model_parameter_summary(model)
+    logger.info(
+        "model_param_count=%s model_param_million=%.6f",
+        model_parameter_summary["model_param_count"],
+        model_parameter_summary["model_param_million"],
+    )
     if hasattr(model, "init_flow_layer"):
         logger.info("model_init_flow_layer=%s", model.init_flow_layer)
     # print("Load Pretrained Weights from IFRNet_Vimeo90K.pth as Baseline")
@@ -796,6 +803,7 @@ def main(argv: list[str] | None = None) -> None:
                         "record": str(record),
                         "mode": str(mode_name),
                         "record_name": f"{record}_{mode_name}",
+                        **model_parameter_summary,
                         "frame_range": frame_range,
                         "valid": bool(row["valid"]) if "valid" in row.index else True,
                         "distance_index_mean": float(row["D_index Mean"]) if "D_index Mean" in row.index else -1.0,
@@ -905,6 +913,7 @@ def main(argv: list[str] | None = None) -> None:
                     "mode": str(mode_name),
                     "record_name": f"{record}_{mode_name}",
                     "samples": int(len(group_dataframe)),
+                    **model_parameter_summary,
                     **{f"mean_{metric_name}": metric_value for metric_name, metric_value in record_metric_values.items()},
                 }
             )
