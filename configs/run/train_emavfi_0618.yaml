@@ -3,7 +3,7 @@
   "model_name": "EMAVFI",
   "model_init_args": {
     "external_root": "src/models/external/EMA-VFI",
-    "model_variant": "ours",
+    "model_variant": "ours_small",
     "tta": true,
     "fast_tta": true,
     "pad_divisor": 32
@@ -12,13 +12,13 @@
   "dataset_root_dir": "/workspace/datasets/",
   "train_preset": "train_vfx_0416",
   "test_preset": "test_vfx_0416",
-  "epochs": 100,
+  "epochs": 150,
   "eval_interval": 5,
   "lr_start": 2e-5,
   "lr_end": 1e-5,
   "seed": 1234,
   "batch_size": 16,
-  "output_dir": "outputs/EMAVFI_FineTuning_0618_oracleTime/",
+  "output_dir": "outputs/EMAVFI_Small_FineTuning_0618_oracleTime/",
   "only_fps": 60,
   "input_fps": 30,
   "metrics": {
@@ -42,15 +42,9 @@
   },
   "scale_factor": 1.0,
   "flow_approx_method": "combination",
-  "resume_path": null,
-  "pretrained_checkpoint_path": "src/models/external/EMA-VFI/ckpt/ours.pkl",
-  "sample_train_frames": [
-    "ARPG_2_4_Medium_5_0502",
-    "ARPG_2_4_Medium_5_0504"
-  ],
-  "sample_test_frames": [
-    "ARPG_3_3_Easy_5_0546",
-    "ARPG_3_3_Easy_5_0552"
-  ],
+  "resume_path": "outputs/EMAVFI_Small_FineTuning_0618_oracleTime/checkpoints/latest.pth",
+  "pretrained_checkpoint_path": null,
+  "sample_train_frames": [],
+  "sample_test_frames": [],
   "sample_interval_epoch": 5
 }

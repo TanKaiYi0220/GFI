@@ -7,8 +7,8 @@
     "train_vfx_0416",
     "test_vfx_0416"
   ],
-  "checkpoint_path": "outputs/IFRNet_FineTuning_0618_deltaTime/checkpoints/latest.pth",
-  "output_dir": "inference_outputs/IFRNet_FineTuning_0618_deltaTime/",
+  "checkpoint_path": "outputs/IFRNet_FineTuning_0625_oracleTime/checkpoints/latest.pth",
+  "output_dir": "inference_outputs/IFRNet_FineTuning_0625_oracleTime/",
   "seed": 1234,
   "batch_size": 1,
   "only_fps": 60,
@@ -39,18 +39,18 @@
 
   "save_sample_selection": "all",
   "save_artifact_mode": "rgb_png",
-
-  "save_topk_worst_psnr": 10,
-  "save_topk_best_psnr": 5,
-  "save_topk_largest_flow_diff": 10,
-  "save_train_frames": [
-    "ARPG_2_4_Medium_5_0502",
-    "ARPG_2_4_Medium_5_0504"
-  ],
-  "save_test_frames": [
-    "ARPG_3_3_Easy_5_0546",
-    "ARPG_3_3_Easy_5_0552"
-  ],
+  "save_topk_worst_psnr": 3,
+  "save_topk_best_psnr": 0,
+  "save_topk_largest_flow_diff": 0,
+  "rgb_sequence": {
+    "enabled": true,
+    "output_dir": "inference_outputs/UPRNet_Official/rgb_sequence",
+    "record_filter": null,
+    "mode_filter": null,
+    "dedupe_endpoints": true,
+    "export_target": true,
+    "export_prediction": true
+  },
   "video": {
     "output_dir": "inference_outputs/IFRNet_FineTuning_0618_deltaTime/videos",
     "fps": 60,

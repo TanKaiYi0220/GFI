@@ -8,7 +8,7 @@
   "dataset_root_dir": "/workspace/datasets/",
   "train_preset": "train_vfx_0416",
   "test_preset": "test_vfx_0416",
-  "epochs": 100,
+  "epochs": 150,
   "eval_interval": 5,
   "lr_start": 2e-5,
   "lr_end": 1e-5,

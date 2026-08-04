@@ -13,8 +13,8 @@
     "train_vfx_0416",
     "test_vfx_0416"
   ],
-  "checkpoint_path": "src/models/external/UPR-Net/checkpoints/upr-base.pkl",
-  "output_dir": "inference_outputs/UPRNet_Official",
+  "checkpoint_path": "outputs/UPRNet_FineTuning_0618_oracleTime/checkpoints/best.pth",
+  "output_dir": "inference_outputs/UPRNet_FineTuning_0618_oracleTime",
   "seed": 1234,
   "batch_size": 1,
   "only_fps": 60,
@@ -47,7 +47,7 @@
   "save_topk_largest_flow_diff": 0,
   "rgb_sequence": {
     "enabled": true,
-    "output_dir": "inference_outputs/UPRNet_Official/rgb_sequence",
+    "output_dir": "inference_outputs/UPRNet_FineTuning_0618_oracleTime_rgb_sequence",
     "record_filter": null,
     "mode_filter": null,
     "dedupe_endpoints": true,

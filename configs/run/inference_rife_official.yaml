@@ -10,8 +10,8 @@
     "train_vfx_0416",
     "test_vfx_0416"
   ],
-  "checkpoint_path": "src/models/external/RIFE/train_log",
-  "output_dir": "inference_outputs/RIFE_Official",
+  "checkpoint_path": "outputs/RIFE_FineTuning_Official/checkpoints/best.pth",
+  "output_dir": "inference_outputs/RIFE_FineTuning_0618_oracleTime/",
   "seed": 1234,
   "batch_size": 1,
   "only_fps": 60,
@@ -42,6 +42,15 @@
   "save_topk_worst_psnr": 3,
   "save_topk_best_psnr": 0,
   "save_topk_largest_flow_diff": 0,
+  "rgb_sequence": {
+    "enabled": true,
+    "output_dir": "inference_outputs/RIFE_FineTuning_0618_oracleTime/rgb_sequence",
+    "record_filter": null,
+    "mode_filter": null,
+    "dedupe_endpoints": true,
+    "export_target": true,
+    "export_prediction": true
+  },
   "video": {
     "output_dir": "inference_outputs/RIFE_Official/videos",
     "fps": 60,
